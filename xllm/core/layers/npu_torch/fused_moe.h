@@ -101,6 +101,10 @@ class FusedMoEImpl : public torch::nn::Module {
     return last_prepare_expert_weight_ok_;
   }
 
+#if defined(XLLM_HAS_ACLSHMEM_MOE_AOT)
+  friend class AclShmemMoeEagerTestPeer;
+#endif
+
  private:
   // struct to store the selected expert info
   struct SelectedExpertInfo {
