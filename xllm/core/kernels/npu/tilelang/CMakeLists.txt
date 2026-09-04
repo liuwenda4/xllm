@@ -186,6 +186,10 @@ if(XLLM_HAS_ACLSHMEM AND
     NAME aclshmem_moe_dequant_int8
     WRAPPER_SRCS aclshmem_moe_dequant_int8_wrapper.cpp
   )
+  tilelang_register_runtime_kernel(
+    NAME aclshmem_moe_combine_bf16
+    WRAPPER_SRCS aclshmem_moe_combine_bf16_wrapper.cpp
+  )
 endif()
 
 cc_library(

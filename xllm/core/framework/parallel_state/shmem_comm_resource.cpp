@@ -166,7 +166,11 @@ AclShmemMoeWindowLayout build_aclshmem_moe_window_layout(
                      combine_rows,
                      static_cast<uint64_t>(combine_hidden),
                      2) ||
-      !append_window("combine_status", combine_rows, 8, 4)) {
+      !append_window("combine_status", combine_rows, 8, 4) ||
+      !append_window("combine_credit",
+                     static_cast<uint64_t>(request.ep_world_size),
+                     combine_rows * 8,
+                     4)) {
     return layout;
   }
   layout.valid = true;
@@ -255,10 +259,10 @@ class ShmemCommResource::Impl final {
   bool allocate(std::string* error) {
     for (const auto& spec : spec_.windows) {
       const uint64_t aligned_bytes = align_window_bytes(spec.bytes);
-      void* address = aclshmem_malloc(static_cast<size_t>(aligned_bytes));
+      void* address = aclshmem_calloc(1, static_cast<size_t>(aligned_bytes));
       if (address == nullptr) {
         if (error != nullptr) {
-          *error = "aclshmem_malloc failed for window '" + spec.name + "'";
+          *error = "aclshmem_calloc failed for window '" + spec.name + "'";
         }
         return false;
       }

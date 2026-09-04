@@ -77,7 +77,7 @@ TEST(ShmemCommResourceTest, BuildsFixedInt8MoeWindowLayout) {
   ASSERT_TRUE(layout.valid) << layout.error;
   EXPECT_EQ(layout.max_capacity, 64);
   EXPECT_EQ(layout.physical_hidden, 64);
-  ASSERT_EQ(layout.windows.size(), 7);
+  ASSERT_EQ(layout.windows.size(), 8);
   EXPECT_EQ(layout.windows[0], (ShmemWindowSpec{"dispatch_payload", 4096}));
   EXPECT_EQ(layout.windows[1], (ShmemWindowSpec{"dispatch_scale", 2048}));
   EXPECT_EQ(layout.windows[2], (ShmemWindowSpec{"dispatch_triplet", 2048}));
@@ -85,6 +85,7 @@ TEST(ShmemCommResourceTest, BuildsFixedInt8MoeWindowLayout) {
   EXPECT_EQ(layout.windows[4], (ShmemWindowSpec{"dispatch_credit", 512}));
   EXPECT_EQ(layout.windows[5], (ShmemWindowSpec{"combine_payload", 768}));
   EXPECT_EQ(layout.windows[6], (ShmemWindowSpec{"combine_status", 256}));
+  EXPECT_EQ(layout.windows[7], (ShmemWindowSpec{"combine_credit", 2048}));
 }
 
 TEST(ShmemCommResourceTest, BuildsCommSpecFromExplicitEnvironment) {

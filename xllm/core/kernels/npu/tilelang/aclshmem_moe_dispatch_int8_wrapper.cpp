@@ -104,14 +104,14 @@ void aclshmem_moe_dispatch_int8(AclShmemMoeDispatchInt8Params& params) {
            std::max<int64_t>(32, (hidden_size + 31) / 32 * 32));
   CHECK_GT(params.ep_world_size, 1);
   CHECK_GT(params.local_experts, 0);
-  const int64_t max_capacity =
-      params.ep_world_size * local_tokens * params.local_experts;
   CHECK(has_aclshmem_moe_dispatch_int8_specialization(local_tokens,
                                                       hidden_size,
                                                       topk,
                                                       params.ep_world_size,
                                                       params.local_experts,
                                                       params.rank));
+  const int64_t max_capacity =
+      params.ep_world_size * local_tokens * params.local_experts;
   const auto specialization = make_specialization(local_tokens,
                                                   hidden_size,
                                                   topk,

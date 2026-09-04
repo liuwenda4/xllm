@@ -53,6 +53,22 @@ struct AclShmemMoeDispatchInt8Params {
   int64_t rank = -1;
 };
 
+struct AclShmemMoeCombineBf16Params {
+  torch::Tensor expert_output;
+  torch::Tensor expand_ids;
+  torch::Tensor active_mask;
+  torch::Tensor generation_id;
+  torch::Tensor iteration_id;
+  torch::Tensor route_weights;
+  void* win_payload = nullptr;
+  void* win_status = nullptr;
+  void* win_credit = nullptr;
+  torch::Tensor output;
+  int64_t ep_world_size = 0;
+  int64_t local_experts = 0;
+  int64_t rank = -1;
+};
+
 bool has_aclshmem_moe_quant_int8_specialization(int64_t local_tokens,
                                                 int64_t hidden_size);
 
@@ -76,6 +92,15 @@ void aclshmem_moe_dequant_int8(const torch::Tensor& payload,
                                const torch::Tensor& scale,
                                const torch::Tensor& active_mask,
                                torch::Tensor& output);
+
+bool has_aclshmem_moe_combine_bf16_specialization(int64_t local_tokens,
+                                                  int64_t hidden_size,
+                                                  int64_t topk,
+                                                  int64_t ep_world_size,
+                                                  int64_t local_experts,
+                                                  int64_t rank);
+
+void aclshmem_moe_combine_bf16(AclShmemMoeCombineBf16Params& params);
 
 // Take the first token from each row of an existing row-major int32 verify
 // buffer and pack it with `spec_width - 1` proposer columns into graph-owned
