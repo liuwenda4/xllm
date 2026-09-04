@@ -39,6 +39,10 @@ limitations under the License.
 #include "layers/common/linear.h"
 #include "layers/npu_torch/deepseek_v4_eplb_utils.h"
 
+#if defined(XLLM_HAS_ACLSHMEM_MOE_AOT)
+#include "framework/parallel_state/shmem_comm_resource.h"
+#endif
+
 namespace xllm {
 namespace layer {
 
@@ -197,6 +201,16 @@ class FusedMoEImpl : public torch::nn::Module {
   void preprocess_w4a8_dynamic_weights();
   void clear_w4a8_dynamic_source_weight_cache();
   bool should_gather_dp_inputs_for_moe() const;
+#if defined(XLLM_HAS_ACLSHMEM_MOE_AOT)
+  bool can_use_aclshmem_moe(const ModelInputParams& input_params,
+                            const torch::Tensor& hidden_states,
+                            const torch::Tensor& topk_weights,
+                            const torch::Tensor& topk_ids);
+  bool initialize_aclshmem_moe_state();
+  torch::Tensor forward_with_aclshmem_moe(const torch::Tensor& hidden_states,
+                                          const torch::Tensor& topk_weights,
+                                          const torch::Tensor& topk_ids);
+#endif
   bool can_use_ep2_dispatch_combine(const ModelInputParams& input_params,
                                     const torch::Tensor& hidden_states) const;
   int64_t local_physical_experts_num() const;
@@ -286,6 +300,28 @@ class FusedMoEImpl : public torch::nn::Module {
   torch::Tensor dispatch_ffn_w2_scale_;
   std::string mc2_group_name_;
   std::string moe_ep_process_group_name_;
+
+#if defined(XLLM_HAS_ACLSHMEM_MOE_AOT)
+  bool aclshmem_enable_consensus_checked_ = false;
+  bool aclshmem_enabled_on_all_ranks_ = false;
+  bool aclshmem_buffers_ready_ = false;
+  std::shared_ptr<ShmemCommResource> aclshmem_moe_resource_;
+  std::optional<ShmemCommSpec> aclshmem_moe_pending_spec_;
+  torch::Tensor aclshmem_payload_;
+  torch::Tensor aclshmem_scale_;
+  torch::Tensor aclshmem_generation_id_;
+  torch::Tensor aclshmem_iteration_id_;
+  torch::Tensor aclshmem_expand_payload_;
+  torch::Tensor aclshmem_expand_scale_;
+  torch::Tensor aclshmem_expand_ids_;
+  torch::Tensor aclshmem_global_prefix_;
+  torch::Tensor aclshmem_expert_token_nums_;
+  torch::Tensor aclshmem_ep_receive_count_;
+  torch::Tensor aclshmem_active_mask_;
+  torch::Tensor aclshmem_actual_count_;
+  torch::Tensor aclshmem_expand_x_;
+  torch::Tensor aclshmem_output_;
+#endif
 
   bool mega_moe_enabled_ = false;
   std::weak_ptr<MegaMoeCommResource> mega_moe_comm_resource_;

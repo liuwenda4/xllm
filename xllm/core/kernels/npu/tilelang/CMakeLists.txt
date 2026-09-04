@@ -1,6 +1,9 @@
 include(cc_library)
 include(CMakeParseArguments)
 
+set(XLLM_HAS_ACLSHMEM_MOE_AOT OFF CACHE INTERNAL
+    "Whether ACLSHMEM MoE AOT kernels are linked" FORCE)
+
 if(NOT USE_NPU)
   return()
 endif()
@@ -174,6 +177,8 @@ tilelang_register_runtime_kernel(
 
 if(XLLM_HAS_ACLSHMEM AND
    "$ENV{XLLM_ENABLE_ACLSHMEM_MOE_AOT}" STREQUAL "1")
+  set(XLLM_HAS_ACLSHMEM_MOE_AOT ON CACHE INTERNAL
+      "Whether ACLSHMEM MoE AOT kernels are linked" FORCE)
   tilelang_register_runtime_kernel(
     NAME aclshmem_moe_quant_int8
     WRAPPER_SRCS aclshmem_moe_quant_int8_wrapper.cpp
@@ -208,6 +213,11 @@ cc_library(
 target_compile_definitions(tilelang_kernels PRIVATE
   ${TILELANG_KERNEL_PRIVATE_DEFINITIONS}
 )
+
+if(XLLM_HAS_ACLSHMEM_MOE_AOT)
+  target_compile_definitions(tilelang_kernels PUBLIC
+    XLLM_HAS_ACLSHMEM_MOE_AOT=1)
+endif()
 
 target_link_libraries(tilelang_kernels
   PUBLIC

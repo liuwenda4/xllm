@@ -96,6 +96,8 @@ class ShmemCommResource final {
   bool owns_runtime() const;
   int32_t rank() const;
   int32_t world_size() const;
+  int32_t reserve_generation();
+  void barrier_all() const;
 
  private:
   class Impl;

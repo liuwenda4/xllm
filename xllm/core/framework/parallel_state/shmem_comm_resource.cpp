@@ -16,10 +16,12 @@ limitations under the License.
 #include "framework/parallel_state/shmem_comm_resource.h"
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
 #include <system_error>
 #include <utility>
 
@@ -241,6 +243,10 @@ class ShmemCommResource::Impl final {
       : spec_(std::move(spec)), owns_runtime_(owns_runtime) {}
 
   ~Impl() {
+    if (!allocation_order_.empty()) {
+      aclrtSetDevice(spec_.device_index);
+      aclrtSynchronizeDevice();
+    }
     for (auto iter = allocation_order_.rbegin();
          iter != allocation_order_.rend();
          ++iter) {
@@ -285,11 +291,21 @@ class ShmemCommResource::Impl final {
   const ShmemCommSpec& spec() const { return spec_; }
   bool owns_runtime() const { return owns_runtime_; }
 
+  int32_t reserve_generation() {
+    const int64_t generation =
+        next_generation_.fetch_add(1, std::memory_order_relaxed);
+    if (generation > std::numeric_limits<int32_t>::max()) {
+      throw std::overflow_error("ACLSHMEM generation exhausted int32 range");
+    }
+    return static_cast<int32_t>(generation);
+  }
+
  private:
   ShmemCommSpec spec_;
   bool owns_runtime_ = false;
   std::unordered_map<std::string, Window> windows_;
   std::vector<std::string> allocation_order_;
+  std::atomic<int64_t> next_generation_{1};
 };
 
 ShmemCommResource::ShmemCommResource(std::unique_ptr<Impl> impl)
@@ -376,6 +392,12 @@ int32_t ShmemCommResource::rank() const { return impl_->spec().rank; }
 int32_t ShmemCommResource::world_size() const {
   return impl_->spec().world_size;
 }
+
+int32_t ShmemCommResource::reserve_generation() {
+  return impl_->reserve_generation();
+}
+
+void ShmemCommResource::barrier_all() const { aclshmem_barrier_all(); }
 
 bool ShmemCommResourceSlot::same_key(const ShmemCommSpec& lhs,
                                      const ShmemCommSpec& rhs) {

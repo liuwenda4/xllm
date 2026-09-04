@@ -44,6 +44,9 @@ limitations under the License.
 #include "framework/parallel_state/mega_moe_comm_resource.h"
 #include "framework/parallel_state/parallel_state.h"
 #include "kernels/ops_api.h"
+#if defined(XLLM_HAS_ACLSHMEM_MOE_AOT)
+#include "kernels/npu/tilelang/tilelang_ops_api.h"
+#endif
 #include "layers/common/dp_utils.h"
 #include "layers/npu_torch/deepseek_v4_eplb_load_utils.h"
 #include "platform/device.h"
@@ -223,6 +226,46 @@ void log_unavailable_aclshmem_moe_backend_once() {
                         capability.fallback_reason);
   });
 }
+
+#if defined(XLLM_HAS_ACLSHMEM_MOE_AOT)
+void log_aclshmem_moe_fallback_once(AclShmemMoeFallbackReason reason,
+                                    const std::string& detail = {}) {
+  static std::once_flag log_once;
+  std::call_once(log_once, [reason, detail]() {
+    LOG(WARNING) << "ACLSHMEM MoE requested but unavailable; preserving the "
+                    "existing NPU MoE backend. fallback_reason="
+                 << aclshmem_moe_fallback_reason_string(reason)
+                 << (detail.empty() ? "" : ", detail=") << detail;
+  });
+}
+
+int64_t aclshmem_spec_signature(const ShmemCommSpec& spec) {
+  uint64_t hash = 1469598103934665603ULL;
+  auto append_byte = [&hash](uint8_t value) {
+    hash ^= value;
+    hash *= 1099511628211ULL;
+  };
+  auto append_uint64 = [&append_byte](uint64_t value) {
+    for (int shift = 0; shift < 64; shift += 8) {
+      append_byte(static_cast<uint8_t>(value >> shift));
+    }
+  };
+  auto append_string = [&append_byte](const std::string& value) {
+    for (unsigned char character : value) {
+      append_byte(character);
+    }
+    append_byte(0);
+  };
+  append_uint64(static_cast<uint64_t>(spec.world_size));
+  append_uint64(spec.local_heap_bytes);
+  append_string(spec.ip_port);
+  for (const auto& window : spec.windows) {
+    append_string(window.name);
+    append_uint64(window.bytes);
+  }
+  return static_cast<int64_t>(hash & 0x7fffffffULL);
+}
+#endif
 
 torch::ScalarType dynamic_quant_supported_dtype(
     torch::ScalarType preferred_dtype) {
@@ -2269,12 +2312,348 @@ bool FusedMoEImpl::should_gather_dp_inputs_for_moe() const {
   return parallel_args_.dp_size() > 1;
 }
 
+#if defined(XLLM_HAS_ACLSHMEM_MOE_AOT)
+bool FusedMoEImpl::can_use_aclshmem_moe(const ModelInputParams& input_params,
+                                        const torch::Tensor& hidden_states,
+                                        const torch::Tensor& topk_weights,
+                                        const torch::Tensor& topk_ids) {
+  const bool locally_enabled =
+      ::xllm::KernelConfig::get_instance().enable_aclshmem_moe();
+  if (input_params.enable_graph) {
+    if (locally_enabled) {
+      log_aclshmem_moe_fallback_once(
+          AclShmemMoeFallbackReason::kGraphVariantUnavailable);
+    }
+    return false;
+  }
+  if (parallel_args_.moe_ep_group_ == nullptr) {
+    if (locally_enabled) {
+      log_aclshmem_moe_fallback_once(AclShmemMoeFallbackReason::kInvalidShape,
+                                     "MoE EP process group is unavailable");
+    }
+    return false;
+  }
+  if (!aclshmem_enable_consensus_checked_) {
+    auto enabled_vote =
+        torch::tensor({locally_enabled ? 1 : 0},
+                      torch::TensorOptions().dtype(torch::kInt32))
+            .to(options_.device());
+    parallel_args_.moe_ep_group_->allreduce(enabled_vote);
+    const int32_t enabled_ranks = enabled_vote.cpu()[0].item<int32_t>();
+    const int32_t ep_world_size = parallel_args_.moe_ep_group_->world_size();
+    aclshmem_enable_consensus_checked_ = true;
+    aclshmem_enabled_on_all_ranks_ = enabled_ranks == ep_world_size;
+    if (enabled_ranks != 0 && enabled_ranks != ep_world_size) {
+      log_aclshmem_moe_fallback_once(
+          AclShmemMoeFallbackReason::kDisabled,
+          "enable_aclshmem_moe differs across EP ranks");
+    }
+  }
+  if (!aclshmem_enabled_on_all_ranks_) {
+    return false;
+  }
+
+  const int64_t local_tokens = hidden_states.numel() / hidden_states.size(-1);
+  const int64_t ep_world_size =
+      parallel_args_.moe_ep_group_ == nullptr
+          ? 0
+          : parallel_args_.moe_ep_group_->world_size();
+  const int64_t ep_rank = parallel_args_.moe_ep_group_ == nullptr
+                              ? -1
+                              : parallel_args_.moe_ep_group_->rank();
+  const int64_t max_capacity =
+      ep_world_size > 0 ? ep_world_size * local_tokens * num_experts_per_rank_
+                        : 0;
+  const bool input_shapes_match =
+      local_tokens == 4 && hidden_size_ == 37 && topk_ == 2 &&
+      ep_world_size == 2 && num_experts_per_rank_ == 2 &&
+      hidden_states.size(-1) == hidden_size_ &&
+      topk_weights.numel() == local_tokens * topk_ &&
+      topk_ids.numel() == local_tokens * topk_;
+  const bool transport_kernels_available =
+      input_shapes_match &&
+      xllm::kernel::npu::tilelang::has_aclshmem_moe_quant_int8_specialization(
+          local_tokens, hidden_size_) &&
+      xllm::kernel::npu::tilelang::
+          has_aclshmem_moe_dispatch_int8_specialization(local_tokens,
+                                                        hidden_size_,
+                                                        topk_,
+                                                        ep_world_size,
+                                                        num_experts_per_rank_,
+                                                        ep_rank) &&
+      xllm::kernel::npu::tilelang::has_aclshmem_moe_dequant_int8_specialization(
+          max_capacity, hidden_size_);
+  const bool combine_kernel_available =
+      input_shapes_match &&
+      xllm::kernel::npu::tilelang::has_aclshmem_moe_combine_bf16_specialization(
+          local_tokens,
+          hidden_size_,
+          topk_,
+          ep_world_size,
+          num_experts_per_rank_,
+          ep_rank);
+  const bool expert_backend_available =
+      enable_ep2_dispatch_combine_ && !enable_eplb_ &&
+      parallel_args_.dp_size() == 1 && tp_pg_ != nullptr &&
+      tp_pg_->world_size() == 1 && !resolved_moe_quant_method_.has_value() &&
+      !is_smoothquant_ && w13_is_loaded_ && w2_is_loaded_ &&
+      w13_.scalar_type() == torch::kBFloat16 &&
+      w2_.scalar_type() == torch::kBFloat16 && is_gated_ &&
+      (hidden_act_ == "silu" || hidden_act_ == "swiglu") &&
+      num_total_experts_ == ep_world_size * num_experts_per_rank_;
+
+  AclShmemMoeCapabilityRequest request;
+  request.enabled = true;
+  request.runtime_available = aclshmem_moe_runtime_compiled();
+  request.dispatch_kernel_available = transport_kernels_available;
+  request.combine_kernel_available = combine_kernel_available;
+  request.graph_requested = input_params.enable_graph;
+  request.graph_variant_available = false;
+  request.expert_backend_available = expert_backend_available;
+  request.int8_dispatch = true;
+  request.input_dtype = hidden_states.scalar_type() == torch::kBFloat16
+                            ? AclShmemMoeInputDType::kBFloat16
+                            : AclShmemMoeInputDType::kUnsupported;
+  request.local_tokens = local_tokens;
+  request.hidden_size = hidden_size_;
+  request.topk = topk_;
+  request.ep_world_size = ep_world_size;
+  request.local_experts = num_experts_per_rank_;
+  request.max_capacity = max_capacity;
+  auto capability = evaluate_aclshmem_moe_capability(request);
+
+  ShmemCommSpec spec;
+  std::string spec_error;
+  if (capability.supported) {
+    if (aclshmem_moe_resource_ != nullptr &&
+        aclshmem_moe_pending_spec_.has_value()) {
+      spec = aclshmem_moe_pending_spec_.value();
+    } else {
+      const auto layout = build_aclshmem_moe_window_layout(
+          {/*local_tokens=*/local_tokens,
+           /*hidden_size=*/hidden_size_,
+           /*topk=*/topk_,
+           /*ep_world_size=*/ep_world_size,
+           /*local_experts=*/num_experts_per_rank_,
+           /*int8_dispatch=*/true});
+      if (!build_shmem_comm_spec_from_environment(ep_rank,
+                                                  ep_world_size,
+                                                  options_.device().index(),
+                                                  layout,
+                                                  &spec,
+                                                  &spec_error)) {
+        capability.supported = false;
+        capability.fallback_reason =
+            AclShmemMoeFallbackReason::kRuntimeUnavailable;
+      }
+    }
+  }
+
+  const int64_t local_vote = capability.supported ? 1 : 0;
+  const int64_t local_signature =
+      capability.supported ? aclshmem_spec_signature(spec) : 0;
+  auto consensus = torch::tensor({local_vote, local_signature},
+                                 torch::TensorOptions().dtype(torch::kInt64))
+                       .to(options_.device());
+  parallel_args_.moe_ep_group_->allreduce(consensus);
+  const auto consensus_cpu = consensus.cpu();
+  const int64_t supported_ranks = consensus_cpu[0].item<int64_t>();
+  const int64_t signature_sum = consensus_cpu[1].item<int64_t>();
+  const bool all_ranks_agree = supported_ranks == ep_world_size &&
+                               signature_sum == local_signature * ep_world_size;
+  if (!all_ranks_agree) {
+    log_aclshmem_moe_fallback_once(
+        capability.supported ? AclShmemMoeFallbackReason::kRuntimeUnavailable
+                             : capability.fallback_reason,
+        capability.supported ? "EP ranks have different SHMEM specs"
+                             : spec_error);
+    return false;
+  }
+  aclshmem_moe_pending_spec_ = std::move(spec);
+  return true;
+}
+
+bool FusedMoEImpl::initialize_aclshmem_moe_state() {
+  if (aclshmem_moe_resource_ != nullptr) {
+    return true;
+  }
+  CHECK(parallel_args_.moe_ep_group_ != nullptr);
+  CHECK(aclshmem_moe_pending_spec_.has_value())
+      << "ACLSHMEM MoE initialization requires an all-rank agreed spec";
+  const int32_t ep_world_size = parallel_args_.moe_ep_group_->world_size();
+  constexpr int64_t kLocalTokens = 4;
+  constexpr int64_t kPhysicalHidden = 64;
+  constexpr int64_t kMaxCapacity = 16;
+  std::string buffer_error;
+  if (!aclshmem_buffers_ready_) {
+    try {
+      const auto int_options = options_.dtype(torch::kInt32);
+      aclshmem_payload_ = torch::empty({kLocalTokens, kPhysicalHidden},
+                                       options_.dtype(torch::kInt8));
+      aclshmem_scale_ =
+          torch::empty({kLocalTokens}, options_.dtype(torch::kFloat32));
+      aclshmem_generation_id_ = torch::empty({1}, int_options);
+      aclshmem_iteration_id_ = torch::empty({1}, int_options);
+      aclshmem_expand_payload_ = torch::empty({kMaxCapacity, kPhysicalHidden},
+                                              options_.dtype(torch::kInt8));
+      aclshmem_expand_scale_ =
+          torch::empty({kMaxCapacity}, options_.dtype(torch::kFloat32));
+      aclshmem_expand_ids_ = torch::empty({kMaxCapacity, 3}, int_options);
+      aclshmem_global_prefix_ =
+          torch::empty({ep_world_size * num_experts_per_rank_}, int_options);
+      aclshmem_expert_token_nums_ =
+          torch::empty({num_experts_per_rank_}, options_.dtype(torch::kInt64));
+      aclshmem_ep_receive_count_ =
+          torch::empty({num_experts_per_rank_}, int_options);
+      aclshmem_active_mask_ = torch::empty({kMaxCapacity}, int_options);
+      aclshmem_actual_count_ = torch::empty({1}, int_options);
+      aclshmem_expand_x_ = torch::empty({kMaxCapacity, hidden_size_},
+                                        options_.dtype(torch::kBFloat16));
+      aclshmem_output_ = torch::empty({kLocalTokens, hidden_size_},
+                                      options_.dtype(torch::kBFloat16));
+      aclshmem_buffers_ready_ = true;
+    } catch (const std::exception& error) {
+      buffer_error = error.what();
+    }
+  }
+  auto buffer_vote = torch::tensor({aclshmem_buffers_ready_ ? 1 : 0},
+                                   torch::TensorOptions().dtype(torch::kInt32))
+                         .to(options_.device());
+  parallel_args_.moe_ep_group_->allreduce(buffer_vote);
+  const int32_t ready_ranks = buffer_vote.cpu()[0].item<int32_t>();
+  if (ready_ranks != ep_world_size) {
+    log_aclshmem_moe_fallback_once(
+        AclShmemMoeFallbackReason::kRuntimeUnavailable,
+        buffer_error.empty() ? "fixed buffer allocation failed on an EP rank"
+                             : buffer_error);
+    return false;
+  }
+
+  std::string resource_error;
+  auto resource = parallel_args_.moe_ep_group_->acquire_shmem_comm_resource(
+      aclshmem_moe_pending_spec_.value(), &resource_error);
+  auto resource_vote =
+      torch::tensor({resource != nullptr ? 1 : 0},
+                    torch::TensorOptions().dtype(torch::kInt32))
+          .to(options_.device());
+  parallel_args_.moe_ep_group_->allreduce(resource_vote);
+  const int32_t initialized_ranks = resource_vote.cpu()[0].item<int32_t>();
+  CHECK_EQ(initialized_ranks, ep_world_size)
+      << "ACLSHMEM initialization failed after all-rank agreement: "
+      << resource_error;
+  aclshmem_moe_resource_ = std::move(resource);
+  aclshmem_moe_resource_->barrier_all();
+  return true;
+}
+
+torch::Tensor FusedMoEImpl::forward_with_aclshmem_moe(
+    const torch::Tensor& hidden_states,
+    const torch::Tensor& topk_weights,
+    const torch::Tensor& topk_ids) {
+  CHECK(initialize_aclshmem_moe_state());
+  const auto hidden_states_shape = hidden_states.sizes();
+  auto input_2d = hidden_states.reshape({4, hidden_size_}).contiguous();
+  auto weights_2d =
+      topk_weights.reshape({4, topk_}).to(torch::kFloat32).contiguous();
+  auto ids_2d = topk_ids.reshape({4, topk_}).to(torch::kInt32).contiguous();
+  const int32_t ep_rank = parallel_args_.moe_ep_group_->rank();
+  if (ep_rank == 0) {
+    aclshmem_generation_id_.fill_(aclshmem_moe_resource_->reserve_generation());
+  } else {
+    aclshmem_generation_id_.zero_();
+  }
+  parallel_args_.moe_ep_group_->broadcast(aclshmem_generation_id_, 0);
+  aclshmem_iteration_id_.copy_(aclshmem_generation_id_).sub_(1);
+
+  xllm::kernel::npu::tilelang::aclshmem_moe_quant_int8(
+      input_2d, aclshmem_payload_, aclshmem_scale_);
+  xllm::kernel::npu::tilelang::AclShmemMoeDispatchInt8Params dispatch_params{
+      /*payload=*/aclshmem_payload_,
+      /*scale=*/aclshmem_scale_,
+      /*expert_ids=*/ids_2d,
+      /*generation_id=*/aclshmem_generation_id_,
+      /*iteration_id=*/aclshmem_iteration_id_,
+      /*win_payload=*/aclshmem_moe_resource_->window("dispatch_payload"),
+      /*win_scale=*/aclshmem_moe_resource_->window("dispatch_scale"),
+      /*win_triplet=*/aclshmem_moe_resource_->window("dispatch_triplet"),
+      /*win_status=*/aclshmem_moe_resource_->window("dispatch_status"),
+      /*win_credit=*/aclshmem_moe_resource_->window("dispatch_credit"),
+      /*expand_payload=*/aclshmem_expand_payload_,
+      /*expand_scale=*/aclshmem_expand_scale_,
+      /*expand_ids=*/aclshmem_expand_ids_,
+      /*global_prefix=*/aclshmem_global_prefix_,
+      /*expert_token_nums=*/aclshmem_expert_token_nums_,
+      /*ep_receive_count=*/aclshmem_ep_receive_count_,
+      /*active_mask=*/aclshmem_active_mask_,
+      /*actual_count=*/aclshmem_actual_count_,
+      /*hidden_size=*/hidden_size_,
+      /*ep_world_size=*/parallel_args_.moe_ep_group_->world_size(),
+      /*local_experts=*/num_experts_per_rank_,
+      /*rank=*/parallel_args_.moe_ep_group_->rank()};
+  xllm::kernel::npu::tilelang::aclshmem_moe_dispatch_int8(dispatch_params);
+  xllm::kernel::npu::tilelang::aclshmem_moe_dequant_int8(
+      aclshmem_expand_payload_,
+      aclshmem_expand_scale_,
+      aclshmem_active_mask_,
+      aclshmem_expand_x_);
+
+  ensure_group_gemm_weight_layout(w13_,
+                                  w13_group_gemm_layout_prepared_,
+                                  hidden_size_,
+                                  local_intermediate_size_ * 2,
+                                  "w13");
+  xllm::kernel::GroupGemmParams gemm1_params;
+  gemm1_params.a = aclshmem_expand_x_;
+  gemm1_params.b = w13_;
+  gemm1_params.group_list = aclshmem_expert_token_nums_;
+  gemm1_params.split_item = 2;
+  gemm1_params.group_type = 0;
+  gemm1_params.group_list_type = 1;
+  auto gemm1_out = xllm::kernel::group_gemm(gemm1_params);
+
+  torch::Tensor act_out;
+  act_->forward(gemm1_out, act_out);
+  ensure_group_gemm_weight_layout(w2_,
+                                  w2_group_gemm_layout_prepared_,
+                                  local_intermediate_size_,
+                                  hidden_size_,
+                                  "w2");
+  xllm::kernel::GroupGemmParams gemm2_params;
+  gemm2_params.a = act_out;
+  gemm2_params.b = w2_;
+  gemm2_params.group_list = aclshmem_expert_token_nums_;
+  gemm2_params.split_item = 2;
+  gemm2_params.group_type = 0;
+  gemm2_params.group_list_type = 1;
+  auto gemm2_out = xllm::kernel::group_gemm(gemm2_params);
+
+  xllm::kernel::npu::tilelang::AclShmemMoeCombineBf16Params combine_params{
+      /*expert_output=*/gemm2_out,
+      /*expand_ids=*/aclshmem_expand_ids_,
+      /*active_mask=*/aclshmem_active_mask_,
+      /*generation_id=*/aclshmem_generation_id_,
+      /*iteration_id=*/aclshmem_iteration_id_,
+      /*route_weights=*/weights_2d,
+      /*win_payload=*/aclshmem_moe_resource_->window("combine_payload"),
+      /*win_status=*/aclshmem_moe_resource_->window("combine_status"),
+      /*win_credit=*/aclshmem_moe_resource_->window("combine_credit"),
+      /*output=*/aclshmem_output_,
+      /*ep_world_size=*/parallel_args_.moe_ep_group_->world_size(),
+      /*local_experts=*/num_experts_per_rank_,
+      /*rank=*/parallel_args_.moe_ep_group_->rank()};
+  xllm::kernel::npu::tilelang::aclshmem_moe_combine_bf16(combine_params);
+  return aclshmem_output_.reshape(hidden_states_shape);
+}
+#endif
+
 bool FusedMoEImpl::can_use_ep2_dispatch_combine(
     const ModelInputParams& input_params,
     const torch::Tensor& hidden_states) const {
+#if !defined(XLLM_HAS_ACLSHMEM_MOE_AOT)
   if (::xllm::KernelConfig::get_instance().enable_aclshmem_moe()) {
     log_unavailable_aclshmem_moe_backend_once();
   }
+#endif
   if (!enable_ep2_dispatch_combine_) {
     return false;
   }
@@ -2758,6 +3137,28 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts(
   torch::Tensor input = hidden_states;
   torch::Tensor selected_topk_weights = topk_weights;
   torch::Tensor selected_topk_ids = topk_ids;
+#if defined(XLLM_HAS_ACLSHMEM_MOE_AOT)
+  if (can_use_aclshmem_moe(
+          input_params, input, selected_topk_weights, selected_topk_ids) &&
+      initialize_aclshmem_moe_state()) {
+    std::optional<torch::Tensor> shared_output = std::nullopt;
+    if (n_shared_experts_ > 0) {
+      shared_output = shared_experts_(input);
+      if (should_apply_shared_expert_gate(shared_expert_gate_,
+                                          is_deepseek_v4_,
+                                          shared_expert_gate_is_loaded_)) {
+        auto gate = torch::sigmoid(shared_expert_gate_->forward(input));
+        shared_output = gate * shared_output.value();
+      }
+    }
+    auto output = forward_with_aclshmem_moe(
+        input, selected_topk_weights, selected_topk_ids);
+    if (shared_output.has_value()) {
+      output = output + shared_output.value();
+    }
+    return output;
+  }
+#endif
   prepare_dispatch_ffn_combine_inputs();
   prepare_dispatch_gmm_combine_decode_inputs();
   const bool use_ep2_dispatch_combine =

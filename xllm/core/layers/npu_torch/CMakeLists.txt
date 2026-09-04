@@ -45,3 +45,9 @@ cc_library(
     :xllm_ops
     :triton_adapter
 )
+
+if(XLLM_HAS_ACLSHMEM_MOE_AOT)
+  target_link_libraries(npu_torch_layers PUBLIC tilelang_kernels)
+  target_compile_definitions(npu_torch_layers PUBLIC
+    XLLM_HAS_ACLSHMEM_MOE_AOT=1)
+endif()
