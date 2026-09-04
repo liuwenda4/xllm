@@ -40,6 +40,7 @@ limitations under the License.
 #include "framework/config/eplb_config.h"
 #include "framework/config/kernel_config.h"
 #include "framework/config/scheduler_config.h"
+#include "framework/parallel_state/aclshmem_moe_capability.h"
 #include "framework/parallel_state/mega_moe_comm_resource.h"
 #include "framework/parallel_state/parallel_state.h"
 #include "kernels/ops_api.h"
@@ -207,6 +208,20 @@ bool is_supported_dynamic_moe_quant_method(
 bool has_effective_swiglu_limit(double swiglu_limit) {
   return std::isfinite(swiglu_limit) && swiglu_limit > 0.0 &&
          swiglu_limit < 1000000.0;
+}
+
+void log_unavailable_aclshmem_moe_backend_once() {
+  static std::once_flag log_once;
+  std::call_once(log_once, []() {
+    AclShmemMoeCapabilityRequest request;
+    request.enabled = true;
+    request.runtime_available = aclshmem_moe_runtime_compiled();
+    const auto capability = evaluate_aclshmem_moe_capability(request);
+    LOG(WARNING) << "ACLSHMEM MoE requested but unavailable; preserving the "
+                    "existing NPU MoE backend. fallback_reason="
+                 << aclshmem_moe_fallback_reason_string(
+                        capability.fallback_reason);
+  });
 }
 
 torch::ScalarType dynamic_quant_supported_dtype(
@@ -2257,6 +2272,9 @@ bool FusedMoEImpl::should_gather_dp_inputs_for_moe() const {
 bool FusedMoEImpl::can_use_ep2_dispatch_combine(
     const ModelInputParams& input_params,
     const torch::Tensor& hidden_states) const {
+  if (::xllm::KernelConfig::get_instance().enable_aclshmem_moe()) {
+    log_unavailable_aclshmem_moe_backend_once();
+  }
   if (!enable_ep2_dispatch_combine_) {
     return false;
   }

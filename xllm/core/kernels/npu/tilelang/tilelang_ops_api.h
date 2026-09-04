@@ -28,6 +28,55 @@ namespace xllm::kernel::npu::tilelang {
 
 // Public TileLang kernel APIs exported to the xLLM NPU runtime.
 
+struct AclShmemMoeDispatchInt8Params {
+  torch::Tensor payload;
+  torch::Tensor scale;
+  torch::Tensor expert_ids;
+  torch::Tensor generation_id;
+  torch::Tensor iteration_id;
+  void* win_payload = nullptr;
+  void* win_scale = nullptr;
+  void* win_triplet = nullptr;
+  void* win_status = nullptr;
+  void* win_credit = nullptr;
+  torch::Tensor expand_payload;
+  torch::Tensor expand_scale;
+  torch::Tensor expand_ids;
+  torch::Tensor global_prefix;
+  torch::Tensor expert_token_nums;
+  torch::Tensor ep_receive_count;
+  torch::Tensor active_mask;
+  torch::Tensor actual_count;
+  int64_t hidden_size = 0;
+  int64_t ep_world_size = 0;
+  int64_t local_experts = 0;
+  int64_t rank = -1;
+};
+
+bool has_aclshmem_moe_quant_int8_specialization(int64_t local_tokens,
+                                                int64_t hidden_size);
+
+void aclshmem_moe_quant_int8(const torch::Tensor& input,
+                             torch::Tensor& payload,
+                             torch::Tensor& scale);
+
+bool has_aclshmem_moe_dispatch_int8_specialization(int64_t local_tokens,
+                                                   int64_t hidden_size,
+                                                   int64_t topk,
+                                                   int64_t ep_world_size,
+                                                   int64_t local_experts,
+                                                   int64_t rank);
+
+void aclshmem_moe_dispatch_int8(AclShmemMoeDispatchInt8Params& params);
+
+bool has_aclshmem_moe_dequant_int8_specialization(int64_t max_capacity,
+                                                  int64_t hidden_size);
+
+void aclshmem_moe_dequant_int8(const torch::Tensor& payload,
+                               const torch::Tensor& scale,
+                               const torch::Tensor& active_mask,
+                               torch::Tensor& output);
+
 // Take the first token from each row of an existing row-major int32 verify
 // buffer and pack it with `spec_width - 1` proposer columns into graph-owned
 // row-major int32 storage on the current NPU stream. `spec_width` equals

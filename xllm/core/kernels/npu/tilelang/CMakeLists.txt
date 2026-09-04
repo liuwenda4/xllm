@@ -172,6 +172,22 @@ tilelang_register_runtime_kernel(
   WRAPPER_SRCS fused_sigmoid_gating_delta_rule_wrapper.cpp
 )
 
+if(XLLM_HAS_ACLSHMEM AND
+   "$ENV{XLLM_ENABLE_ACLSHMEM_MOE_AOT}" STREQUAL "1")
+  tilelang_register_runtime_kernel(
+    NAME aclshmem_moe_quant_int8
+    WRAPPER_SRCS aclshmem_moe_quant_int8_wrapper.cpp
+  )
+  tilelang_register_runtime_kernel(
+    NAME aclshmem_moe_dispatch_int8
+    WRAPPER_SRCS aclshmem_moe_dispatch_int8_wrapper.cpp
+  )
+  tilelang_register_runtime_kernel(
+    NAME aclshmem_moe_dequant_int8
+    WRAPPER_SRCS aclshmem_moe_dequant_int8_wrapper.cpp
+  )
+endif()
+
 cc_library(
   NAME
     tilelang_kernels

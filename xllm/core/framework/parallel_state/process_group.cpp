@@ -560,6 +560,13 @@ std::shared_ptr<MegaMoeCommResource>
 ProcessGroup::acquire_mega_moe_comm_resource(const MegaMoeCommSpec& spec) {
   return mega_moe_comm_slot_.acquire(spec);
 }
+#if defined(XLLM_HAS_ACLSHMEM)
+std::shared_ptr<ShmemCommResource> ProcessGroup::acquire_shmem_comm_resource(
+    const ShmemCommSpec& spec,
+    std::string* error) {
+  return shmem_comm_slot_.acquire(spec, error);
+}
+#endif
 #endif
 
 std::unique_ptr<ProcessGroup> create_process_group(

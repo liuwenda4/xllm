@@ -59,7 +59,18 @@ def prepend_pythonpath(env: dict[str, str], path: str) -> None:
 
 def prepare_tilelang_import(tilelang_root: str | Path | None = None) -> Path:
     tl_root = Path(tilelang_root).resolve() if tilelang_root is not None else resolve_tilelang_root()
-    import_path = tl_root.parent
+    source_root_value = os.environ.get("TL_SOURCE_ROOT", "").strip()
+    source_root = Path(source_root_value).resolve() if source_root_value else None
+    if source_root is not None:
+        if not (source_root / "tilelang" / "__init__.py").is_file():
+            raise RuntimeError(f"TL_SOURCE_ROOT must point to a TileLang source repository, got: {source_root}")
+        import_path = source_root
+    elif (tl_root / "tilelang" / "__init__.py").is_file():
+        import_path = tl_root
+    elif (tl_root / "__init__.py").is_file():
+        import_path = tl_root.parent
+    else:
+        raise RuntimeError(f"TL_ROOT must be a TileLang source repository or installed package root, got: {tl_root}")
     source_root = repo_root()
     import_paths = [
         str(source_root),

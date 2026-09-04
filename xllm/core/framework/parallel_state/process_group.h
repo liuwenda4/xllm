@@ -27,6 +27,9 @@ limitations under the License.
 #include <torch_npu/csrc/distributed/ProcessGroupHCCL.hpp>
 
 #include "framework/parallel_state/mega_moe_comm_resource.h"
+#if defined(XLLM_HAS_ACLSHMEM)
+#include "framework/parallel_state/shmem_comm_resource.h"
+#endif
 #endif
 
 namespace xllm {
@@ -138,6 +141,11 @@ class ProcessGroup {
   virtual HcclComm hccl_comm();
   std::shared_ptr<MegaMoeCommResource> acquire_mega_moe_comm_resource(
       const MegaMoeCommSpec& spec);
+#if defined(XLLM_HAS_ACLSHMEM)
+  std::shared_ptr<ShmemCommResource> acquire_shmem_comm_resource(
+      const ShmemCommSpec& spec,
+      std::string* error);
+#endif
 #endif
 
  private:
@@ -182,6 +190,9 @@ class ProcessGroup {
   // declaration order), releasing the context tensor before the HCCL
   // communicator is torn down.
   MegaMoeCommResourceSlot mega_moe_comm_slot_;
+#if defined(XLLM_HAS_ACLSHMEM)
+  ShmemCommResourceSlot shmem_comm_slot_;
+#endif
 #endif
 };
 

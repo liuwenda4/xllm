@@ -88,6 +88,28 @@ if(USE_NPU)
       torch
       GTest::gtest_main
   )
+
+  cc_test(
+    NAME
+      aclshmem_moe_capability_test
+    SRCS
+      aclshmem_moe_capability_test.cpp
+    DEPS
+      parallel_state
+      GTest::gtest_main
+  )
+
+  if(XLLM_HAS_ACLSHMEM)
+    cc_test(
+      NAME
+        shmem_comm_resource_test
+      SRCS
+        shmem_comm_resource_test.cpp
+      DEPS
+        parallel_state
+        GTest::gtest_main
+    )
+  endif()
 endif()
 
 if(USE_MLU)

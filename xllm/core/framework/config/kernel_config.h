@@ -49,6 +49,7 @@ class KernelConfig final {
          "enable_aclnn_matmul",
          "enable_aclnn_swiglu",
          "enable_mega_moe",
+         "enable_aclshmem_moe",
          "enable_dspark_native_sas",
          "enable_flashcomm1",
          "flashcomm1_min_prefill_tokens",
@@ -75,6 +76,8 @@ class KernelConfig final {
   PROPERTY(bool, enable_aclnn_swiglu) = false;
 
   PROPERTY(bool, enable_mega_moe) = false;
+
+  PROPERTY(bool, enable_aclshmem_moe) = false;
 
   PROPERTY(bool, enable_dspark_native_sas) = false;
 

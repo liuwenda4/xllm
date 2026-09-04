@@ -129,6 +129,7 @@ def resolve_npu_home_path() -> str:
 
 def bisheng_include_dirs() -> list[str]:
     tl_root = require_env("TL_ROOT")
+    tl_source_root = os.environ.get("TL_SOURCE_ROOT", "").strip() or tl_root
     npu_home_path = resolve_npu_home_path()
     return [
         f"{npu_home_path}/include",
@@ -139,23 +140,27 @@ def bisheng_include_dirs() -> list[str]:
         f"{npu_home_path}/compiler/tikcpp/tikcfw",
         f"{npu_home_path}/compiler/tikcpp/tikcfw/impl",
         f"{npu_home_path}/compiler/tikcpp/tikcfw/interface",
-        f"{tl_root}/3rdparty/catlass/include",
-        f"{tl_root}/3rdparty/shmem/include",
-        f"{tl_root}/3rdparty/shmem/src/device",
-        f"{tl_root}/src",
+        f"{tl_source_root}/3rdparty/catlass/include",
+        f"{tl_source_root}/3rdparty/shmem/include",
+        f"{tl_source_root}/3rdparty/shmem/src/device",
+        f"{tl_source_root}/src",
     ]
 
 
 def build_fingerprint(bisheng_executable: str, bisheng_arch: str) -> dict[str, str]:
     tl_root = require_env("TL_ROOT")
     npu_home_path = resolve_npu_home_path()
-    return {
+    fingerprint = {
         "target": "ascend",
         "tl_root": tl_root,
         "npu_home_path": npu_home_path,
         "bisheng_executable": bisheng_executable,
         "bisheng_arch": bisheng_arch,
     }
+    tl_source_root = os.environ.get("TL_SOURCE_ROOT", "").strip()
+    if tl_source_root:
+        fingerprint["tl_source_root"] = tl_source_root
+    return fingerprint
 
 
 def resolve_build_context(device: str | None, bisheng_executable: str) -> AscendBuildContext:

@@ -410,6 +410,8 @@ DECLARE_bool(enable_aclnn_matmul);
 
 DECLARE_bool(enable_aclnn_swiglu);
 
+DECLARE_bool(enable_aclshmem_moe);
+
 DECLARE_bool(enable_dspark_native_sas);
 
 DECLARE_bool(enable_flashcomm1);
