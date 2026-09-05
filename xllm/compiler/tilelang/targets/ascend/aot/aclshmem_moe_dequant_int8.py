@@ -31,7 +31,12 @@ class AclShmemMoeDequantInt8Kernel(TilelangKernel):
             "variant_key": "c16_h37",
             "max_capacity": 16,
             "hidden_size": 37,
-        }
+        },
+        {
+            "variant_key": "c1024_h4096",
+            "max_capacity": 1024,
+            "hidden_size": 4096,
+        },
     ]
 
     @staticmethod

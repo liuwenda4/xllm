@@ -690,6 +690,29 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
     CHECK(parallel_args_.moe_ep_group_ != nullptr)
         << "DeepSeek-V4 NPU EP2 dispatch/combine requires moe_ep_group.";
   }
+#if defined(XLLM_HAS_ACLSHMEM_MOE_AOT)
+  const bool aclshmem_enabled_locally =
+      ::xllm::KernelConfig::get_instance().enable_aclshmem_moe();
+  if (parallel_args_.moe_ep_group_ != nullptr &&
+      parallel_args_.moe_ep_group_->world_size() > 1) {
+    auto enabled_vote =
+        torch::tensor({aclshmem_enabled_locally ? 1 : 0},
+                      torch::TensorOptions().dtype(torch::kInt32))
+            .to(options_);
+    parallel_args_.moe_ep_group_->allreduce(enabled_vote);
+    const int32_t enabled_ranks = enabled_vote.cpu()[0].item<int32_t>();
+    const int32_t ep_world_size = parallel_args_.moe_ep_group_->world_size();
+    aclshmem_enable_consensus_checked_ = true;
+    aclshmem_enabled_on_all_ranks_ = enabled_ranks == ep_world_size;
+    if (enabled_ranks != 0 && enabled_ranks != ep_world_size) {
+      LOG(WARNING) << "ACLSHMEM MoE enable flag differs across EP ranks; "
+                      "disabling the backend for this layer.";
+    }
+  } else {
+    aclshmem_enable_consensus_checked_ = true;
+    aclshmem_enabled_on_all_ranks_ = aclshmem_enabled_locally;
+  }
+#endif
   if (enable_eplb_) {
     CHECK(parallel_args_.eplb_group_ != nullptr)
         << "DeepSeek-V4 EPLB requires a dedicated EPLB process group.";
@@ -2317,39 +2340,14 @@ bool FusedMoEImpl::can_use_aclshmem_moe(const ModelInputParams& input_params,
                                         const torch::Tensor& hidden_states,
                                         const torch::Tensor& topk_weights,
                                         const torch::Tensor& topk_ids) {
-  const bool locally_enabled =
-      ::xllm::KernelConfig::get_instance().enable_aclshmem_moe();
   if (input_params.enable_graph) {
-    if (locally_enabled) {
+    if (aclshmem_enabled_on_all_ranks_) {
       log_aclshmem_moe_fallback_once(
           AclShmemMoeFallbackReason::kGraphVariantUnavailable);
     }
     return false;
   }
-  if (parallel_args_.moe_ep_group_ == nullptr) {
-    if (locally_enabled) {
-      log_aclshmem_moe_fallback_once(AclShmemMoeFallbackReason::kInvalidShape,
-                                     "MoE EP process group is unavailable");
-    }
-    return false;
-  }
-  if (!aclshmem_enable_consensus_checked_) {
-    auto enabled_vote =
-        torch::tensor({locally_enabled ? 1 : 0},
-                      torch::TensorOptions().dtype(torch::kInt32))
-            .to(options_.device());
-    parallel_args_.moe_ep_group_->allreduce(enabled_vote);
-    const int32_t enabled_ranks = enabled_vote.cpu()[0].item<int32_t>();
-    const int32_t ep_world_size = parallel_args_.moe_ep_group_->world_size();
-    aclshmem_enable_consensus_checked_ = true;
-    aclshmem_enabled_on_all_ranks_ = enabled_ranks == ep_world_size;
-    if (enabled_ranks != 0 && enabled_ranks != ep_world_size) {
-      log_aclshmem_moe_fallback_once(
-          AclShmemMoeFallbackReason::kDisabled,
-          "enable_aclshmem_moe differs across EP ranks");
-    }
-  }
-  if (!aclshmem_enabled_on_all_ranks_) {
+  if (!aclshmem_enable_consensus_checked_ || !aclshmem_enabled_on_all_ranks_) {
     return false;
   }
 
@@ -2365,8 +2363,6 @@ bool FusedMoEImpl::can_use_aclshmem_moe(const ModelInputParams& input_params,
       ep_world_size > 0 ? ep_world_size * local_tokens * num_experts_per_rank_
                         : 0;
   const bool input_shapes_match =
-      local_tokens == 4 && hidden_size_ == 37 && topk_ == 2 &&
-      ep_world_size == 2 && num_experts_per_rank_ == 2 &&
       hidden_states.size(-1) == hidden_size_ &&
       topk_weights.numel() == local_tokens * topk_ &&
       topk_ids.numel() == local_tokens * topk_;
@@ -2392,13 +2388,22 @@ bool FusedMoEImpl::can_use_aclshmem_moe(const ModelInputParams& input_params,
           ep_world_size,
           num_experts_per_rank_,
           ep_rank);
-  const bool expert_backend_available =
+  const bool bf16_expert_backend_available =
       enable_ep2_dispatch_combine_ && !enable_eplb_ &&
       parallel_args_.dp_size() == 1 && tp_pg_ != nullptr &&
       tp_pg_->world_size() == 1 && !resolved_moe_quant_method_.has_value() &&
       !is_smoothquant_ && w13_is_loaded_ && w2_is_loaded_ &&
       w13_.scalar_type() == torch::kBFloat16 &&
       w2_.scalar_type() == torch::kBFloat16 && is_gated_ &&
+      (hidden_act_ == "silu" || hidden_act_ == "swiglu") &&
+      num_total_experts_ == ep_world_size * num_experts_per_rank_;
+  const bool w8a8_expert_backend_available =
+      enable_ep2_dispatch_combine_ && !enable_eplb_ &&
+      parallel_args_.dp_size() == 1 && tp_pg_ != nullptr &&
+      tp_pg_->world_size() == 1 &&
+      is_w8a8_dynamic_quant_method(resolved_moe_quant_method_) &&
+      w13_is_loaded_ && w2_is_loaded_ && w13_scale_is_loaded_ &&
+      w2_scale_is_loaded_ && is_gated_ &&
       (hidden_act_ == "silu" || hidden_act_ == "swiglu") &&
       num_total_experts_ == ep_world_size * num_experts_per_rank_;
 
@@ -2409,7 +2414,8 @@ bool FusedMoEImpl::can_use_aclshmem_moe(const ModelInputParams& input_params,
   request.combine_kernel_available = combine_kernel_available;
   request.graph_requested = input_params.enable_graph;
   request.graph_variant_available = false;
-  request.expert_backend_available = expert_backend_available;
+  request.expert_backend_available =
+      bf16_expert_backend_available || w8a8_expert_backend_available;
   request.int8_dispatch = true;
   request.input_dtype = hidden_states.scalar_type() == torch::kBFloat16
                             ? AclShmemMoeInputDType::kBFloat16
@@ -2482,8 +2488,10 @@ bool FusedMoEImpl::initialize_aclshmem_moe_state() {
       << "ACLSHMEM MoE initialization requires an all-rank agreed spec";
   const int32_t ep_world_size = parallel_args_.moe_ep_group_->world_size();
   constexpr int64_t kLocalTokens = 4;
-  constexpr int64_t kPhysicalHidden = 64;
-  constexpr int64_t kMaxCapacity = 16;
+  const int64_t kPhysicalHidden =
+      std::max<int64_t>(32, (hidden_size_ + 31) / 32 * 32);
+  const int64_t kMaxCapacity =
+      ep_world_size * kLocalTokens * num_experts_per_rank_;
   std::string buffer_error;
   if (!aclshmem_buffers_ready_) {
     try {
@@ -2597,35 +2605,102 @@ torch::Tensor FusedMoEImpl::forward_with_aclshmem_moe(
       aclshmem_active_mask_,
       aclshmem_expand_x_);
 
-  ensure_group_gemm_weight_layout(w13_,
-                                  w13_group_gemm_layout_prepared_,
-                                  hidden_size_,
-                                  local_intermediate_size_ * 2,
-                                  "w13");
-  xllm::kernel::GroupGemmParams gemm1_params;
-  gemm1_params.a = aclshmem_expand_x_;
-  gemm1_params.b = w13_;
-  gemm1_params.group_list = aclshmem_expert_token_nums_;
-  gemm1_params.split_item = 2;
-  gemm1_params.group_type = 0;
-  gemm1_params.group_list_type = 1;
-  auto gemm1_out = xllm::kernel::group_gemm(gemm1_params);
+  torch::Tensor gemm2_out;
+  const auto group_list = aclshmem_expert_token_nums_.to(torch::kInt64);
+  if (is_w8a8_dynamic_quant_method(resolved_moe_quant_method_)) {
+    CHECK(w13_scale_is_loaded_ && w2_scale_is_loaded_)
+        << "ACLSHMEM W8A8 MoE requires both weight scales";
+    xllm::kernel::NpuQuantizeParams quant_params;
+    quant_params.input = aclshmem_expand_x_;
+    torch::Tensor quantized_expand_x;
+    std::optional<torch::Tensor> input_scale;
+    std::tie(quantized_expand_x, input_scale) =
+        xllm::kernel::dynamic_quant(quant_params);
+    CHECK(input_scale.has_value() && input_scale->defined())
+        << "ACLSHMEM W8A8 MoE requires a per-token input scale";
 
-  torch::Tensor act_out;
-  act_->forward(gemm1_out, act_out);
-  ensure_group_gemm_weight_layout(w2_,
-                                  w2_group_gemm_layout_prepared_,
-                                  local_intermediate_size_,
-                                  hidden_size_,
-                                  "w2");
-  xllm::kernel::GroupGemmParams gemm2_params;
-  gemm2_params.a = act_out;
-  gemm2_params.b = w2_;
-  gemm2_params.group_list = aclshmem_expert_token_nums_;
-  gemm2_params.split_item = 2;
-  gemm2_params.group_type = 0;
-  gemm2_params.group_list_type = 1;
-  auto gemm2_out = xllm::kernel::group_gemm(gemm2_params);
+    ensure_group_gemm_weight_layout(w13_,
+                                    w13_group_gemm_layout_prepared_,
+                                    hidden_size_,
+                                    local_intermediate_size_ * 2,
+                                    "w13");
+    std::vector<torch::Tensor> quantized_x_list{quantized_expand_x};
+    std::vector<torch::Tensor> w13_list{w13_};
+    xllm::kernel::GroupGemmParams gemm1_params;
+    gemm1_params.x_list = torch::TensorList(quantized_x_list);
+    gemm1_params.weight_list = torch::TensorList(w13_list);
+    gemm1_params.group_list = group_list;
+    gemm1_params.split_item = 2;
+    gemm1_params.group_type = 0;
+    gemm1_params.group_list_type = 1;
+    gemm1_params.output_dtype = torch::kInt32;
+    auto gemm1_out = xllm::kernel::group_gemm(gemm1_params);
+
+    xllm::kernel::DequantSwigluQuantParams swiglu_params;
+    swiglu_params.x = gemm1_out;
+    swiglu_params.weight_scale = w13_scale_;
+    swiglu_params.activation_scale = input_scale.value();
+    swiglu_params.group_index = group_list;
+    swiglu_params.activate_left = true;
+    swiglu_params.quant_mode = 1;
+    apply_ds_v4_dequant_swiglu_quant_v2_params(swiglu_params, swiglu_limit_);
+    torch::Tensor activated_x;
+    torch::Tensor activated_scale;
+    std::tie(activated_x, activated_scale) =
+        xllm::kernel::dequant_swiglu_quant(swiglu_params);
+
+    ensure_group_gemm_weight_layout(w2_,
+                                    w2_group_gemm_layout_prepared_,
+                                    local_intermediate_size_,
+                                    hidden_size_,
+                                    "w2");
+    std::vector<torch::Tensor> activated_x_list{activated_x};
+    std::vector<torch::Tensor> w2_list{w2_};
+    std::vector<torch::Tensor> w2_scale_list{w2_scale_};
+    std::vector<torch::Tensor> activated_scale_list{activated_scale};
+    xllm::kernel::GroupGemmParams gemm2_params;
+    gemm2_params.x_list = torch::TensorList(activated_x_list);
+    gemm2_params.weight_list = torch::TensorList(w2_list);
+    gemm2_params.scale_list = torch::TensorList(w2_scale_list);
+    gemm2_params.per_token_scale_list = torch::TensorList(activated_scale_list);
+    gemm2_params.group_list = group_list;
+    gemm2_params.split_item = 2;
+    gemm2_params.group_type = 0;
+    gemm2_params.group_list_type = 1;
+    gemm2_params.output_dtype = hidden_states.dtype().toScalarType();
+    gemm2_out = xllm::kernel::group_gemm(gemm2_params);
+  } else {
+    ensure_group_gemm_weight_layout(w13_,
+                                    w13_group_gemm_layout_prepared_,
+                                    hidden_size_,
+                                    local_intermediate_size_ * 2,
+                                    "w13");
+    xllm::kernel::GroupGemmParams gemm1_params;
+    gemm1_params.a = aclshmem_expand_x_;
+    gemm1_params.b = w13_;
+    gemm1_params.group_list = group_list;
+    gemm1_params.split_item = 2;
+    gemm1_params.group_type = 0;
+    gemm1_params.group_list_type = 1;
+    auto gemm1_out = xllm::kernel::group_gemm(gemm1_params);
+
+    torch::Tensor act_out;
+    act_->forward(gemm1_out, act_out);
+    ensure_group_gemm_weight_layout(w2_,
+                                    w2_group_gemm_layout_prepared_,
+                                    local_intermediate_size_,
+                                    hidden_size_,
+                                    "w2");
+    xllm::kernel::GroupGemmParams gemm2_params;
+    gemm2_params.a = act_out;
+    gemm2_params.b = w2_;
+    gemm2_params.group_list = group_list;
+    gemm2_params.split_item = 2;
+    gemm2_params.group_type = 0;
+    gemm2_params.group_list_type = 1;
+    gemm2_params.output_dtype = hidden_states.dtype().toScalarType();
+    gemm2_out = xllm::kernel::group_gemm(gemm2_params);
+  }
 
   xllm::kernel::npu::tilelang::AclShmemMoeCombineBf16Params combine_params{
       /*expert_output=*/gemm2_out,

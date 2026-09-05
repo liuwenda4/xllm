@@ -41,6 +41,17 @@ class AclShmemMoeCombineBf16Kernel(TilelangKernel):
             "rank": rank,
         }
         for rank in range(2)
+    ] + [
+        {
+            "variant_key": f"t4_h4096_k6_ep16_le16_r{rank}",
+            "local_tokens": 4,
+            "hidden_size": 4096,
+            "topk": 6,
+            "ep_world_size": 16,
+            "local_experts": 16,
+            "rank": rank,
+        }
+        for rank in range(16)
     ]
 
     @staticmethod

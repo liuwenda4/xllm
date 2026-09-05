@@ -31,7 +31,12 @@ class AclShmemMoeQuantInt8Kernel(TilelangKernel):
             "variant_key": "t4_h37",
             "local_tokens": 4,
             "hidden_size": 37,
-        }
+        },
+        {
+            "variant_key": "t4_h4096",
+            "local_tokens": 4,
+            "hidden_size": 4096,
+        },
     ]
 
     @staticmethod
