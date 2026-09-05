@@ -121,4 +121,31 @@ if(XLLM_HAS_ACLSHMEM_MOE_AOT)
     "-Wl,--whole-archive"
     "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
     "-Wl,--no-whole-archive")
+
+  cc_test(
+    NAME
+      aclshmem_moe_w8a8_eager_test
+    SRCS
+      aclshmem_moe_w8a8_eager_test.cpp
+    DEPS
+      :npu_torch_layers
+      :parallel_state
+      :state_dict
+      glog::glog
+      torch
+      GTest::gtest_main
+  )
+
+  target_link_libraries(aclshmem_moe_w8a8_eager_test
+                        PRIVATE
+                        ascendcl
+                        hccl
+                        c_sec
+                        nnopbase
+                        atb)
+
+  target_link_options(aclshmem_moe_w8a8_eager_test PRIVATE
+    "-Wl,--whole-archive"
+    "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
+    "-Wl,--no-whole-archive")
 endif()

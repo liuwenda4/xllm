@@ -103,6 +103,7 @@ class FusedMoEImpl : public torch::nn::Module {
 
 #if defined(XLLM_HAS_ACLSHMEM_MOE_AOT)
   friend class AclShmemMoeEagerTestPeer;
+  friend class AclShmemMoeW8A8EagerTestPeer;
 #endif
 
  private:
