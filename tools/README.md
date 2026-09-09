@@ -39,6 +39,19 @@ python tools/minimax_h3_checkpoint_audit.py \
   --output-path /path/to/checkpoint_manifest.json
 ```
 
+Build the source-to-runtime weight ledger and optionally compare every
+converted tensor payload bitwise:
+
+```bash
+python tools/minimax_h3_weight_ledger.py \
+  --checkpoint-path /path/to/MiniMax-H3/Ref2VA \
+  --converted-path /path/to/Ref2VA-diffusers \
+  --converter-path /path/to/diffusers/scripts/convert_minimax_h3_to_diffusers.py \
+  --output-path /path/to/weight_ledger.jsonl \
+  --summary-path /path/to/weight_ledger_summary.json \
+  --validate-payload
+```
+
 Run a converted Modular Diffusers Ref2VA text-plus-image reference case with
 group offloading:
 
