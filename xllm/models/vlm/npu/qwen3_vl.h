@@ -907,5 +907,6 @@ REGISTER_MODEL_ARGS_WITH_VARNAME(qwen3_vl_atb, qwen3_vl_atb, [&] {
       rope_scaling_rope_type, "vision_config.rope_scaling.type", "mrope");
 
   LOAD_ARG_OR(vocab_size, "text_config.vocab_size", 151936);
+  LOAD_ARG_OR(layers_to_capture, "layers_to_capture", std::vector<int32_t>{});
 });
 }  // namespace xllm::npu::model

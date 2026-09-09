@@ -40,6 +40,7 @@ from xllm.python.layers import (
     RMSNorm,
     RotaryEmbedding,
 )
+from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.qwen3 import (
     Qwen3Config,
@@ -702,6 +703,7 @@ class Qwen3VLModel(nn.Module):
             )
         self.layers = nn.ModuleList([Qwen3DecoderLayer(cfg, i, dtype, device) for i in range(cfg.n_layers)])
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype=dtype, device=device)
+        self.aux_hidden_capture = AuxHiddenCapture(cfg.layers_to_capture)
         # Set externally by get_input_embeddings before the runner kicks in.
         self._inputs_embeds: torch.Tensor | None = None
         self.deepstack_input_embeds: list[torch.Tensor] | None = None
@@ -710,7 +712,7 @@ class Qwen3VLModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self._inputs_embeds is not None:
             hidden = self._inputs_embeds
             self._inputs_embeds = None
@@ -732,17 +734,19 @@ class Qwen3VLModel(nn.Module):
             cos, sin = self.rotary(positions)
 
         residual: torch.Tensor | None = None
+        aux_hidden_buffer = self.aux_hidden_capture.create_buffer(hidden)
         for i, layer in enumerate(self.layers):
             hidden, residual = layer(hidden, residual, positions, cos_sin_cache, cos, sin, mrope_sec)
             # Deepstack injection: add deepstack embeds after the first
             # N layers.
             if self.deepstack_input_embeds is not None and i < len(self.deepstack_input_embeds):
                 hidden = hidden + self.deepstack_input_embeds[i]
+            self.aux_hidden_capture.capture_layer(i, hidden, residual, aux_hidden_buffer)
 
         hidden, _ = self.norm(hidden, residual)
         # Clear deepstack embeds after use.
         self.deepstack_input_embeds = None
-        return hidden
+        return self.aux_hidden_capture.finalize(hidden, aux_hidden_buffer)
 
 
 # ---------------------------------------------------------------------------

@@ -63,3 +63,25 @@ python tools/minimax_h3_reference.py \
   --output-dir /path/to/artifact \
   --device npu:0
 ```
+
+Dump the official Qwen3-VL input, layer-0, and pre-final-norm layer-50
+conditioning tensors without running the H3 denoiser:
+
+```bash
+python tools/minimax_h3_qwen_reference.py \
+  --checkpoint-path /path/to/Ref2VA-diffusers \
+  --image-path /path/to/reference.png \
+  --prompt-path /path/to/prompt.txt \
+  --output-dir /path/to/qwen-reference \
+  --device npu:0
+```
+
+Compare xLLM's Qwen3-VL NPU conditioner against that golden tensor:
+
+```bash
+python tools/minimax_h3_qwen_xllm.py \
+  --text-checkpoint /path/to/MiniMax-H3/Ref2VA/text_encoder \
+  --golden-path /path/to/qwen_layer50_reference.pt \
+  --output-dir /path/to/qwen-xllm \
+  --device npu:0
+```
