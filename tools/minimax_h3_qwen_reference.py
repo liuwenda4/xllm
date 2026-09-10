@@ -41,6 +41,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--reference-short-edge", type=int, default=2048)
     parser.add_argument("--fps", type=float, default=24.0)
+    parser.add_argument("--capture-all-layers", action="store_true")
+    parser.add_argument("--trace-attention", action="store_true")
     return parser.parse_args()
 
 
@@ -179,15 +181,96 @@ def main() -> None:
 
     logger.info(f"Running official Qwen3-VL conditioner with {len(token_ids)} tokens")
     inference_started_at = time.perf_counter()
-    with torch.no_grad():
-        outputs = text_encoder.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            mm_token_type_ids=mm_token_type_ids,
-            use_cache=False,
-            output_hidden_states=True,
-            **vision_kwargs,
+    profiler = None
+    step_hooks = []
+    original_sdpa = None
+    if args.trace_attention:
+        import torch.nn.functional as F
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import eager_attention_forward
+
+        attention = text_encoder.model.language_model.layers[43].self_attn
+        interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+            attention.config._attn_implementation, eager_attention_forward
         )
+        logger.info(
+            "Official attention backend: "
+            f"interface={interface.__module__}.{interface.__qualname__} "
+            f"implementation={attention.config._attn_implementation} "
+            f"head_dim={attention.head_dim} heads={attention.config.num_attention_heads} "
+            f"kv_heads={attention.config.num_key_value_heads} scale={attention.scaling}"
+        )
+        trace_path = output_dir / "h3_layer43_attention_trace.json"
+        profiler = torch_npu.profiler.profile(
+            activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
+            schedule=torch_npu.profiler.schedule(wait=42, warmup=1, active=1, repeat=1),
+            on_trace_ready=lambda profile: profile.export_chrome_trace(str(trace_path)),
+            record_shapes=True,
+            with_stack=False,
+        )
+        original_sdpa = F.scaled_dot_product_attention
+        active = {"value": False}
+
+        def logged_sdpa(*args: Any, **kwargs: Any) -> Any:
+            if active["value"]:
+                query, key, value = args[:3]
+                logger.info(
+                    "H3_SDPA "
+                    + json.dumps(
+                        {
+                            "q_shape": list(query.shape),
+                            "k_shape": list(key.shape),
+                            "v_shape": list(value.shape),
+                            "q_dtype": str(query.dtype),
+                            "k_dtype": str(key.dtype),
+                            "v_dtype": str(value.dtype),
+                            "attn_mask": None if kwargs.get("attn_mask") is None else list(kwargs["attn_mask"].shape),
+                            "dropout_p": kwargs.get("dropout_p", args[4] if len(args) > 4 else 0.0),
+                            "is_causal": kwargs.get("is_causal", args[5] if len(args) > 5 else False),
+                            "scale": kwargs.get("scale"),
+                            "enable_gqa": kwargs.get("enable_gqa", False),
+                        },
+                        sort_keys=True,
+                    )
+                )
+            return original_sdpa(*args, **kwargs)
+
+        F.scaled_dot_product_attention = logged_sdpa
+
+        def enable_layer43(module: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+            del module, args, kwargs
+            active["value"] = True
+
+        def disable_layer43(module: Any, args: tuple[Any, ...], output: Any) -> None:
+            del module, args, output
+            active["value"] = False
+
+        flag_hooks = [
+            attention.register_forward_pre_hook(enable_layer43, with_kwargs=True),
+            attention.register_forward_hook(disable_layer43),
+        ]
+        step_hooks = [
+            layer.register_forward_hook(lambda module, args, output: profiler.step())
+            for layer in text_encoder.model.language_model.layers
+        ]
+        profiler.__enter__()
+    try:
+        with torch.no_grad():
+            outputs = text_encoder.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                mm_token_type_ids=mm_token_type_ids,
+                use_cache=False,
+                output_hidden_states=True,
+                **vision_kwargs,
+            )
+    finally:
+        if profiler is not None:
+            profiler.__exit__(None, None, None)
+        if original_sdpa is not None:
+            F.scaled_dot_product_attention = original_sdpa
+        for hook in step_hooks + (flag_hooks if args.trace_attention else []):
+            hook.remove()
     visual_hook.remove()
     for hook in layer_43_hooks:
         hook.remove()
@@ -199,7 +282,7 @@ def main() -> None:
     layer_0_output = outputs.hidden_states[1]
     layer_49_output = outputs.hidden_states[50]
     final_norm_output = outputs.last_hidden_state
-    selected_layer_indices = (0, 1, 2, 3, 4, 8, 16, *range(32, 50))
+    selected_layer_indices = tuple(range(64)) if args.capture_all_layers else (0, 1, 2, 3, 4, 8, 16, *range(32, 50))
     selected_hidden_states = {
         f"layer_{index}_output_pre_final_norm": outputs.hidden_states[index + 1].cpu()
         for index in selected_layer_indices

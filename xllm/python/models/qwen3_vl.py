@@ -40,6 +40,7 @@ from xllm.python.layers import (
     RMSNorm,
     RotaryEmbedding,
 )
+from xllm.python.model_executor.forward_context import record_layer_event
 from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.qwen3 import (
@@ -704,6 +705,7 @@ class Qwen3VLModel(nn.Module):
         self.layers = nn.ModuleList([Qwen3DecoderLayer(cfg, i, dtype, device) for i in range(cfg.n_layers)])
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype=dtype, device=device)
         self.aux_hidden_capture = AuxHiddenCapture(cfg.layers_to_capture)
+        self.exact_residual = False
         # Set externally by get_input_embeddings before the runner kicks in.
         self._inputs_embeds: torch.Tensor | None = None
         self.deepstack_input_embeds: list[torch.Tensor] | None = None
@@ -732,6 +734,23 @@ class Qwen3VLModel(nn.Module):
             mrope_sec = self.mrope_section
         else:
             cos, sin = self.rotary(positions)
+
+        if self.exact_residual:
+            aux_hidden_buffer = self.aux_hidden_capture.create_buffer(hidden)
+            for i, layer in enumerate(self.layers):
+                residual = hidden
+                hidden = layer.input_layernorm(hidden)
+                hidden = layer.self_attn(positions, hidden, cos_sin_cache, cos, sin, mrope_sec)
+                residual = residual + hidden
+                hidden = layer.post_attention_layernorm(residual)
+                hidden = residual + layer.mlp(hidden)
+                if self.deepstack_input_embeds is not None and i < len(self.deepstack_input_embeds):
+                    hidden = hidden + self.deepstack_input_embeds[i]
+                self.aux_hidden_capture.capture_layer(i, hidden, None, aux_hidden_buffer)
+                record_layer_event(i)
+            hidden = self.norm(hidden)
+            self.deepstack_input_embeds = None
+            return self.aux_hidden_capture.finalize(hidden, aux_hidden_buffer)
 
         residual: torch.Tensor | None = None
         aux_hidden_buffer = self.aux_hidden_capture.create_buffer(hidden)

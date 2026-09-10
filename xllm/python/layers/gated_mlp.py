@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import torch.nn as nn
 
@@ -56,6 +58,8 @@ class GatedMLP(nn.Module):
             device=device,
             reduce_results=reduce_results,
         )
+        self.split_gate_up = False
+        self.diagnostic_callback: Callable[[str, torch.Tensor], None] | None = None
 
     def load_weights(
         self,
@@ -78,4 +82,27 @@ class GatedMLP(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(kernels.silu_and_mul(self.gate_up_proj(hidden_states)))
+        if self.split_gate_up:
+            weight = self.gate_up_proj.weight
+            local_intermediate_size = weight.shape[0] // 2
+            gate_up = torch.cat(
+                [
+                    torch.nn.functional.linear(hidden_states, weight[:local_intermediate_size]),
+                    torch.nn.functional.linear(hidden_states, weight[local_intermediate_size:]),
+                ],
+                dim=-1,
+            )
+        else:
+            gate_up = self.gate_up_proj(hidden_states)
+        callback = self.diagnostic_callback
+        if callback is not None:
+            gate, up = gate_up.chunk(2, dim=-1)
+            callback("gate_projection", gate)
+            callback("up_projection", up)
+        activated = kernels.silu_and_mul(gate_up)
+        if callback is not None:
+            callback("silu_and_mul", activated)
+        output = self.down_proj(activated)
+        if callback is not None:
+            callback("down_projection", output)
+        return output

@@ -57,6 +57,31 @@ class _FinalNorm(nn.Module):
         return (hidden if residual is None else hidden + residual), residual
 
 
+class _IdentityNorm(nn.Module):
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return hidden
+
+
+class _ConstantBranch(nn.Module):
+    def __init__(self, value: float) -> None:
+        super().__init__()
+        self.value = value
+
+    def forward(self, hidden: torch.Tensor, *args: object) -> torch.Tensor:
+        template = args[0] if args else hidden
+        assert isinstance(template, torch.Tensor)
+        return torch.full_like(template, self.value)
+
+
+class _ExactLayer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.input_layernorm = _IdentityNorm()
+        self.self_attn = _ConstantBranch(1.0)
+        self.post_attention_layernorm = _IdentityNorm()
+        self.mlp = _ConstantBranch(2.0)
+
+
 class _Rotary(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -76,6 +101,7 @@ def _model(layers_to_capture: tuple[int, ...]) -> Qwen3VLModel:
     model.layers = nn.ModuleList([_ResidualLayer(1.0), _ResidualLayer(2.0)])
     model.norm = _FinalNorm()
     model.aux_hidden_capture = AuxHiddenCapture(layers_to_capture)
+    model.exact_residual = False
     model._inputs_embeds = None
     model.deepstack_input_embeds = None
     return model
@@ -111,3 +137,17 @@ def test_disabled_capture_preserves_tensor_return_type() -> None:
     output = model(torch.tensor([1, 2]), torch.tensor([0, 1]))
 
     assert isinstance(output, torch.Tensor)
+
+
+def test_exact_residual_mode_matches_official_deepstack_order() -> None:
+    model = _model((0,))
+    model.layers = nn.ModuleList([_ExactLayer(), _ExactLayer()])
+    model.norm = _IdentityNorm()
+    model.exact_residual = True
+    embedded = model.embed_tokens(torch.tensor([1, 2]))
+    model.deepstack_input_embeds = [torch.full_like(embedded, 100.0)]
+
+    final_hidden, captured = model(torch.tensor([1, 2]), torch.tensor([0, 1]))
+
+    torch.testing.assert_close(captured, embedded + 103.0)
+    torch.testing.assert_close(final_hidden, embedded + 106.0)

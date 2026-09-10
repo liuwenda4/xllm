@@ -23,6 +23,7 @@ The model does not import FlashInfer, own wrappers, or call plan.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -143,6 +144,9 @@ class Qwen3Attention(nn.Module):
         )
         self.q_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps, dtype=dtype, device=device)
         self.k_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps, dtype=dtype, device=device)
+        self.split_qkv = False
+        self.use_qk_norm_modules = False
+        self.diagnostic_callback: Callable[[str, torch.Tensor], None] | None = None
         self.attn = Attention(
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
@@ -162,7 +166,23 @@ class Qwen3Attention(nn.Module):
         sin: torch.Tensor | None,
         mrope_section: list[int] | None = None,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden)
+        if self.split_qkv:
+            qkv_weight = self.qkv_proj.weight
+            qkv = torch.cat(
+                [
+                    torch.nn.functional.linear(hidden, qkv_weight[: self.q_size]),
+                    torch.nn.functional.linear(hidden, qkv_weight[self.q_size : self.q_size + self.kv_size]),
+                    torch.nn.functional.linear(hidden, qkv_weight[self.q_size + self.kv_size :]),
+                ],
+                dim=-1,
+            )
+        else:
+            qkv = self.qkv_proj(hidden)
+        callback = self.diagnostic_callback
+        if callback is not None:
+            callback("q_projection", qkv[:, : self.q_size])
+            callback("k_projection", qkv[:, self.q_size : self.q_size + self.kv_size])
+            callback("v_projection", qkv[:, self.q_size + self.kv_size :])
 
         if mrope_section is not None and positions.dim() == 2:
             # mRoPE prefill: per-head Q/K RMSNorm (same math as the fused
@@ -171,16 +191,19 @@ class Qwen3Attention(nn.Module):
             # cos_sin_cache here is the [max_pos, head_dim]=[cos_half|sin_half]
             # table; q/k stay 2D [N, num_heads*head_dim] as npu_mrope requires.
             num_tokens = qkv.size(0)
-            q = torch.ops.xllm_ops.rms_norm(
-                qkv[:, : self.q_size].reshape(num_tokens * self.num_heads, self.head_dim),
-                self.q_norm.weight,
-                self.q_norm.eps,
-            ).view(num_tokens, self.q_size)
-            k = torch.ops.xllm_ops.rms_norm(
-                qkv[:, self.q_size : self.q_size + self.kv_size].reshape(num_tokens * self.num_kv_heads, self.head_dim),
-                self.k_norm.weight,
-                self.k_norm.eps,
-            ).view(num_tokens, self.kv_size)
+            q = qkv[:, : self.q_size].reshape(num_tokens * self.num_heads, self.head_dim)
+            k = qkv[:, self.q_size : self.q_size + self.kv_size].reshape(num_tokens * self.num_kv_heads, self.head_dim)
+            if self.use_qk_norm_modules:
+                q = self.q_norm(q)
+                k = self.k_norm(k)
+            else:
+                q = torch.ops.xllm_ops.rms_norm(q, self.q_norm.weight, self.q_norm.eps)
+                k = torch.ops.xllm_ops.rms_norm(k, self.k_norm.weight, self.k_norm.eps)
+            if callback is not None:
+                callback("q_norm", q)
+                callback("k_norm", k)
+            q = q.view(num_tokens, self.q_size)
+            k = k.view(num_tokens, self.kv_size)
             v = qkv[:, self.q_size + self.kv_size :]
             q, k = kernels.mrope(
                 positions,
@@ -192,6 +215,9 @@ class Qwen3Attention(nn.Module):
                 rotary_mode="half",
                 cache_mode="interleave",
             )
+            if callback is not None:
+                callback("mrope_q", q)
+                callback("mrope_k", k)
         else:
             q, k, v = kernels.fused_qk_norm_rope(
                 qkv,
@@ -209,7 +235,12 @@ class Qwen3Attention(nn.Module):
             )
 
         attn_out = self.attn(q, k, v)
-        return self.o_proj(attn_out)
+        if callback is not None:
+            callback("attention_output", attn_out)
+        output = self.o_proj(attn_out)
+        if callback is not None:
+            callback("out_projection", output)
+        return output
 
 
 class Qwen3DecoderLayer(nn.Module):
