@@ -33,6 +33,7 @@ limitations under the License.
 #include "core/runtime/dit_forward_params.h"
 #include "core/util/json_reader.h"
 #include "models/dit/transformers/transformer_minimax_h3.h"
+#include "models/dit/utils/minimax_h3_packing.h"
 #include "models/model_registry.h"
 
 namespace xllm {
@@ -374,6 +375,18 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
   static MiniMaxH3DryRunShapeTrace dry_run_shape_trace(
       const MiniMaxH3DryRunShapeInput& input) {
     return minimax_h3_dry_run_shape_trace(input);
+  }
+
+  static H3PackedLayout dry_run_packed_layout(
+      const DiTForwardInput& input,
+      const H3TargetLatents& target,
+      const std::vector<H3ReferenceBlock>& reference_blocks,
+      std::optional<int64_t> sequence_length = std::nullopt) {
+    return minimax_h3_build_ref2va_packed_layout(input.prompt_embeds,
+                                                 input.text_token_tags,
+                                                 target,
+                                                 reference_blocks,
+                                                 sequence_length);
   }
 
   void load_model(std::unique_ptr<DiTModelLoader> loader) {

@@ -16,6 +16,9 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <functional>
 #include <memory>
@@ -25,6 +28,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "framework/state_dict/state_dict.h"
 #include "models/dit/pipelines/pipeline_minimax_h3.h"
 
 namespace xllm {
@@ -486,6 +490,754 @@ TEST(MiniMaxH3DryRunTest, RejectsInvalidGeometryDurationAndConditionShapes) {
   invalid.token_tags_shape = {1, 7};
   expect_invalid_argument_contains(
       [&] { MiniMaxH3PipelineImpl::dry_run_shape_trace(invalid); }, "[B,N]");
+}
+
+torch::Tensor h3_condition_hidden(int64_t tokens) {
+  return torch::arange(tokens * 5120, torch::kFloat32)
+      .remainder(257)
+      .sub(128)
+      .reshape({1, tokens, 5120})
+      .to(torch::kBFloat16)
+      .contiguous();
+}
+
+H3TargetLatents h3_target() {
+  return {.audio_t = 2,
+          .audio_channels = 2,
+          .latent_t = 2,
+          .latent_h = 4,
+          .latent_w = 6};
+}
+
+H3ReferenceBlock h3_image(int64_t height = 4, int64_t width = 4) {
+  return {.kind = H3ReferenceBlockKind::IMAGE,
+          .latent_h = height,
+          .latent_w = width};
+}
+
+H3ReferenceBlock h3_audio(int64_t temporal = 2) {
+  return {.kind = H3ReferenceBlockKind::AUDIO, .ref_audio_t = temporal};
+}
+
+H3ReferenceBlock h3_video(int64_t temporal = 3,
+                          int64_t height = 4,
+                          int64_t width = 4) {
+  return {.kind = H3ReferenceBlockKind::VIDEO,
+          .ref_audio_t = 0,
+          .latent_t = temporal,
+          .latent_h = height,
+          .latent_w = width};
+}
+
+H3ReferenceBlock h3_video_audio(int64_t audio_temporal = 2,
+                                int64_t video_temporal = 3,
+                                int64_t height = 4,
+                                int64_t width = 4) {
+  return {.kind = H3ReferenceBlockKind::VIDEO_AUDIO,
+          .ref_audio_t = audio_temporal,
+          .latent_t = video_temporal,
+          .latent_h = height,
+          .latent_w = width};
+}
+
+H3PackedLayout h3_layout(
+    const std::vector<H3ReferenceBlock>& references,
+    const std::vector<int64_t>& tags = {0, 1, 1},
+    std::optional<int64_t> sequence_length = std::nullopt) {
+  const torch::Tensor condition_tags =
+      torch::tensor(tags, torch::kInt64).reshape({1, -1});
+  return minimax_h3_build_ref2va_packed_layout(
+      h3_condition_hidden(static_cast<int64_t>(tags.size())),
+      condition_tags,
+      h3_target(),
+      references,
+      sequence_length);
+}
+
+void expect_slice(const H3Slice& slice, int64_t start, int64_t stop) {
+  EXPECT_EQ(slice.start, start);
+  EXPECT_EQ(slice.stop, stop);
+}
+
+bool within_one_ulp(double actual, double expected) {
+  return actual == expected || actual == std::nextafter(expected, -INFINITY) ||
+         actual == std::nextafter(expected, INFINITY);
+}
+
+void expect_positions_within_one_ulp(
+    const torch::Tensor& actual,
+    const std::vector<std::array<double, 3>>& expected) {
+  ASSERT_EQ(actual.scalar_type(), torch::kFloat64);
+  ASSERT_TRUE(actual.device().is_cpu());
+  ASSERT_EQ(actual.dim(), 2);
+  ASSERT_EQ(actual.size(0), static_cast<int64_t>(expected.size()));
+  ASSERT_EQ(actual.size(1), 3);
+  const auto values = actual.accessor<double, 2>();
+  for (int64_t row = 0; row < actual.size(0); ++row) {
+    for (int64_t axis = 0; axis < 3; ++axis) {
+      SCOPED_TRACE("row=" + std::to_string(row) +
+                   " axis=" + std::to_string(axis));
+      EXPECT_TRUE(within_one_ulp(values[row][axis],
+                                 expected[static_cast<size_t>(row)][axis]));
+    }
+  }
+}
+
+TEST(MiniMaxH3PackedTokensTest, PatchifyAndAudioPackUseGoldenRowOrder) {
+  const torch::Tensor video =
+      torch::arange(32, torch::kInt64).reshape({1, 2, 2, 2, 4}).contiguous();
+  const torch::Tensor expected_video_rows =
+      torch::tensor(
+          {0, 1, 4,  5,  16, 17, 20, 21, 2,  3,  6,  7,  18, 19, 22, 23,
+           8, 9, 12, 13, 24, 25, 28, 29, 10, 11, 14, 15, 26, 27, 30, 31},
+          torch::kInt64)
+          .reshape({4, 8});
+  const torch::Tensor video_rows = minimax_h3_patchify_video_latent(video);
+  EXPECT_TRUE(torch::equal(video_rows, expected_video_rows));
+  EXPECT_TRUE(video_rows.is_contiguous());
+  EXPECT_TRUE(torch::equal(
+      minimax_h3_unpatchify_video_tokens(
+          video_rows, {.channels = 2, .temporal = 2, .height = 2, .width = 4}),
+      video));
+
+  const torch::Tensor audio =
+      torch::arange(24, torch::kInt64).reshape({2, 3, 4}).contiguous();
+  const torch::Tensor expected_audio_rows =
+      torch::tensor({0,  4,  8,  1,  5,  9,  2,  6,  10, 3,  7,  11,
+                     12, 16, 20, 13, 17, 21, 14, 18, 22, 15, 19, 23},
+                    torch::kInt64)
+          .reshape({8, 3});
+  const torch::Tensor audio_rows = minimax_h3_pack_audio_latent(audio);
+  EXPECT_TRUE(torch::equal(audio_rows, expected_audio_rows));
+  EXPECT_TRUE(audio_rows.is_contiguous());
+  EXPECT_TRUE(
+      torch::equal(minimax_h3_unpack_audio_tokens(
+                       audio_rows, /*audio_channels=*/2, /*temporal=*/4),
+                   audio));
+}
+
+const torch::Tensor* find_raw_tensor(const StateDict& state_dict,
+                                     const std::string& key) {
+  for (const auto& [name, tensor] : state_dict) {
+    if (name == key) {
+      return &tensor;
+    }
+  }
+  return nullptr;
+}
+
+void expect_golden_tensor(const StateDict& golden,
+                          const std::string& key,
+                          const torch::Tensor& actual,
+                          bool allow_one_ulp = false) {
+  SCOPED_TRACE(key);
+  const torch::Tensor* expected = find_raw_tensor(golden, key);
+  ASSERT_NE(expected, nullptr) << "Golden tensor key is missing";
+  ASSERT_TRUE(actual.defined());
+  ASSERT_EQ(actual.scalar_type(), expected->scalar_type())
+      << "Golden tensor dtype mismatch";
+  ASSERT_EQ(actual.sizes().vec(), expected->sizes().vec())
+      << "Golden tensor shape mismatch";
+  ASSERT_TRUE(actual.device().is_cpu());
+  ASSERT_TRUE(expected->device().is_cpu());
+  if (!allow_one_ulp) {
+    EXPECT_TRUE(torch::equal(actual, *expected));
+    return;
+  }
+
+  ASSERT_EQ(actual.scalar_type(), torch::kFloat64);
+  const torch::Tensor actual_values = actual.contiguous();
+  const torch::Tensor expected_values = expected->contiguous();
+  const double* actual_data = actual_values.data_ptr<double>();
+  const double* expected_data = expected_values.data_ptr<double>();
+  for (int64_t index = 0; index < actual_values.numel(); ++index) {
+    SCOPED_TRACE("element=" + std::to_string(index));
+    EXPECT_TRUE(within_one_ulp(actual_data[index], expected_data[index]))
+        << "actual=" << actual_data[index]
+        << " expected=" << expected_data[index];
+  }
+}
+
+struct H3GoldenCase {
+  std::string name;
+  std::vector<int64_t> tags;
+  std::vector<H3ReferenceBlock> references;
+  std::optional<int64_t> sequence_length;
+};
+
+TEST(MiniMaxH3PackingGoldenTest, MatchesPinnedVllmOmniReferenceWhenRequested) {
+  const char* golden_path = std::getenv("MINIMAX_H3_PACKING_GOLDEN");
+  if (golden_path == nullptr || std::string(golden_path).empty()) {
+    GTEST_SKIP() << "Set MINIMAX_H3_PACKING_GOLDEN to the generated "
+                    "safetensors file";
+  }
+  const std::unique_ptr<StateDict> golden =
+      StateDictFromSafeTensor::load(golden_path);
+  ASSERT_NE(golden, nullptr);
+  ASSERT_EQ(golden->size(), 91);
+
+  const std::vector<H3GoldenCase> cases = {
+      {.name = "one_image", .tags = {0, 1, 1}, .references = {h3_image()}},
+      {.name = "image_audio",
+       .tags = {1, 0, 1},
+       .references = {h3_image(), h3_audio()}},
+      {.name = "video", .tags = {1, 1, 0}, .references = {h3_video()}},
+      {.name = "video_audio",
+       .tags = {0, 1, 0},
+       .references = {h3_video_audio()},
+       .sequence_length = 128},
+      {.name = "mixed",
+       .tags = {0, 1, 0, 1},
+       .references = {h3_image(/*height=*/2, /*width=*/4),
+                      h3_audio(/*temporal=*/3),
+                      h3_video(/*temporal=*/2, /*height=*/2, /*width=*/4),
+                      h3_video_audio(/*audio_temporal=*/2,
+                                     /*video_temporal=*/3,
+                                     /*height=*/4,
+                                     /*width=*/2)}}};
+
+  for (const H3GoldenCase& golden_case : cases) {
+    SCOPED_TRACE(golden_case.name);
+    const torch::Tensor condition_hidden =
+        h3_condition_hidden(static_cast<int64_t>(golden_case.tags.size()));
+    const torch::Tensor condition_tags =
+        torch::tensor(golden_case.tags, torch::kInt64).reshape({1, -1});
+    const H3PackedLayout layout =
+        minimax_h3_build_ref2va_packed_layout(condition_hidden,
+                                              condition_tags,
+                                              h3_target(),
+                                              golden_case.references,
+                                              golden_case.sequence_length);
+    const torch::Tensor seq_len =
+        torch::tensor({layout.aligned_length}, torch::kInt64).reshape({});
+    const torch::Tensor latent_grid =
+        torch::tensor({layout.target_latent_grid.temporal,
+                       layout.target_latent_grid.height,
+                       layout.target_latent_grid.width},
+                      torch::kInt64);
+    const torch::Tensor video_row_start =
+        torch::tensor({layout.target_video_slice.start}, torch::kInt64)
+            .reshape({});
+    const std::vector<std::pair<std::string, torch::Tensor>> fields = {
+        {"seq_len", seq_len},
+        {"condition_hidden", layout.condition_hidden},
+        {"condition_tags", condition_tags},
+        {"input_ids", layout.input_ids},
+        {"image_mask", layout.image_mask},
+        {"audio_mask", layout.audio_mask},
+        {"img_pos", layout.img_pos},
+        {"audio_pos", layout.audio_pos},
+        {"text_pos", layout.text_pos},
+        {"update_mask", layout.update_mask},
+        {"audio_update_mask", layout.audio_update_mask},
+        {"position_ids", layout.position_ids},
+        {"token_tags", layout.token_tags},
+        {"cu_seqlens", layout.cu_seqlens},
+        {"document_id", layout.document_id},
+        {"latent_grid", latent_grid},
+        {"video_row_start", video_row_start}};
+    for (const auto& [field, actual] : fields) {
+      expect_golden_tensor(*golden,
+                           golden_case.name + "." + field,
+                           actual,
+                           field == "position_ids");
+    }
+    EXPECT_EQ(seq_len.item<int64_t>(), layout.aligned_length);
+  }
+
+  const torch::Tensor video_latent =
+      torch::arange(2 * 3 * 2 * 4 * 6, torch::kFloat32)
+          .reshape({2, 3, 2, 4, 6});
+  const torch::Tensor video_rows =
+      minimax_h3_patchify_video_latent(video_latent);
+  const torch::Tensor video_roundtrip = minimax_h3_unpatchify_video_tokens(
+      video_rows, {.channels = 3, .temporal = 2, .height = 4, .width = 6});
+  expect_golden_tensor(*golden, "transforms.video_latent", video_latent);
+  expect_golden_tensor(*golden, "transforms.video_rows", video_rows);
+  expect_golden_tensor(*golden, "transforms.video_roundtrip", video_roundtrip);
+
+  const torch::Tensor audio_latent =
+      torch::arange(2 * 3 * 4, torch::kFloat32).reshape({2, 3, 4});
+  const torch::Tensor audio_rows = minimax_h3_pack_audio_latent(audio_latent);
+  const torch::Tensor audio_roundtrip = minimax_h3_unpack_audio_tokens(
+      audio_rows, /*audio_channels=*/2, /*temporal=*/4);
+  expect_golden_tensor(*golden, "transforms.audio_latent", audio_latent);
+  expect_golden_tensor(*golden, "transforms.audio_rows", audio_rows);
+  expect_golden_tensor(*golden, "transforms.audio_roundtrip", audio_roundtrip);
+}
+
+TEST(MiniMaxH3PackingGoldenTest, ConsumesAttestedRealConditionBundle) {
+  const char* bundle_path = std::getenv("MINIMAX_H3_CONDITION_BUNDLE");
+  if (bundle_path == nullptr || std::string(bundle_path).empty()) {
+    GTEST_SKIP() << "Set MINIMAX_H3_CONDITION_BUNDLE to condition.safetensors";
+  }
+  const auto bundle = StateDictFromSafeTensor::load(bundle_path);
+  ASSERT_NE(bundle, nullptr);
+  const torch::Tensor hidden = bundle->get_tensor("prompt_embeds");
+  const torch::Tensor tags = bundle->get_tensor("text_token_tags");
+  ASSERT_TRUE(hidden.defined());
+  ASSERT_TRUE(tags.defined());
+
+  DiTForwardInput input;
+  input.prompt_embeds = hidden.unsqueeze(0).contiguous();
+  input.text_token_tags = tags.unsqueeze(0).contiguous();
+  const H3PackedLayout layout =
+      MiniMaxH3PipelineImpl::dry_run_packed_layout(input,
+                                                   {.audio_t = 207,
+                                                    .audio_channels = 2,
+                                                    .latent_t = 37,
+                                                    .latent_h = 48,
+                                                    .latent_w = 84},
+                                                   {h3_image()});
+
+  EXPECT_EQ(layout.text_slice.stop, 11350);
+  EXPECT_EQ(layout.used_length, 49064);
+  EXPECT_EQ(layout.aligned_length, 49088);
+  EXPECT_TRUE(torch::equal(layout.token_tags.slice(0, 0, 11350), tags));
+  EXPECT_TRUE(
+      layout.token_tags.slice(0, 49064, 49088).eq(-1).all().item<bool>());
+  EXPECT_TRUE(
+      layout.document_id.slice(0, 49064, 49088).eq(1).all().item<bool>());
+  EXPECT_TRUE(torch::equal(layout.cu_seqlens,
+                           torch::tensor({0, 49064, 49088}, torch::kInt32)));
+}
+
+TEST(MiniMaxH3PackedTokensTest, RejectsInvalidRanksDivisibilityAndRows) {
+  expect_invalid_argument_contains(
+      [] { minimax_h3_patchify_video_latent(torch::zeros({1, 2, 3, 4})); },
+      "rank 5");
+  expect_invalid_argument_contains(
+      [] { minimax_h3_patchify_video_latent(torch::zeros({1, 2, 1, 3, 4})); },
+      "divisible");
+  expect_invalid_argument_contains(
+      [] {
+        minimax_h3_unpatchify_video_tokens(
+            torch::zeros({4, 7}),
+            {.channels = 2, .temporal = 2, .height = 2, .width = 4});
+      },
+      "row dimension");
+  expect_invalid_argument_contains(
+      [] {
+        minimax_h3_unpatchify_video_tokens(
+            torch::zeros({3, 8}),
+            {.channels = 2, .temporal = 2, .height = 2, .width = 4});
+      },
+      "row count");
+  expect_invalid_argument_contains(
+      [] { minimax_h3_pack_audio_latent(torch::zeros({2, 3})); }, "rank 3");
+  expect_invalid_argument_contains(
+      [] {
+        minimax_h3_unpack_audio_tokens(
+            torch::zeros({7, 3}), /*audio_channels=*/2, /*temporal=*/4);
+      },
+      "row count");
+}
+
+TEST(MiniMaxH3PackingTest, OneImageMatchesAllGoldenFields) {
+  DiTForwardInput input;
+  input.prompt_embeds = h3_condition_hidden(/*tokens=*/3);
+  input.text_token_tags = torch::tensor({{0, 1, 1}}, torch::kInt64);
+  const H3PackedLayout layout = MiniMaxH3PipelineImpl::dry_run_packed_layout(
+      input, h3_target(), {h3_image()});
+
+  EXPECT_TRUE(layout.condition_hidden.is_same(input.prompt_embeds));
+  EXPECT_EQ(layout.used_length, 23);
+  EXPECT_EQ(layout.aligned_length, 64);
+  expect_slice(layout.text_slice, 0, 3);
+  expect_slice(layout.target_audio_slice, 7, 11);
+  expect_slice(layout.target_video_slice, 11, 23);
+  expect_slice(layout.padding_slice, 23, 64);
+  EXPECT_EQ(layout.target_temporal_origin, 4.0);
+  EXPECT_EQ(layout.target_latent_grid.temporal, 2);
+  EXPECT_EQ(layout.target_latent_grid.height, 2);
+  EXPECT_EQ(layout.target_latent_grid.width, 3);
+
+  std::vector<int64_t> expected_ids(64, kMiniMaxH3PadId);
+  std::fill(expected_ids.begin(), expected_ids.begin() + 3, kMiniMaxH3TextId);
+  std::fill(expected_ids.begin() + 3,
+            expected_ids.begin() + 7,
+            kMiniMaxH3ImageVideoConditionId);
+  std::fill(
+      expected_ids.begin() + 7, expected_ids.begin() + 11, kMiniMaxH3AudioId);
+  expected_ids[7] = kMiniMaxH3AudioFirstId;
+  std::fill(
+      expected_ids.begin() + 11, expected_ids.begin() + 23, kMiniMaxH3VideoId);
+  expected_ids[11] = kMiniMaxH3VideoFirstId;
+  expected_ids[22] = kMiniMaxH3VideoLastId;
+  EXPECT_TRUE(torch::equal(layout.input_ids,
+                           torch::tensor(expected_ids, torch::kInt64)));
+
+  const torch::Tensor expected_img_pos = torch::tensor(
+      {3, 4, 5, 6, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22},
+      torch::kInt64);
+  const torch::Tensor expected_audio_pos =
+      torch::tensor({7, 8, 9, 10}, torch::kInt64);
+  EXPECT_TRUE(torch::equal(layout.img_pos, expected_img_pos));
+  EXPECT_TRUE(torch::equal(layout.audio_pos, expected_audio_pos));
+  EXPECT_TRUE(
+      torch::equal(layout.text_pos, torch::tensor({0, 1, 2}, torch::kInt64)));
+  EXPECT_TRUE(torch::equal(torch::nonzero(layout.image_mask).flatten(),
+                           expected_img_pos));
+  EXPECT_TRUE(torch::equal(torch::nonzero(layout.audio_mask).flatten(),
+                           expected_audio_pos));
+  EXPECT_FALSE(layout.update_mask.slice(0, 0, 4).any().item<bool>());
+  EXPECT_TRUE(layout.update_mask.slice(0, 4, 16).all().item<bool>());
+  EXPECT_TRUE(layout.audio_update_mask.all().item<bool>());
+
+  std::vector<std::array<double, 3>> expected_positions = {
+      {0.0, 0.0, 0.0},
+      {1.0, 0.0, 0.0},
+      {2.0, 0.0, 0.0},
+      {3.0, 0.0, 0.0},
+      {3.0, 0.0, 16.0},
+      {3.0, 16.0, 0.0},
+      {3.0, 16.0, 16.0},
+      {4.0, 0.0, -3.5959179422654266},
+      {5.0, 0.0, -3.5959179422654266},
+      {4.0, 0.0, 22.531972647421814},
+      {5.0, 0.0, 22.531972647421814}};
+  const std::array<double, 2> target_height = {2.9360547051563817, 16.0};
+  const std::array<double, 3> target_width = {
+      -3.5959179422654266, 9.468027352578194, 22.531972647421814};
+  for (double temporal : {4.0, 5.666666666666667}) {
+    for (double height : target_height) {
+      for (double width : target_width) {
+        expected_positions.emplace_back(
+            std::array<double, 3>{temporal, height, width});
+      }
+    }
+  }
+  expect_positions_within_one_ulp(
+      layout.position_ids.slice(0, 0, layout.used_length), expected_positions);
+  EXPECT_EQ(layout.position_ids[3][0].item<double>(), 3.0);
+  EXPECT_EQ(layout.position_ids[7][0].item<double>(), 4.0);
+  EXPECT_EQ(layout.position_ids[11][0].item<double>(), 4.0);
+  EXPECT_EQ(layout.position_ids[17][0].item<double>(), 5.666666666666667);
+  EXPECT_EQ(
+      layout.position_ids.slice(0, 23, 64).count_nonzero().item<int64_t>(), 0);
+
+  std::vector<int64_t> expected_tags(64, -1);
+  expected_tags[0] = 0;
+  expected_tags[1] = 1;
+  expected_tags[2] = 1;
+  std::fill(expected_tags.begin() + 3, expected_tags.begin() + 7, 0);
+  std::fill(expected_tags.begin() + 7, expected_tags.begin() + 11, 2);
+  std::fill(expected_tags.begin() + 11, expected_tags.begin() + 23, 0);
+  EXPECT_TRUE(torch::equal(layout.token_tags,
+                           torch::tensor(expected_tags, torch::kInt64)));
+  EXPECT_EQ(layout.cu_seqlens.scalar_type(), torch::kInt32);
+  EXPECT_TRUE(torch::equal(layout.cu_seqlens,
+                           torch::tensor({0, 23, 64}, torch::kInt32)));
+  EXPECT_EQ(layout.document_id.scalar_type(), torch::kInt32);
+  EXPECT_EQ(layout.document_id.slice(0, 0, 23).count_nonzero().item<int64_t>(),
+            0);
+  EXPECT_TRUE(layout.document_id.slice(0, 23, 64).eq(1).all().item<bool>());
+
+  ASSERT_EQ(layout.reference_blocks.size(), 1);
+  const H3PhysicalReferenceBlock& image = layout.reference_blocks[0];
+  EXPECT_EQ(image.packed_offset, 3);
+  expect_slice(image.row_slice, 3, 7);
+  EXPECT_FALSE(image.audio_slice.has_value());
+  ASSERT_TRUE(image.visual_slice.has_value());
+  expect_slice(*image.visual_slice, 3, 7);
+  EXPECT_EQ(image.temporal_origin, 3.0);
+  EXPECT_EQ(image.temporal_extent, 1.0);
+  ASSERT_EQ(layout.video_spans.size(), 1);
+  EXPECT_EQ(layout.video_spans[0].role, H3VideoSpanRole::TARGET);
+  EXPECT_EQ(layout.video_spans[0].start, 11);
+}
+
+TEST(MiniMaxH3PackingTest, ImageAndStandaloneAudioAdvanceInPhysicalOrder) {
+  const H3PackedLayout layout = h3_layout({h3_image(), h3_audio()});
+
+  EXPECT_EQ(layout.used_length, 27);
+  ASSERT_EQ(layout.reference_blocks.size(), 2);
+  expect_slice(layout.reference_blocks[0].row_slice, 3, 7);
+  expect_slice(*layout.reference_blocks[0].visual_slice, 3, 7);
+  EXPECT_EQ(layout.reference_blocks[0].temporal_origin, 3.0);
+  expect_slice(layout.reference_blocks[1].row_slice, 7, 11);
+  expect_slice(*layout.reference_blocks[1].audio_slice, 7, 11);
+  EXPECT_EQ(layout.reference_blocks[1].temporal_origin, 4.0);
+  EXPECT_EQ(layout.reference_blocks[1].temporal_extent, 2.0);
+  expect_slice(layout.target_audio_slice, 11, 15);
+  expect_slice(layout.target_video_slice, 15, 27);
+  EXPECT_EQ(layout.target_temporal_origin, 6.0);
+  EXPECT_TRUE(layout.input_ids.slice(0, 7, 11)
+                  .eq(kMiniMaxH3AudioReferenceConditionId)
+                  .all()
+                  .item<bool>());
+  EXPECT_TRUE(torch::equal(
+      layout.audio_pos,
+      torch::tensor({7, 8, 9, 10, 11, 12, 13, 14}, torch::kInt64)));
+  EXPECT_FALSE(layout.audio_update_mask.slice(0, 0, 4).any().item<bool>());
+  EXPECT_TRUE(layout.audio_update_mask.slice(0, 4, 8).all().item<bool>());
+  EXPECT_EQ(layout.position_ids[7][0].item<double>(), 4.0);
+  EXPECT_EQ(layout.position_ids[8][0].item<double>(), 5.0);
+  EXPECT_EQ(layout.position_ids[9][0].item<double>(), 4.0);
+  EXPECT_EQ(layout.position_ids[11][0].item<double>(), 6.0);
+  EXPECT_TRUE(within_one_ulp(layout.position_ids[7][2].item<double>(),
+                             -3.5959179422654266));
+  EXPECT_TRUE(within_one_ulp(layout.position_ids[9][2].item<double>(),
+                             22.531972647421814));
+  ASSERT_EQ(layout.video_spans.size(), 1);
+  EXPECT_EQ(layout.video_spans[0].role, H3VideoSpanRole::TARGET);
+}
+
+TEST(MiniMaxH3PackingTest, VideoUsesSequentialSpanAndHasNoAudioRows) {
+  const H3PackedLayout layout = h3_layout({h3_video()});
+
+  EXPECT_EQ(layout.used_length, 31);
+  ASSERT_EQ(layout.reference_blocks.size(), 1);
+  const H3PhysicalReferenceBlock& video = layout.reference_blocks[0];
+  ASSERT_TRUE(video.audio_slice.has_value());
+  ASSERT_TRUE(video.visual_slice.has_value());
+  expect_slice(*video.audio_slice, 3, 3);
+  expect_slice(*video.visual_slice, 3, 15);
+  expect_slice(video.row_slice, 3, 15);
+  EXPECT_EQ(video.temporal_origin, 3.0);
+  EXPECT_EQ(video.temporal_extent, 15.0);
+  EXPECT_EQ(layout.target_temporal_origin, 18.0);
+  EXPECT_EQ(layout.position_ids[3][0].item<double>(), 3.0);
+  EXPECT_EQ(layout.position_ids[7][0].item<double>(), 4.666666666666667);
+  EXPECT_EQ(layout.position_ids[11][0].item<double>(), 11.333333333333334);
+  EXPECT_EQ(layout.position_ids[15][0].item<double>(), 18.0);
+  EXPECT_TRUE(torch::equal(layout.audio_pos,
+                           torch::tensor({15, 16, 17, 18}, torch::kInt64)));
+  ASSERT_EQ(layout.video_spans.size(), 2);
+  EXPECT_EQ(layout.video_spans[0].start, 3);
+  EXPECT_EQ(layout.video_spans[0].latent_grid.temporal, 3);
+  EXPECT_EQ(layout.video_spans[0].latent_grid.height, 2);
+  EXPECT_EQ(layout.video_spans[0].latent_grid.width, 2);
+  EXPECT_EQ(layout.video_spans[0].role, H3VideoSpanRole::REFERENCE);
+  EXPECT_EQ(layout.video_spans[1].start, 19);
+  EXPECT_EQ(layout.video_spans[1].role, H3VideoSpanRole::TARGET);
+}
+
+TEST(MiniMaxH3PackingTest, VideoAudioSharesOriginAndHonorsExplicitAlignment) {
+  const H3PackedLayout layout =
+      h3_layout({h3_video_audio()}, {0, 1, 0}, /*sequence_length=*/128);
+
+  EXPECT_EQ(layout.used_length, 35);
+  EXPECT_EQ(layout.aligned_length, 128);
+  const H3PhysicalReferenceBlock& video_audio = layout.reference_blocks[0];
+  expect_slice(*video_audio.audio_slice, 3, 7);
+  expect_slice(*video_audio.visual_slice, 7, 19);
+  expect_slice(video_audio.row_slice, 3, 19);
+  EXPECT_EQ(video_audio.temporal_origin, 3.0);
+  EXPECT_EQ(layout.position_ids[3][0].item<double>(), 3.0);
+  EXPECT_EQ(layout.position_ids[5][0].item<double>(), 3.0);
+  EXPECT_EQ(layout.position_ids[7][0].item<double>(), 3.0);
+  EXPECT_EQ(layout.target_temporal_origin, 18.0);
+  expect_slice(layout.target_audio_slice, 19, 23);
+  expect_slice(layout.target_video_slice, 23, 35);
+  expect_slice(layout.padding_slice, 35, 128);
+  EXPECT_TRUE(layout.input_ids.slice(0, 3, 7)
+                  .eq(kMiniMaxH3AudioReferenceConditionId)
+                  .all()
+                  .item<bool>());
+  EXPECT_TRUE(layout.input_ids.slice(0, 7, 19)
+                  .eq(kMiniMaxH3ImageVideoConditionId)
+                  .all()
+                  .item<bool>());
+  EXPECT_TRUE(torch::equal(layout.cu_seqlens,
+                           torch::tensor({0, 35, 128}, torch::kInt32)));
+  EXPECT_TRUE(layout.document_id.slice(0, 35, 128).eq(1).all().item<bool>());
+  EXPECT_TRUE(layout.token_tags.slice(0, 35, 128).eq(-1).all().item<bool>());
+  EXPECT_EQ(
+      layout.position_ids.slice(0, 35, 128).count_nonzero().item<int64_t>(), 0);
+  ASSERT_EQ(layout.video_spans.size(), 2);
+  EXPECT_EQ(layout.video_spans[0].start, 7);
+  EXPECT_EQ(layout.video_spans[1].start, 23);
+}
+
+TEST(MiniMaxH3PackingTest, MixedReferencesPreserveSlicesOriginsAndVideoSpans) {
+  const std::vector<H3ReferenceBlock> references = {
+      h3_image(/*height=*/2, /*width=*/4),
+      h3_audio(/*temporal=*/3),
+      h3_video(/*temporal=*/2, /*height=*/2, /*width=*/4),
+      h3_video_audio(/*audio_temporal=*/2,
+                     /*video_temporal=*/3,
+                     /*height=*/4,
+                     /*width=*/2)};
+  const H3PackedLayout layout = h3_layout(references, {0, 1, 0, 1});
+
+  EXPECT_EQ(layout.used_length, 42);
+  ASSERT_EQ(layout.reference_blocks.size(), 4);
+  expect_slice(layout.reference_blocks[0].row_slice, 4, 6);
+  expect_slice(layout.reference_blocks[1].row_slice, 6, 12);
+  expect_slice(layout.reference_blocks[2].row_slice, 12, 16);
+  expect_slice(*layout.reference_blocks[2].audio_slice, 12, 12);
+  expect_slice(*layout.reference_blocks[2].visual_slice, 12, 16);
+  expect_slice(layout.reference_blocks[3].row_slice, 16, 26);
+  expect_slice(*layout.reference_blocks[3].audio_slice, 16, 20);
+  expect_slice(*layout.reference_blocks[3].visual_slice, 20, 26);
+  EXPECT_EQ(layout.reference_blocks[0].temporal_origin, 4.0);
+  EXPECT_EQ(layout.reference_blocks[1].temporal_origin, 5.0);
+  EXPECT_EQ(layout.reference_blocks[2].temporal_origin, 8.0);
+  EXPECT_EQ(layout.reference_blocks[3].temporal_origin, 16.333333333333336);
+  EXPECT_EQ(layout.target_temporal_origin, 31.333333333333336);
+  EXPECT_EQ(layout.position_ids[14][0].item<double>(), 9.666666666666666);
+  EXPECT_EQ(layout.position_ids[20][0].item<double>(), 16.333333333333336);
+  EXPECT_EQ(layout.position_ids[22][0].item<double>(), 18.000000000000004);
+  EXPECT_EQ(layout.position_ids[26][0].item<double>(), 31.333333333333336);
+  expect_slice(layout.target_audio_slice, 26, 30);
+  expect_slice(layout.target_video_slice, 30, 42);
+  EXPECT_TRUE(torch::equal(
+      layout.img_pos,
+      torch::tensor({4,  5,  12, 13, 14, 15, 20, 21, 22, 23, 24, 25,
+                     30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41},
+                    torch::kInt64)));
+  EXPECT_TRUE(torch::equal(
+      layout.audio_pos,
+      torch::tensor({6, 7, 8, 9, 10, 11, 16, 17, 18, 19, 26, 27, 28, 29},
+                    torch::kInt64)));
+  ASSERT_EQ(layout.video_spans.size(), 3);
+  EXPECT_EQ(layout.video_spans[0].start, 12);
+  EXPECT_EQ(layout.video_spans[0].latent_grid.temporal, 2);
+  EXPECT_EQ(layout.video_spans[0].latent_grid.height, 1);
+  EXPECT_EQ(layout.video_spans[0].latent_grid.width, 2);
+  EXPECT_EQ(layout.video_spans[1].start, 20);
+  EXPECT_EQ(layout.video_spans[1].latent_grid.temporal, 3);
+  EXPECT_EQ(layout.video_spans[1].latent_grid.height, 2);
+  EXPECT_EQ(layout.video_spans[1].latent_grid.width, 1);
+  EXPECT_EQ(layout.video_spans[2].start, 30);
+  EXPECT_EQ(layout.video_spans[2].role, H3VideoSpanRole::TARGET);
+}
+
+TEST(MiniMaxH3PackingTest, RejectsInvalidReferenceAndTargetSemantics) {
+  expect_invalid_argument_contains([] { h3_layout({}); },
+                                   "at least one visual reference");
+  expect_invalid_argument_contains([] { h3_layout({h3_audio()}); },
+                                   "audio-only");
+
+  H3ReferenceBlock invalid = h3_image();
+  invalid.kind = static_cast<H3ReferenceBlockKind>(99);
+  expect_invalid_argument_contains([&] { h3_layout({invalid}); },
+                                   "kind is unsupported");
+
+  invalid = h3_image();
+  invalid.latent_h = 0;
+  expect_invalid_argument_contains([&] { h3_layout({invalid}); }, "positive");
+  invalid = h3_image();
+  invalid.latent_w = -2;
+  expect_invalid_argument_contains([&] { h3_layout({invalid}); }, "positive");
+  invalid = h3_image();
+  invalid.latent_h = 3;
+  expect_invalid_argument_contains([&] { h3_layout({invalid}); },
+                                   "divisible by 2");
+  invalid = h3_video();
+  invalid.latent_t = 0;
+  expect_invalid_argument_contains([&] { h3_layout({invalid}); }, "positive");
+  invalid = h3_audio(/*temporal=*/0);
+  expect_invalid_argument_contains([&] { h3_layout({h3_image(), invalid}); },
+                                   "positive");
+
+  invalid = h3_video();
+  invalid.ref_audio_t = 1;
+  expect_invalid_argument_contains([&] { h3_layout({invalid}); },
+                                   "must be 0 for video kind");
+  invalid = h3_video_audio();
+  invalid.ref_audio_t = 0;
+  expect_invalid_argument_contains([&] { h3_layout({invalid}); }, "positive");
+
+  H3TargetLatents target = h3_target();
+  target.audio_channels = 1;
+  expect_invalid_argument_contains(
+      [&] {
+        minimax_h3_build_ref2va_packed_layout(
+            h3_condition_hidden(3),
+            torch::tensor({{0, 1, 1}}, torch::kInt64),
+            target,
+            {h3_image()});
+      },
+      "stereo");
+  target = h3_target();
+  target.audio_t = -1;
+  expect_invalid_argument_contains(
+      [&] {
+        minimax_h3_build_ref2va_packed_layout(
+            h3_condition_hidden(3),
+            torch::tensor({{0, 1, 1}}, torch::kInt64),
+            target,
+            {h3_image()});
+      },
+      "positive");
+  target = h3_target();
+  target.latent_t = 0;
+  expect_invalid_argument_contains(
+      [&] {
+        minimax_h3_build_ref2va_packed_layout(
+            h3_condition_hidden(3),
+            torch::tensor({{0, 1, 1}}, torch::kInt64),
+            target,
+            {h3_image()});
+      },
+      "positive");
+  target = h3_target();
+  target.latent_w = 5;
+  expect_invalid_argument_contains(
+      [&] {
+        minimax_h3_build_ref2va_packed_layout(
+            h3_condition_hidden(3),
+            torch::tensor({{0, 1, 1}}, torch::kInt64),
+            target,
+            {h3_image()});
+      },
+      "divisible by 2");
+}
+
+TEST(MiniMaxH3PackingTest, RejectsBadConditionAbiAndSequenceLength) {
+  const torch::Tensor hidden = h3_condition_hidden(/*tokens=*/3);
+  const torch::Tensor tags = torch::tensor({{0, 1, 1}}, torch::kInt64);
+  const auto build = [&](const torch::Tensor& candidate_hidden,
+                         const torch::Tensor& candidate_tags) {
+    return minimax_h3_build_ref2va_packed_layout(
+        candidate_hidden, candidate_tags, h3_target(), {h3_image()});
+  };
+
+  expect_invalid_argument_contains([&] { build(torch::Tensor(), tags); },
+                                   "condition hidden");
+  expect_invalid_argument_contains(
+      [&] { build(hidden.to(torch::kFloat32), tags); }, "condition hidden");
+  expect_invalid_argument_contains(
+      [&] { build(torch::zeros({2, 3, 5120}, torch::kBFloat16), tags); },
+      "condition hidden");
+  expect_invalid_argument_contains(
+      [&] { build(torch::zeros({1, 3, 5119}, torch::kBFloat16), tags); },
+      "condition hidden");
+  const torch::Tensor noncontiguous_hidden =
+      torch::zeros({1, 3, 10240}, torch::kBFloat16)
+          .slice(/*dim=*/2, /*start=*/0, /*end=*/10240, /*step=*/2);
+  ASSERT_FALSE(noncontiguous_hidden.is_contiguous());
+  expect_invalid_argument_contains([&] { build(noncontiguous_hidden, tags); },
+                                   "condition hidden");
+
+  expect_invalid_argument_contains([&] { build(hidden, torch::Tensor()); },
+                                   "condition tags");
+  expect_invalid_argument_contains(
+      [&] { build(hidden, tags.to(torch::kInt32)); }, "condition tags");
+  expect_invalid_argument_contains(
+      [&] { build(hidden, torch::tensor({0, 1, 1}, torch::kInt64)); },
+      "condition tags");
+  expect_invalid_argument_contains(
+      [&] { build(hidden, torch::tensor({{0, 1}}, torch::kInt64)); },
+      "condition tags");
+  expect_invalid_argument_contains(
+      [&] { build(hidden, torch::tensor({{0, 2, 1}}, torch::kInt64)); },
+      "values must be 0 or 1");
+  const torch::Tensor noncontiguous_tags =
+      torch::zeros({1, 6}, torch::kInt64)
+          .slice(/*dim=*/1, /*start=*/0, /*end=*/6, /*step=*/2);
+  ASSERT_FALSE(noncontiguous_tags.is_contiguous());
+  expect_invalid_argument_contains([&] { build(hidden, noncontiguous_tags); },
+                                   "condition tags");
+
+  expect_invalid_argument_contains(
+      [&] { h3_layout({h3_image()}, {0, 1, 1}, /*sequence_length=*/0); },
+      "smaller than used");
+  expect_invalid_argument_contains(
+      [&] { h3_layout({h3_image()}, {0, 1, 1}, /*sequence_length=*/65); },
+      "divisible by 64");
 }
 
 TEST(MiniMaxH3PipelineTest, ForwardFailsInsteadOfReturningFakeMedia) {
