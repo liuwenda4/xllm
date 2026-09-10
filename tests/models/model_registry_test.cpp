@@ -54,5 +54,30 @@ TEST(ModelRegistryTest, DeepseekV4DSparkUsesTorchBackend) {
             "--npu_kernel_backend=TORCH.");
 }
 
+TEST(ModelRegistryTest, MiniMaxH3ResolvesExactPipelineAndConfigClassNames) {
+  EXPECT_TRUE(ModelRegistry::has_dit_model_factory("MiniMaxH3Pipeline"));
+  EXPECT_TRUE(static_cast<bool>(
+      ModelRegistry::get_model_args_loader("MiniMaxH3DiTModel")));
+  EXPECT_TRUE(static_cast<bool>(
+      ModelRegistry::get_model_args_loader("MiniMaxH3Transformer3DModel")));
+  EXPECT_TRUE(static_cast<bool>(
+      ModelRegistry::get_model_args_loader("MiniMaxH3VideoVAE")));
+  EXPECT_TRUE(static_cast<bool>(
+      ModelRegistry::get_model_args_loader("MiniMaxH3AudioVAE")));
+  EXPECT_TRUE(static_cast<bool>(
+      ModelRegistry::get_model_args_loader("MiniMaxH3Qwen3VLHFEncoder")));
+
+  std::string effective_backend;
+  std::string resolved_name;
+  std::string error_message;
+  EXPECT_TRUE(resolve_model_registration("MiniMaxH3Pipeline",
+                                         "AUTO",
+                                         &effective_backend,
+                                         &resolved_name,
+                                         &error_message));
+  EXPECT_EQ(resolved_name, "MiniMaxH3Pipeline");
+  EXPECT_EQ(ModelRegistry::get_model_backend(resolved_name), "dit");
+}
+
 }  // namespace
 }  // namespace xllm

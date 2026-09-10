@@ -529,6 +529,29 @@ struct ModelArgs {
   PROPERTY(int64_t, added_kv_proj_dim) = -1;
   PROPERTY(int64_t, pos_embed_seq_len) = -1;
 
+  // MiniMax-H3 transformer contract. These are deliberately prefixed because
+  // several generic DiT fields have different semantics across architectures.
+  PROPERTY(int64_t, h3_num_layers) = 50;
+  PROPERTY(int64_t, h3_token_refiner_num_layers) = 2;
+  PROPERTY(int64_t, h3_hidden_size) = 5376;
+  PROPERTY(int64_t, h3_num_attention_heads) = 56;
+  PROPERTY(int64_t, h3_attention_head_dim) = 128;
+  PROPERTY(int64_t, h3_ffn_hidden_size) = 14336;
+  PROPERTY(int64_t, h3_video_latent_dim) = 24;
+  PROPERTY(int64_t, h3_audio_latent_dim) = 32;
+  PROPERTY(std::vector<int64_t>, h3_patch_size) = { 1, 2, 2 };
+  PROPERTY(int64_t, h3_text_dim) = 5120;
+  PROPERTY(int64_t, h3_timestep_input_dim) = 256;
+  PROPERTY(int64_t, h3_time_embed_hidden_size) = 5376;
+  PROPERTY(int64_t, h3_time_embed_dim) = 2688;
+  PROPERTY(int64_t, h3_adaln_out_features) = 96768;
+  PROPERTY(int64_t, h3_final_adaln_out_features) = 10752;
+  PROPERTY(int64_t, h3_rope_inv_freq_len) = 16;
+  PROPERTY(double, h3_rope_theta) = 10000.0;
+  PROPERTY(double, h3_norm_eps) = 1e-5;
+  PROPERTY(double, h3_qk_norm_eps) = 1e-5;
+  PROPERTY(double, h3_final_norm_eps) = 1e-5;
+
   // cola-dlm dit related args
   PROPERTY(int64_t, txt_dim) = 0;
   PROPERTY(int64_t, txt_in_channels) = 0;
@@ -858,6 +881,30 @@ inline std::ostream& operator<<(std::ostream& os, const ModelArgs& args) {
   }
   os << "]";
   os << ", num_single_layers: " << args.num_single_layers();
+  os << ", h3_num_layers: " << args.h3_num_layers();
+  os << ", h3_token_refiner_num_layers: " << args.h3_token_refiner_num_layers();
+  os << ", h3_hidden_size: " << args.h3_hidden_size();
+  os << ", h3_num_attention_heads: " << args.h3_num_attention_heads();
+  os << ", h3_attention_head_dim: " << args.h3_attention_head_dim();
+  os << ", h3_ffn_hidden_size: " << args.h3_ffn_hidden_size();
+  os << ", h3_video_latent_dim: " << args.h3_video_latent_dim();
+  os << ", h3_audio_latent_dim: " << args.h3_audio_latent_dim();
+  os << ", h3_patch_size: [";
+  for (const auto& dim : args.h3_patch_size()) {
+    os << dim << ", ";
+  }
+  os << "]";
+  os << ", h3_text_dim: " << args.h3_text_dim();
+  os << ", h3_timestep_input_dim: " << args.h3_timestep_input_dim();
+  os << ", h3_time_embed_hidden_size: " << args.h3_time_embed_hidden_size();
+  os << ", h3_time_embed_dim: " << args.h3_time_embed_dim();
+  os << ", h3_adaln_out_features: " << args.h3_adaln_out_features();
+  os << ", h3_final_adaln_out_features: " << args.h3_final_adaln_out_features();
+  os << ", h3_rope_inv_freq_len: " << args.h3_rope_inv_freq_len();
+  os << ", h3_rope_theta: " << args.h3_rope_theta();
+  os << ", h3_norm_eps: " << args.h3_norm_eps();
+  os << ", h3_qk_norm_eps: " << args.h3_qk_norm_eps();
+  os << ", h3_final_norm_eps: " << args.h3_final_norm_eps();
   os << ", d_model: " << args.d_model();
   os << ", num_layers: " << args.num_layers();
   os << ", d_kv: " << args.d_kv();
