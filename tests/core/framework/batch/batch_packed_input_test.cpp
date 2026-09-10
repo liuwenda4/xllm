@@ -18,16 +18,21 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "core/common/global_flags.h"
 #include "core/framework/batch/batch_input_builder.h"
+#include "core/framework/batch/dit_batch.h"
 #include "core/framework/block/block_manager_impl.h"
 #include "core/framework/model/model_input_params.h"
+#include "core/framework/request/dit_request.h"
 #include "core/framework/request/stopping_checker.h"
 #include "core/framework/sampling/json_object_grammar.h"
 #include "core/runtime/forward_params.h"
+#include "core/runtime/forward_shared_memory_manager.h"
 #include "core/runtime/params_utils.h"
 
 namespace xllm {
@@ -40,6 +45,58 @@ void expect_linear_state_cache_op_eq(const LinearStateCacheOp& actual,
   EXPECT_EQ(actual.reset_requested, expected.reset_requested);
   EXPECT_EQ(actual.restore_requested, expected.restore_requested);
   EXPECT_EQ(actual.restore_src_slot_id, expected.restore_src_slot_id);
+}
+
+DiTForwardInput make_condition_forward_input() {
+  DiTForwardInput input;
+  input.batch_size = 2;
+  input.prompt_embeds = torch::arange(24, torch::kBFloat16).reshape({2, 3, 4});
+  input.text_token_tags = torch::tensor({{0, 1, 0}, {1, 0, 1}}, torch::kInt64);
+  input.condition_schemas = {"xllm.minimax_h3.text_conditioning/v1",
+                             "xllm.minimax_h3.text_conditioning/v1"};
+  input.condition_source_backends = {"official_hf", "xllm_native"};
+  input.condition_manifest_jsons = {"{\"request\":1}", "{\"request\":2}"};
+  return input;
+}
+
+void expect_condition_forward_input_eq(const DiTForwardInput& actual,
+                                       const DiTForwardInput& expected) {
+  EXPECT_EQ(actual.batch_size, expected.batch_size);
+  ASSERT_TRUE(actual.prompt_embeds.defined());
+  EXPECT_TRUE(torch::equal(actual.prompt_embeds, expected.prompt_embeds));
+  ASSERT_TRUE(actual.text_token_tags.defined());
+  EXPECT_EQ(actual.text_token_tags.scalar_type(), torch::kInt64);
+  EXPECT_TRUE(torch::equal(actual.text_token_tags, expected.text_token_tags));
+  EXPECT_EQ(actual.condition_schemas, expected.condition_schemas);
+  EXPECT_EQ(actual.condition_source_backends,
+            expected.condition_source_backends);
+  EXPECT_EQ(actual.condition_manifest_jsons, expected.condition_manifest_jsons);
+}
+
+std::shared_ptr<DiTRequest> make_conditioned_dit_request(
+    const std::string& request_id,
+    const std::vector<int64_t>& tags,
+    const std::string& source_backend,
+    const std::string& manifest) {
+  DiTInputParams input_params;
+  input_params.prompt_embed = torch::zeros({3, 5120}, torch::kBFloat16);
+  input_params.text_token_tags = torch::tensor(tags, torch::kInt64);
+  input_params.text_token_tags_is_set = true;
+  input_params.condition_schema = "xllm.minimax_h3.text_conditioning/v1";
+  input_params.condition_source_backend = source_backend;
+  input_params.condition_manifest_json = manifest;
+
+  DiTGenerationParams generation_params;
+  DiTOutputFunc output_func = [](const DiTRequestOutput&) { return true; };
+  DiTOutputsFunc outputs_func = [](const std::vector<DiTRequestOutput>&) {
+    return std::vector<bool>{};
+  };
+  DiTRequestState state(input_params,
+                        generation_params,
+                        output_func,
+                        outputs_func,
+                        DiTRequestKind::kVideo);
+  return std::make_shared<DiTRequest>(request_id, "rid", "rtime", state);
 }
 
 }  // namespace
@@ -277,6 +334,70 @@ TEST(BatchPackedInputTest, PackedProtoLazyToPreservesJsonMetadata) {
             std::vector<std::string>({"req-json#0"}));
   EXPECT_EQ(materialized_input.sample_prior_output_rows,
             std::vector<int32_t>({-1}));
+}
+
+TEST(BatchPackedInputTest, WorkerProtoPreservesMiniMaxH3ConditionBundle) {
+  const DiTForwardInput expected = make_condition_forward_input();
+  proto::DiTForwardInput serialized_proto;
+  ASSERT_TRUE(dit_forward_input_to_proto(expected, &serialized_proto));
+
+  const std::string wire = serialized_proto.SerializeAsString();
+  proto::DiTForwardInput parsed_proto;
+  ASSERT_TRUE(parsed_proto.ParseFromString(wire));
+
+  DiTForwardInput actual;
+  ASSERT_TRUE(proto_to_dit_forward_input(parsed_proto, actual));
+  expect_condition_forward_input_eq(actual, expected);
+}
+
+TEST(BatchPackedInputTest, SharedMemoryPreservesMiniMaxH3ConditionBundle) {
+  ForwardInput input;
+  const DiTForwardInput expected = make_condition_forward_input();
+  input.input_params.dit_forward_input = expected;
+
+  bool is_creator = false;
+  const std::string shm_name = ForwardSharedMemoryManager::create_unique_name(
+      "batch_packed_h3_condition",
+      /*dp_group=*/0,
+      ForwardType::RAW_INPUT,
+      /*rank=*/0);
+  ForwardSharedMemoryManager writer_manager(
+      shm_name, 1 << 20, is_creator, ForwardType::RAW_INPUT);
+  bool is_reader_creator = false;
+  ForwardSharedMemoryManager reader_manager(
+      shm_name, 1 << 20, is_reader_creator, ForwardType::RAW_INPUT);
+
+  ASSERT_TRUE(writer_manager.input_write(input));
+  ForwardInput round_trip;
+  reader_manager.input_read(round_trip, torch::Device(torch::kCPU));
+
+  expect_condition_forward_input_eq(round_trip.input_params.dit_forward_input,
+                                    expected);
+}
+
+TEST(BatchPackedInputTest, DiTBatchStacksMiniMaxH3TokenTags) {
+  DiTBatch batch;
+  batch.add(make_conditioned_dit_request(
+      "request-1", {0, 1, 0}, "official_hf", "{\"request\":1}"));
+  batch.add(make_conditioned_dit_request(
+      "request-2", {1, 0, 1}, "xllm_native", "{\"request\":2}"));
+
+  const DiTForwardInput input = batch.prepare_forward_input();
+
+  ASSERT_TRUE(input.prompt_embeds.defined());
+  EXPECT_EQ(input.prompt_embeds.sizes(), (torch::IntArrayRef{2, 3, 5120}));
+  ASSERT_TRUE(input.text_token_tags.defined());
+  EXPECT_EQ(input.text_token_tags.sizes(), (torch::IntArrayRef{2, 3}));
+  EXPECT_TRUE(
+      torch::equal(input.text_token_tags,
+                   torch::tensor({{0, 1, 0}, {1, 0, 1}}, torch::kInt64)));
+  EXPECT_EQ(input.condition_schemas,
+            (std::vector<std::string>{"xllm.minimax_h3.text_conditioning/v1",
+                                      "xllm.minimax_h3.text_conditioning/v1"}));
+  EXPECT_EQ(input.condition_source_backends,
+            (std::vector<std::string>{"official_hf", "xllm_native"}));
+  EXPECT_EQ(input.condition_manifest_jsons,
+            (std::vector<std::string>{"{\"request\":1}", "{\"request\":2}"}));
 }
 
 }  // namespace xllm

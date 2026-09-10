@@ -58,6 +58,8 @@ bool image_batch_signature_matches(const DiTInputParams& lhs,
 bool stacked_tensor_inputs_match(const DiTInputParams& lhs,
                                  const DiTInputParams& rhs) {
   return tensor_batch_signature_matches(lhs.prompt_embed, rhs.prompt_embed) &&
+         tensor_batch_signature_matches(lhs.text_token_tags,
+                                        rhs.text_token_tags) &&
          tensor_batch_signature_matches(lhs.pooled_prompt_embed,
                                         rhs.pooled_prompt_embed) &&
          tensor_batch_signature_matches(lhs.negative_prompt_embed,
@@ -70,6 +72,15 @@ bool stacked_tensor_inputs_match(const DiTInputParams& lhs,
          tensor_batch_signature_matches(lhs.masked_image_latent,
                                         rhs.masked_image_latent) &&
          tensor_batch_signature_matches(lhs.last_image, rhs.last_image);
+}
+
+bool condition_bundle_presence_matches(const DiTInputParams& lhs,
+                                       const DiTInputParams& rhs) {
+  return lhs.condition_schema.has_value() == rhs.condition_schema.has_value() &&
+         lhs.condition_source_backend.has_value() ==
+             rhs.condition_source_backend.has_value() &&
+         lhs.condition_manifest_json.has_value() ==
+             rhs.condition_manifest_json.has_value();
 }
 
 bool prompt_audio_allows_batching(const DiTInputParams& lhs,
@@ -110,6 +121,7 @@ bool is_compatible_dit_batch_request(
   const auto& candidate_input = candidate_state.input_params();
   return image_batch_signature_matches(batch_input, candidate_input) &&
          stacked_tensor_inputs_match(batch_input, candidate_input) &&
+         condition_bundle_presence_matches(batch_input, candidate_input) &&
          prompt_audio_allows_batching(batch_input, candidate_input);
 }
 

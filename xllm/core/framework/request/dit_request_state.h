@@ -154,6 +154,15 @@ struct DiTInputParams {
 
   torch::Tensor prompt_embed;
 
+  // MiniMax-H3 token classification tags, shape [tokens].
+  torch::Tensor text_token_tags;
+  bool text_token_tags_is_set = false;
+
+  // Presence is retained so partial condition bundles fail closed.
+  std::optional<std::string> condition_schema;
+  std::optional<std::string> condition_source_backend;
+  std::optional<std::string> condition_manifest_json;
+
   torch::Tensor pooled_prompt_embed;
 
   torch::Tensor negative_prompt_embed;

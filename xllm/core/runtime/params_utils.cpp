@@ -510,6 +510,16 @@ bool dit_forward_input_to_proto(const DiTForwardInput& dit_inputs,
     pb_dit_inputs->set_audio_prompt_text(dit_inputs.audio_prompt_text);
   }
 
+  torch_tensor_to_proto_tensor(dit_inputs.text_token_tags,
+                               pb_dit_inputs->mutable_text_token_tags());
+
+  ADD_VECTOR_TO_PROTO(pb_dit_inputs->mutable_condition_schemas(),
+                      dit_inputs.condition_schemas);
+  ADD_VECTOR_TO_PROTO(pb_dit_inputs->mutable_condition_source_backends(),
+                      dit_inputs.condition_source_backends);
+  ADD_VECTOR_TO_PROTO(pb_dit_inputs->mutable_condition_manifest_jsons(),
+                      dit_inputs.condition_manifest_jsons);
+
   if (!generation_params_to_proto(dit_inputs.generation_params,
                                   pb_dit_inputs->mutable_generation_params())) {
     LOG(ERROR) << "Failed to convert generation_params";
@@ -660,6 +670,19 @@ bool proto_to_dit_forward_input(const proto::DiTForwardInput& pb_dit_inputs,
   if (pb_dit_inputs.has_audio_prompt_text()) {
     dit_inputs.audio_prompt_text = pb_dit_inputs.audio_prompt_text();
   }
+
+  if (pb_dit_inputs.has_text_token_tags()) {
+    dit_inputs.text_token_tags =
+        util::proto_to_torch(pb_dit_inputs.text_token_tags());
+  }
+  dit_inputs.condition_schemas.assign(pb_dit_inputs.condition_schemas().begin(),
+                                      pb_dit_inputs.condition_schemas().end());
+  dit_inputs.condition_source_backends.assign(
+      pb_dit_inputs.condition_source_backends().begin(),
+      pb_dit_inputs.condition_source_backends().end());
+  dit_inputs.condition_manifest_jsons.assign(
+      pb_dit_inputs.condition_manifest_jsons().begin(),
+      pb_dit_inputs.condition_manifest_jsons().end());
 
   return true;
 }

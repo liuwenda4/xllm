@@ -66,6 +66,7 @@ DiTForwardInput DiTBatch::prepare_forward_input() {
   input.generation_params = request_vec_[0]->state().generation_params();
 
   std::vector<torch::Tensor> prompt_embeds;
+  std::vector<torch::Tensor> text_token_tags;
   std::vector<torch::Tensor> pooled_prompt_embeds;
 
   std::vector<torch::Tensor> negative_prompt_embeds;
@@ -80,6 +81,7 @@ DiTForwardInput DiTBatch::prepare_forward_input() {
   std::vector<std::vector<torch::Tensor>> per_request_images;
   const auto batch_size = request_vec_.size();
   prompt_embeds.reserve(batch_size);
+  text_token_tags.reserve(batch_size);
   pooled_prompt_embeds.reserve(batch_size);
   negative_prompt_embeds.reserve(batch_size);
   negative_pooled_prompt_embeds.reserve(batch_size);
@@ -114,7 +116,20 @@ DiTForwardInput DiTBatch::prepare_forward_input() {
       input.negative_prompts_2.emplace_back(input_params.negative_prompt_2);
 
     prompt_embeds.emplace_back(input_params.prompt_embed);
+    text_token_tags.emplace_back(input_params.text_token_tags);
     pooled_prompt_embeds.emplace_back(input_params.pooled_prompt_embed);
+
+    if (input_params.condition_schema.has_value()) {
+      input.condition_schemas.emplace_back(*input_params.condition_schema);
+    }
+    if (input_params.condition_source_backend.has_value()) {
+      input.condition_source_backends.emplace_back(
+          *input_params.condition_source_backend);
+    }
+    if (input_params.condition_manifest_json.has_value()) {
+      input.condition_manifest_jsons.emplace_back(
+          *input_params.condition_manifest_json);
+    }
 
     negative_prompt_embeds.emplace_back(input_params.negative_prompt_embed);
     negative_pooled_prompt_embeds.emplace_back(
@@ -159,6 +174,18 @@ DiTForwardInput DiTBatch::prepare_forward_input() {
 
   if (input.prompts_2.size() != request_vec_.size()) {
     input.prompts_2.clear();
+  }
+
+  if (input.condition_schemas.size() != request_vec_.size()) {
+    input.condition_schemas.clear();
+  }
+
+  if (input.condition_source_backends.size() != request_vec_.size()) {
+    input.condition_source_backends.clear();
+  }
+
+  if (input.condition_manifest_jsons.size() != request_vec_.size()) {
+    input.condition_manifest_jsons.clear();
   }
 
   const bool has_full_negative_prompts =
@@ -207,6 +234,10 @@ DiTForwardInput DiTBatch::prepare_forward_input() {
 
   if (check_tensors_valid(prompt_embeds)) {
     input.prompt_embeds = torch::stack(prompt_embeds);
+  }
+
+  if (check_tensors_valid(text_token_tags)) {
+    input.text_token_tags = torch::stack(text_token_tags);
   }
 
   if (check_tensors_valid(pooled_prompt_embeds)) {

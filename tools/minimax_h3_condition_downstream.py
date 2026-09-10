@@ -166,7 +166,6 @@ def main() -> None:
     modality_masks = {
         "h3_vision_segment": text_token_tags == 0,
         "h3_text": text_token_tags == 1,
-        "h3_audio": text_token_tags == 2,
     }
     comparisons = [_compare("layer_49_condition", native_hidden, official_hidden, modality_masks)]
     comparisons.extend(
@@ -184,7 +183,7 @@ def main() -> None:
     save_file(tensor_archive, str(tensor_path))
     summary = {
         "status": "H3_NATIVE_DOWNSTREAM_REPORT",
-        "official_fallback_status": "PASS",
+        "official_condition_status": "ATTESTED_OFFLINE_FIXTURE_VALIDATED",
         "native_status": "PENDING_PACKED_DENOISE_GATE",
         "scope": "text_prefix_only",
         "condition_cache_key": manifest["cache_key"],

@@ -390,6 +390,10 @@ inline size_t get_dit_forward_input_size(const DiTForwardInput& input) {
   size += get_tensor_size(input.last_images);
   size += get_tensor_size(input.prompt_audio);
   size += get_string_size(input.audio_prompt_text);
+  size += get_tensor_size(input.text_token_tags);
+  size += get_string_vector_size(input.condition_schemas);
+  size += get_string_vector_size(input.condition_source_backends);
+  size += get_string_vector_size(input.condition_manifest_jsons);
 
   // Generation params
   size += get_dit_generation_params_size(input.generation_params);
@@ -1130,6 +1134,10 @@ inline void write_dit_forward_input(char*& buffer,
   write_tensor(buffer, input.last_images);
   write_tensor(buffer, input.prompt_audio);
   write_string(buffer, input.audio_prompt_text);
+  write_tensor(buffer, input.text_token_tags);
+  write_string_vector(buffer, input.condition_schemas);
+  write_string_vector(buffer, input.condition_source_backends);
+  write_string_vector(buffer, input.condition_manifest_jsons);
 
   write_dit_generation_params(buffer, input.generation_params);
 }
@@ -1156,6 +1164,10 @@ inline void write_dit_forward_input(RawInputSerializeContext& context,
   write_tensor(context, input.last_images);
   write_tensor(context, input.prompt_audio);
   write_string(context.descriptor, input.audio_prompt_text);
+  write_tensor(context, input.text_token_tags);
+  write_string_vector(context.descriptor, input.condition_schemas);
+  write_string_vector(context.descriptor, input.condition_source_backends);
+  write_string_vector(context.descriptor, input.condition_manifest_jsons);
 
   write_dit_generation_params(context, input.generation_params);
 }
@@ -2141,6 +2153,7 @@ inline void stabilize_dit_forward_input_tensors(DiTForwardInput& input) {
   clone_tensor_if_defined(input.latents);
   clone_tensor_if_defined(input.last_images);
   clone_tensor_if_defined(input.prompt_audio);
+  clone_tensor_if_defined(input.text_token_tags);
 }
 
 inline void read_dit_forward_input(const char*& buffer,
@@ -2166,6 +2179,10 @@ inline void read_dit_forward_input(const char*& buffer,
   read_tensor(buffer, input.last_images);
   read_tensor(buffer, input.prompt_audio);
   read_string(buffer, input.audio_prompt_text);
+  read_tensor(buffer, input.text_token_tags);
+  read_string_vector(buffer, input.condition_schemas);
+  read_string_vector(buffer, input.condition_source_backends);
+  read_string_vector(buffer, input.condition_manifest_jsons);
 
   read_dit_generation_params(buffer, input.generation_params);
   if (stabilize_host_tensors) {
@@ -2232,6 +2249,13 @@ inline void read_dit_forward_input(ReadContext& context,
               /*stream=*/nullptr,
               /*force_host_materialize=*/true);
   read_string(context, input.audio_prompt_text);
+  read_tensor(context,
+              input.text_token_tags,
+              /*stream=*/nullptr,
+              /*force_host_materialize=*/true);
+  read_string_vector(context, input.condition_schemas);
+  read_string_vector(context, input.condition_source_backends);
+  read_string_vector(context, input.condition_manifest_jsons);
 
   read_dit_generation_params(context, input.generation_params);
   if (stabilize_host_tensors) {

@@ -404,6 +404,13 @@ def _compare(
     return result
 
 
+def _legacy_max_abs_pass(comparisons: list[dict[str, Any]], threshold: float) -> bool:
+    return all(
+        item["shape_match"] and item.get("nonfinite_mismatch_count", 0) == 0 and item["max_abs_error"] <= threshold
+        for item in comparisons
+    )
+
+
 def _run_layerwise_qwen(
     model: Any, input_ids: Any, positions: Any, device: Any
 ) -> tuple[Any, Any, Any, dict[str, Any], dict[str, Any]]:
@@ -726,7 +733,6 @@ def main() -> None:
         "qwen_text": ~image_positions,
         "h3_vision_segment": h3_token_tags == 0,
         "h3_text": h3_token_tags == 1,
-        "h3_audio": h3_token_tags == 2,
     }
 
     def compare_tensors(name: str, actual: Any, expected: Any) -> dict[str, Any]:
@@ -797,11 +803,13 @@ def main() -> None:
                         expected_activation,
                     )
                 )
-        legacy_pass = all(item["shape_match"] and item["max_abs_error"] <= args.max_abs_error for item in comparisons)
+        legacy_pass = _legacy_max_abs_pass(comparisons, args.max_abs_error)
         summary = {
-            "status": f"H3_QWEN_LAYER{isolated_layer}_ISOLATED_PASS"
-            if legacy_pass
-            else f"H3_QWEN_LAYER{isolated_layer}_ISOLATED_REPORT",
+            "status": (
+                f"H3_QWEN_LAYER{isolated_layer}_ISOLATED_PASS"
+                if args.gate_mode == "legacy_max_abs" and legacy_pass
+                else f"H3_QWEN_LAYER{isolated_layer}_ISOLATED_REPORT"
+            ),
             "gate": {
                 "mode": args.gate_mode,
                 "legacy_max_abs_passed": legacy_pass,
@@ -918,14 +926,16 @@ def main() -> None:
     model_state["isolated_layer_43_output"] = isolated_output.cpu()
     model_state.update({f"isolated_layer_43_{name}": value for name, value in isolated_nodes.items()})
     torch.save(model_state, output_dir / "qwen_layer50_xllm.pt")
-    legacy_pass = all(item["shape_match"] and item["max_abs_error"] <= args.max_abs_error for item in comparisons)
+    legacy_pass = _legacy_max_abs_pass(comparisons, args.max_abs_error)
     summary = {
         "status": (
             "H3_QWEN_LAYER50_NPU_PASS"
-            if legacy_pass
-            else "H3_QWEN_LAYER50_NATIVE_PENDING_DOWNSTREAM_GATE"
-            if args.gate_mode == "report_only"
-            else "H3_QWEN_LAYER50_NPU_DIVERGED"
+            if args.gate_mode == "legacy_max_abs" and legacy_pass
+            else (
+                "H3_QWEN_LAYER50_NATIVE_PENDING_DOWNSTREAM_GATE"
+                if args.gate_mode == "report_only"
+                else "H3_QWEN_LAYER50_NPU_DIVERGED"
+            )
         ),
         "gate": {
             "mode": args.gate_mode,

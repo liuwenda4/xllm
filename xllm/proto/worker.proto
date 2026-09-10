@@ -299,6 +299,12 @@ message DiTForwardInput {
   // Voice cloning fields (LongCat-AudioDiT)
   optional Tensor prompt_audio = 19;
   optional string audio_prompt_text = 20;
+
+  // Versioned MiniMax-H3 condition bundle
+  Tensor text_token_tags = 22;
+  repeated string condition_schemas = 23;
+  repeated string condition_source_backends = 24;
+  repeated string condition_manifest_jsons = 25;
 }
 
 message DiTForwardOutput {

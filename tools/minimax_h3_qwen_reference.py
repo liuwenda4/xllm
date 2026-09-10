@@ -110,7 +110,7 @@ def main() -> None:
         torch.npu.reset_peak_memory_stats(device)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    prompt = prompt_path.read_text(encoding="utf-8").strip()
+    prompt = prompt_path.read_text(encoding="utf-8")
     reference = _normalize_reference(image_path, args.reference_short_edge)
     started_at = time.perf_counter()
     text_encoder, tokenizer, processor = _load_components(checkpoint_path, device)

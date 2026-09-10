@@ -16,6 +16,8 @@ limitations under the License.
 
 #include "dit_request_params.h"
 
+#include <algorithm>
+
 #include "butil/base64.h"
 #include "core/common/instance_name.h"
 #include "core/common/macros.h"
@@ -28,6 +30,110 @@ limitations under the License.
 namespace xllm {
 namespace {
 thread_local ShortUUID short_uuid;
+
+constexpr char kMiniMaxH3ConditionSchema[] =
+    "xllm.minimax_h3.text_conditioning/v1";
+
+bool has_supported_tensor_datatype(const proto::Tensor& tensor) {
+  const std::string& datatype = tensor.datatype();
+  return datatype == "BOOL" || datatype == "INT32" || datatype == "INT64" ||
+         datatype == "UINT32" || datatype == "UINT64" || datatype == "FP32" ||
+         datatype == "FP64" || datatype == "BYTES" || datatype == "FP16" ||
+         datatype == "BF16";
+}
+
+bool json_integer_equals(const nlohmann::json& object,
+                         const char* key,
+                         int64_t expected) {
+  const auto iter = object.find(key);
+  return iter != object.end() && iter->is_number_integer() && *iter == expected;
+}
+
+bool json_string_equals(const nlohmann::json& object,
+                        const char* key,
+                        const std::string& expected) {
+  const auto iter = object.find(key);
+  return iter != object.end() && iter->is_string() && *iter == expected;
+}
+
+bool json_has_sha256(const nlohmann::json& object, const char* key) {
+  const auto iter = object.find(key);
+  if (iter == object.end() || !iter->is_string()) {
+    return false;
+  }
+  const std::string value = *iter;
+  return value.size() == 64 &&
+         std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+           return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+         });
+}
+
+std::optional<std::string> verify_minimax_h3_condition_bundle(
+    const DiTInputParams& input) {
+  const bool has_any_bundle_field =
+      input.text_token_tags_is_set || input.condition_schema.has_value() ||
+      input.condition_source_backend.has_value() ||
+      input.condition_manifest_json.has_value();
+  if (!has_any_bundle_field) {
+    return std::nullopt;
+  }
+
+  if (!input.text_token_tags.defined() || !input.condition_schema.has_value() ||
+      !input.condition_source_backend.has_value() ||
+      !input.condition_manifest_json.has_value()) {
+    return "MiniMax-H3 condition bundle is incomplete";
+  }
+
+  if (*input.condition_schema != kMiniMaxH3ConditionSchema) {
+    return "unsupported MiniMax-H3 condition_schema";
+  }
+  if (*input.condition_source_backend != "official_hf" &&
+      *input.condition_source_backend != "xllm_native") {
+    return "unsupported MiniMax-H3 condition_source_backend";
+  }
+
+  if (!input.prompt_embed.defined() ||
+      input.prompt_embed.scalar_type() != torch::kBFloat16 ||
+      !input.prompt_embed.is_contiguous() || input.prompt_embed.dim() != 2 ||
+      input.prompt_embed.size(0) <= 0 || input.prompt_embed.size(1) != 5120) {
+    return "MiniMax-H3 prompt_embed must be contiguous BF16 with shape "
+           "[tokens,5120]";
+  }
+
+  if (input.text_token_tags.scalar_type() != torch::kInt64 ||
+      !input.text_token_tags.is_contiguous() ||
+      input.text_token_tags.dim() != 1 ||
+      input.text_token_tags.size(0) != input.prompt_embed.size(0)) {
+    return "MiniMax-H3 text_token_tags must be contiguous int64 with shape "
+           "[tokens] matching prompt_embed";
+  }
+  if (!torch::logical_or(input.text_token_tags == 0, input.text_token_tags == 1)
+           .all()
+           .item<bool>()) {
+    return "MiniMax-H3 text_token_tags values must be 0 or 1";
+  }
+
+  const nlohmann::json manifest =
+      nlohmann::json::parse(*input.condition_manifest_json,
+                            /*cb=*/nullptr,
+                            /*allow_exceptions=*/false);
+  if (manifest.is_discarded() || !manifest.is_object()) {
+    return "MiniMax-H3 condition_manifest_json must be a JSON object";
+  }
+  if (!json_string_equals(manifest, "schema", *input.condition_schema) ||
+      !json_string_equals(
+          manifest, "source_backend", *input.condition_source_backend) ||
+      !json_integer_equals(manifest, "decoder_layer_index", 49) ||
+      !json_integer_equals(manifest, "hidden_state_slot", 50) ||
+      !json_integer_equals(
+          manifest, "token_count", input.prompt_embed.size(0)) ||
+      !json_has_sha256(manifest, "hidden_digest") ||
+      !json_has_sha256(manifest, "token_tags_digest")) {
+    return "MiniMax-H3 condition manifest does not match the supplied bundle";
+  }
+
+  return std::nullopt;
+}
 
 std::string generate_request_id(const std::string& prefix) {
   return prefix + InstanceName::name()->get_name_hash() + "-" +
@@ -92,15 +198,21 @@ bool decode_base64_image(const std::string& base64, torch::Tensor& out) {
 // Shared helper: populate DiTInputParams fields common to Image and Video
 // input.
 template <typename InputProto>
-void fill_input_params(DiTInputParams& input_params, const InputProto& input) {
+void fill_input_params(DiTInputParams& input_params,
+                       const InputProto& input,
+                       bool skip_unsupported_tensor_datatypes = false) {
   input_params.prompt = input.prompt();
   if (input.has_negative_prompt()) {
     input_params.negative_prompt = input.negative_prompt();
   }
-  if (input.has_prompt_embed()) {
+  if (input.has_prompt_embed() &&
+      (!skip_unsupported_tensor_datatypes ||
+       has_supported_tensor_datatype(input.prompt_embed()))) {
     input_params.prompt_embed = util::proto_to_torch(input.prompt_embed());
   }
-  if (input.has_negative_prompt_embed()) {
+  if (input.has_negative_prompt_embed() &&
+      (!skip_unsupported_tensor_datatypes ||
+       has_supported_tensor_datatype(input.negative_prompt_embed()))) {
     input_params.negative_prompt_embed =
         util::proto_to_torch(input.negative_prompt_embed());
   }
@@ -332,10 +444,33 @@ DiTRequestParams::DiTRequestParams(const proto::VideoGenerationRequest& request,
 
   if (request.has_input()) {
     const auto& input = request.input();
-    fill_input_params(input_params, input);
+    const bool has_condition_bundle = input.has_text_token_tags() ||
+                                      input.has_condition_schema() ||
+                                      input.has_condition_source_backend() ||
+                                      input.has_condition_manifest_json();
+    fill_input_params(input_params,
+                      input,
+                      /*skip_unsupported_tensor_datatypes=*/
+                      has_condition_bundle);
     // Video-only input fields
     if (input.has_last_image()) {
       decode_base64_image(input.last_image(), input_params.last_image);
+    }
+    if (input.has_text_token_tags()) {
+      input_params.text_token_tags_is_set = true;
+      if (has_supported_tensor_datatype(input.text_token_tags())) {
+        input_params.text_token_tags =
+            util::proto_to_torch(input.text_token_tags());
+      }
+    }
+    if (input.has_condition_schema()) {
+      input_params.condition_schema = input.condition_schema();
+    }
+    if (input.has_condition_source_backend()) {
+      input_params.condition_source_backend = input.condition_source_backend();
+    }
+    if (input.has_condition_manifest_json()) {
+      input_params.condition_manifest_json = input.condition_manifest_json();
     }
   }
 
@@ -394,6 +529,13 @@ bool DiTRequestParams::verify_params(
 
   if (request_kind == DiTRequestKind::kAudio) {
     return true;
+  }
+
+  if (request_kind == DiTRequestKind::kVideo) {
+    if (const auto error = verify_minimax_h3_condition_bundle(input_params)) {
+      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT, *error);
+      return false;
+    }
   }
 
   if (generation_params.width <= 0 || generation_params.height <= 0) {

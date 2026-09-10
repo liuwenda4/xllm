@@ -36,6 +36,7 @@ struct DiTForwardInput {
   void save_with_prefix(std::string prefix) const {
     torch::save(images, prefix + "images_cpp.pt");
     torch::save(prompt_embeds, prefix + "prompt_embeds_cpp.pt");
+    torch::save(text_token_tags, prefix + "text_token_tags_cpp.pt");
     torch::save(negative_prompt_embeds, prefix + "neg_prompt_embeds_cpp.pt");
   }
   void debug_print(std::ostream& os = std::cout) const {
@@ -72,6 +73,22 @@ struct DiTForwardInput {
       if (i < negative_prompts_2.size() - 1) os << ", ";
     }
     os << "]" << std::endl;
+
+    os << "condition_schemas: [";
+    for (size_t i = 0; i < condition_schemas.size(); ++i) {
+      os << "\"" << condition_schemas[i] << "\"";
+      if (i < condition_schemas.size() - 1) os << ", ";
+    }
+    os << "]" << std::endl;
+
+    os << "condition_source_backends: [";
+    for (size_t i = 0; i < condition_source_backends.size(); ++i) {
+      os << "\"" << condition_source_backends[i] << "\"";
+      if (i < condition_source_backends.size() - 1) os << ", ";
+    }
+    os << "]" << std::endl;
+    os << "condition_manifest_jsons: " << condition_manifest_jsons.size()
+       << " entries" << std::endl;
 
     // Print tensor shapes
     os << "\n--- Tensor Shapes ---" << std::endl;
@@ -118,6 +135,13 @@ struct DiTForwardInput {
     os << "prompt_embeds: ";
     if (prompt_embeds.defined()) {
       os << prompt_embeds.sizes() << std::endl;
+    } else {
+      os << "undefined" << std::endl;
+    }
+
+    os << "text_token_tags: ";
+    if (text_token_tags.defined()) {
+      os << text_token_tags.sizes() << std::endl;
     } else {
       os << "undefined" << std::endl;
     }
@@ -183,6 +207,10 @@ struct DiTForwardInput {
       input.prompt_embeds = prompt_embeds.to(device, dtype);
     }
 
+    if (text_token_tags.defined()) {
+      input.text_token_tags = text_token_tags.to(device, torch::kInt64);
+    }
+
     if (pooled_prompt_embeds.defined()) {
       input.pooled_prompt_embeds = pooled_prompt_embeds.to(device, dtype);
     }
@@ -244,6 +272,11 @@ struct DiTForwardInput {
   // Secondary negative prompt to exclude additional unwanted features
   std::vector<std::string> negative_prompts_2;
 
+  // Versioned MiniMax-H3 condition metadata, one value per request.
+  std::vector<std::string> condition_schemas;
+  std::vector<std::string> condition_source_backends;
+  std::vector<std::string> condition_manifest_jsons;
+
   torch::Tensor images;
 
   std::vector<torch::Tensor> images_list;
@@ -255,6 +288,9 @@ struct DiTForwardInput {
   torch::Tensor masked_image_latents;
 
   torch::Tensor prompt_embeds;
+
+  // MiniMax-H3 token classification tags, shape [batch, tokens].
+  torch::Tensor text_token_tags;
 
   torch::Tensor pooled_prompt_embeds;
 

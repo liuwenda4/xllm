@@ -13,7 +13,7 @@ import math
 import pytest
 import torch
 
-from tools.minimax_h3_qwen_xllm import _compare, _metric_summary, _ordered_bf16
+from tools.minimax_h3_qwen_xllm import _compare, _legacy_max_abs_pass, _metric_summary, _ordered_bf16
 
 
 def test_metric_summary_reports_relative_l2_and_stable_cosine() -> None:
@@ -71,3 +71,15 @@ def test_metric_summary_reports_sign_crossings_separately() -> None:
 
     assert metrics["bf16"]["sign_crossing_count"] == 1
     assert metrics["bf16"]["same_sign_ulp_max"] == 0
+
+
+def test_legacy_gate_rejects_nonfinite_mismatches() -> None:
+    comparison = _compare(
+        "nonfinite",
+        torch.tensor([float("nan")]),
+        torch.tensor([0.0]),
+    )
+
+    assert comparison["max_abs_error"] == 0.0
+    assert comparison["nonfinite_mismatch_count"] == 1
+    assert not _legacy_max_abs_pass([comparison], 0.25)

@@ -22,6 +22,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -30,19 +31,20 @@ from typing import Any
 import torch
 from safetensors.torch import load_file, save_file
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+RUNTIME_CONDITION_SCHEMA = "xllm.minimax_h3.text_conditioning/v1"
 CONDITION_ABI = {
     "name": "minimax_h3_qwen_layer50_condition",
-    "version": 1,
+    "version": 2,
     "decoder_layer_index": 49,
     "hidden_state_slot": 50,
     "hidden_size": 5120,
     "prompt_embeds_dtype": "bfloat16",
     "text_token_tags_dtype": "int64",
-    "allowed_text_token_tags": [0, 1, 2],
+    "allowed_text_token_tags": [0, 1],
 }
 BACKEND_APPROVAL_STATUS = {
-    "official_hf": "approved correctness fallback",
+    "official_hf": "attested-offline-fixture",
     "xllm_native": "experimental/native-gate-pending",
 }
 
@@ -112,9 +114,8 @@ def _normalization_parameters(fps: float, video_sample_fps: float, reference_sho
 def build_cache_key_inputs(
     *,
     backend: str,
-    source_identity: Sequence[Mapping[str, str]],
     checkpoint_identity: Mapping[str, Any],
-    prompt_bytes_sha256: str | None,
+    prompt_bytes_sha256: str,
     ordered_references: Sequence[Mapping[str, str]],
     fps: float,
     video_sample_fps: float,
@@ -122,16 +123,9 @@ def build_cache_key_inputs(
 ) -> dict[str, Any]:
     """Build the complete, path-independent identity hashed for a cache key."""
     _validate_backend(backend)
-    _validate_sha256(prompt_bytes_sha256, "prompt_bytes_sha256", optional=True)
-
-    normalized_sources = []
-    for index, source in enumerate(source_identity):
-        role = source.get("role")
-        digest = source.get("sha256")
-        if not isinstance(role, str) or not role:
-            raise ValueError(f"source_identity[{index}].role must be non-empty")
-        _validate_sha256(digest, f"source_identity[{index}].sha256")
-        normalized_sources.append({"role": role, "sha256": digest})
+    _validate_sha256(prompt_bytes_sha256, "prompt_bytes_sha256")
+    if not checkpoint_identity:
+        raise ValueError("checkpoint_identity must not be empty")
 
     normalized_references = []
     for index, reference in enumerate(ordered_references):
@@ -145,7 +139,6 @@ def build_cache_key_inputs(
     inputs = {
         "backend": backend,
         "condition_abi": dict(CONDITION_ABI),
-        "source_identity": normalized_sources,
         "checkpoint_identity": dict(checkpoint_identity),
         "prompt_bytes_sha256": prompt_bytes_sha256,
         "ordered_references": normalized_references,
@@ -292,9 +285,7 @@ def _manifest_checkpoint_identity(
     return key_identity, manifest_identity
 
 
-def _prompt_identity(prompt_path: Path | None) -> dict[str, Any] | None:
-    if prompt_path is None:
-        return None
+def _prompt_identity(prompt_path: Path) -> dict[str, Any]:
     path = _resolved_file(prompt_path, "prompt file")
     return {"path": str(path), "sha256": file_sha256(path), "byte_count": path.stat().st_size}
 
@@ -307,6 +298,49 @@ def _reference_identities(references: Sequence[tuple[str, Path]]) -> list[dict[s
         path = _resolved_file(reference_path, f"reference {index}")
         identities.append({"type": reference_type, "path": str(path), "sha256": file_sha256(path)})
     return identities
+
+
+def _official_summary_identity(
+    summary_path: Path,
+    *,
+    source_archive: Path,
+    prompt: Mapping[str, Any],
+    references: Sequence[Mapping[str, str]],
+) -> dict[str, Any]:
+    path = _resolved_file(summary_path, "official reference summary")
+    try:
+        summary = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as error:
+        raise ValueError(f"Failed to read official reference summary {path}: {error}") from error
+    if not isinstance(summary, dict) or summary.get("status") != "H3_QWEN_LAYER50_REFERENCE_PASS":
+        raise ValueError("official reference summary does not record H3_QWEN_LAYER50_REFERENCE_PASS")
+    source_digest = file_sha256(source_archive)
+    if summary.get("tensor_archive_sha256") != source_digest:
+        raise ValueError("official reference summary tensor archive digest does not match --source-archive")
+    if summary.get("prompt_sha256") != prompt["sha256"]:
+        raise ValueError("official reference summary prompt digest does not match --prompt-path bytes")
+    if len(references) != 1 or references[0]["type"] != "image":
+        raise ValueError("the current official reference runner attests exactly one ordered image reference")
+    if summary.get("image_sha256") != references[0]["sha256"]:
+        raise ValueError("official reference summary image digest does not match --reference")
+    if summary.get("lm_head_executed") is not False:
+        raise ValueError("official reference summary must attest that the LM head was not executed")
+    hidden = summary.get("layer_49_output_pre_final_norm")
+    hidden_shape = hidden.get("shape") if isinstance(hidden, Mapping) else None
+    if (
+        not isinstance(hidden_shape, list)
+        or len(hidden_shape) != 3
+        or hidden_shape[0] != 1
+        or hidden_shape[1] <= 0
+        or hidden_shape[2] != CONDITION_ABI["hidden_size"]
+    ):
+        raise ValueError("official reference summary has an unexpected layer-49 hidden contract")
+    return {
+        "path": str(path),
+        "sha256": file_sha256(path),
+        "status": summary["status"],
+        "source_archive_sha256": source_digest,
+    }
 
 
 def _write_cache_entry(
@@ -331,6 +365,11 @@ def _write_cache_entry(
             os.fsync(handle.fileno())
         os.replace(condition_temp, cache_dir / _CONDITION_FILE)
         os.replace(manifest_temp, cache_dir / _MANIFEST_FILE)
+        directory_fd = os.open(cache_dir, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         condition_temp.unlink(missing_ok=True)
         manifest_temp.unlink(missing_ok=True)
@@ -378,17 +417,15 @@ def validate_cache_entry(cache_dir: Path, expected_key: str | None = None) -> di
         source_archives = manifest.get("source_archives")
         if not isinstance(source_archives, list):
             raise CacheValidationError("manifest source_archives must be a list")
-        source_identity = []
         for source in source_archives:
             if not isinstance(source, dict) or not Path(source.get("path", "")).is_absolute():
                 raise CacheValidationError("source archive paths must be absolute")
             _validate_sha256(source.get("sha256"), "source archive sha256")
-            source_identity.append({"role": source.get("role"), "sha256": source.get("sha256")})
-        if source_identity != cache_key_inputs.get("source_identity"):
-            raise CacheValidationError("source archive provenance does not match cache key inputs")
 
         prompt = manifest.get("prompt")
-        prompt_digest = None if prompt is None else prompt.get("sha256")
+        if not isinstance(prompt, dict):
+            raise CacheValidationError("manifest prompt provenance must be an object")
+        prompt_digest = prompt.get("sha256")
         if prompt_digest != cache_key_inputs.get("prompt_bytes_sha256"):
             raise CacheValidationError("prompt provenance does not match cache key inputs")
         references = manifest.get("ordered_references")
@@ -409,6 +446,17 @@ def validate_cache_entry(cache_dir: Path, expected_key: str | None = None) -> di
         if checkpoint_key_identity != cache_key_inputs.get("checkpoint_identity"):
             raise CacheValidationError("checkpoint provenance does not match cache key inputs")
 
+        attestation = manifest.get("official_reference_attestation")
+        if backend == "official_hf":
+            if not isinstance(attestation, dict):
+                raise CacheValidationError("official_hf cache requires reference attestation")
+            _validate_sha256(attestation.get("sha256"), "official reference summary sha256")
+            _validate_sha256(attestation.get("source_archive_sha256"), "attested source archive sha256")
+            if attestation.get("status") != "H3_QWEN_LAYER50_REFERENCE_PASS":
+                raise CacheValidationError("official reference attestation status mismatch")
+            if not source_archives or attestation["source_archive_sha256"] != source_archives[0].get("sha256"):
+                raise CacheValidationError("official reference attestation source archive mismatch")
+
         artifact = manifest.get("artifacts", {}).get(_CONDITION_FILE, {})
         if file_sha256(condition_path) != artifact.get("sha256"):
             raise CacheValidationError("condition.safetensors file SHA256 mismatch")
@@ -420,6 +468,18 @@ def validate_cache_entry(cache_dir: Path, expected_key: str | None = None) -> di
         actual_tensors = {name: _tensor_metadata(tensor) for name, tensor in tensors.items()}
         if expected_tensors != actual_tensors:
             raise CacheValidationError("condition tensor metadata or SHA256 mismatch")
+        expected_runtime_manifest = {
+            "schema": RUNTIME_CONDITION_SCHEMA,
+            "source_backend": backend,
+            "decoder_layer_index": 49,
+            "hidden_state_slot": 50,
+            "token_count": int(tensors["prompt_embeds"].shape[0]),
+            "hidden_digest": actual_tensors["prompt_embeds"]["sha256"],
+            "token_tags_digest": actual_tensors["text_token_tags"]["sha256"],
+            "condition_cache_key": actual_key,
+        }
+        if manifest.get("runtime_bundle_manifest") != expected_runtime_manifest:
+            raise CacheValidationError("runtime condition bundle manifest mismatch")
         return manifest
     except CacheValidationError:
         raise
@@ -434,8 +494,9 @@ def create_condition_cache(
     cache_root: Path,
     official_metadata_archive: Path | None = None,
     checkpoint_identity: Mapping[str, str] | None = None,
-    checkpoint_manifest: Path | None = None,
-    prompt_path: Path | None = None,
+    checkpoint_manifest: Path,
+    prompt_path: Path,
+    official_reference_summary: Path | None = None,
     references: Sequence[tuple[str, Path]] = (),
     fps: float = 24.0,
     video_sample_fps: float = 2.0,
@@ -444,6 +505,8 @@ def create_condition_cache(
 ) -> Path:
     """Create or validate one content-addressed offline condition cache entry."""
     _validate_backend(backend)
+    if not checkpoint_identity:
+        raise ValueError("checkpoint identity must not be empty")
     source_archive = _resolved_file(source_archive, f"{backend} source archive")
     if backend == "official_hf":
         if official_metadata_archive is not None:
@@ -461,15 +524,26 @@ def create_condition_cache(
 
     normalization = _normalization_parameters(fps, video_sample_fps, reference_short_edge)
     checkpoint_key_identity, checkpoint_manifest_identity = _manifest_checkpoint_identity(
-        checkpoint_identity or {}, checkpoint_manifest
+        checkpoint_identity, checkpoint_manifest
     )
     prompt = _prompt_identity(prompt_path)
     reference_identities = _reference_identities(references)
+    official_attestation = None
+    if backend == "official_hf":
+        if official_reference_summary is None:
+            raise ValueError("official_hf requires --official-reference-summary attestation")
+        official_attestation = _official_summary_identity(
+            official_reference_summary,
+            source_archive=source_archive,
+            prompt=prompt,
+            references=reference_identities,
+        )
+    elif official_reference_summary is not None:
+        raise ValueError("--official-reference-summary is only valid with --backend official_hf")
     cache_key_inputs = build_cache_key_inputs(
         backend=backend,
-        source_identity=[{"role": item["role"], "sha256": item["sha256"]} for item in source_archives],
         checkpoint_identity=checkpoint_key_identity,
-        prompt_bytes_sha256=None if prompt is None else prompt["sha256"],
+        prompt_bytes_sha256=prompt["sha256"],
         ordered_references=[{"type": item["type"], "sha256": item["sha256"]} for item in reference_identities],
         **normalization,
     )
@@ -477,7 +551,6 @@ def create_condition_cache(
     cache_root = cache_root.expanduser().resolve()
     cache_root.mkdir(parents=True, exist_ok=True)
     cache_dir = cache_root / cache_key
-
     if cache_dir.exists():
         try:
             validate_cache_entry(cache_dir, expected_key=cache_key)
@@ -488,29 +561,85 @@ def create_condition_cache(
                 ) from error
         else:
             return cache_dir
-    cache_dir.mkdir(parents=False, exist_ok=True)
+    lock_path = cache_root / f".{cache_key}.lock"
+    try:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as error:
+        raise CacheValidationError(f"condition cache entry is currently being published: {cache_key}") from error
+    os.close(lock_fd)
+    staging_dir = cache_root / f".{cache_key}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    backup_dir = cache_root / f".{cache_key}.{uuid.uuid4().hex}.old"
+    replaced_existing = False
+    try:
+        if cache_dir.exists():
+            try:
+                validate_cache_entry(cache_dir, expected_key=cache_key)
+            except CacheValidationError as error:
+                if not force:
+                    raise CacheValidationError(
+                        f"Existing cache entry is invalid; pass --force to replace it safely: {cache_dir}: {error}"
+                    ) from error
+            else:
+                return cache_dir
 
-    source_tensors = load_tensor_archive(source_archive)
-    metadata_tensors = None if metadata_archive is None else load_tensor_archive(metadata_archive)
-    tensors = extract_condition_tensors(backend, source_tensors, metadata_tensors)
-    manifest = {
-        "schema_version": SCHEMA_VERSION,
-        "condition_abi": dict(CONDITION_ABI),
-        "backend": backend,
-        "backend_approval_status": BACKEND_APPROVAL_STATUS[backend],
-        "hidden_state": {"decoder_layer_index": 49, "hidden_state_slot": 50},
-        "cache_key": cache_key,
-        "cache_key_inputs": cache_key_inputs,
-        "source_archives": source_archives,
-        "checkpoint_identity_inputs": checkpoint_manifest_identity,
-        "prompt": prompt,
-        "ordered_references": reference_identities,
-        "normalization_parameters": normalization,
-        "tensors": {name: _tensor_metadata(tensor) for name, tensor in tensors.items()},
-    }
-    _write_cache_entry(cache_dir, tensors, manifest)
-    validate_cache_entry(cache_dir, expected_key=cache_key)
-    return cache_dir
+        source_tensors = load_tensor_archive(source_archive)
+        metadata_tensors = None if metadata_archive is None else load_tensor_archive(metadata_archive)
+        tensors = extract_condition_tensors(backend, source_tensors, metadata_tensors)
+        tensor_metadata = {name: _tensor_metadata(tensor) for name, tensor in tensors.items()}
+        runtime_bundle_manifest = {
+            "schema": RUNTIME_CONDITION_SCHEMA,
+            "source_backend": backend,
+            "decoder_layer_index": 49,
+            "hidden_state_slot": 50,
+            "token_count": int(tensors["prompt_embeds"].shape[0]),
+            "hidden_digest": tensor_metadata["prompt_embeds"]["sha256"],
+            "token_tags_digest": tensor_metadata["text_token_tags"]["sha256"],
+            "condition_cache_key": cache_key,
+        }
+        manifest = {
+            "schema_version": SCHEMA_VERSION,
+            "condition_abi": dict(CONDITION_ABI),
+            "backend": backend,
+            "backend_approval_status": BACKEND_APPROVAL_STATUS[backend],
+            "hidden_state": {"decoder_layer_index": 49, "hidden_state_slot": 50},
+            "cache_key": cache_key,
+            "cache_key_inputs": cache_key_inputs,
+            "source_archives": source_archives,
+            "checkpoint_identity_inputs": checkpoint_manifest_identity,
+            "official_reference_attestation": official_attestation,
+            "prompt": prompt,
+            "ordered_references": reference_identities,
+            "normalization_parameters": normalization,
+            "tensors": tensor_metadata,
+            "runtime_bundle_manifest": runtime_bundle_manifest,
+        }
+        staging_dir.mkdir()
+        _write_cache_entry(staging_dir, tensors, manifest)
+        if cache_dir.exists():
+            os.replace(cache_dir, backup_dir)
+            replaced_existing = True
+        os.replace(staging_dir, cache_dir)
+        root_fd = os.open(cache_root, os.O_RDONLY)
+        try:
+            os.fsync(root_fd)
+        finally:
+            os.close(root_fd)
+        validate_cache_entry(cache_dir, expected_key=cache_key)
+        shutil.rmtree(backup_dir, ignore_errors=True)
+        replaced_existing = False
+        return cache_dir
+    except BaseException:
+        if replaced_existing and backup_dir.exists():
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir, ignore_errors=True)
+            os.replace(backup_dir, cache_dir)
+            replaced_existing = False
+        raise
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        if not replaced_existing:
+            shutil.rmtree(backup_dir, ignore_errors=True)
+        lock_path.unlink(missing_ok=True)
 
 
 def _parse_checkpoint_identity(values: Sequence[str]) -> dict[str, str]:
@@ -554,8 +683,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         metavar="NAME=VALUE",
         help="Repeatable checkpoint identity input, such as revision or checkpoint digest.",
     )
-    parser.add_argument("--checkpoint-manifest", type=Path, help="Optional local checkpoint identity manifest.")
-    parser.add_argument("--prompt-path", type=Path, help="Optional prompt file, hashed as raw bytes.")
+    parser.add_argument("--checkpoint-manifest", type=Path, required=True, help="Local checkpoint identity manifest.")
+    parser.add_argument("--prompt-path", type=Path, required=True, help="Prompt file, hashed as exact UTF-8 bytes.")
+    parser.add_argument(
+        "--official-reference-summary",
+        type=Path,
+        help="Official Qwen reference summary attesting the source archive, prompt, and image.",
+    )
     parser.add_argument(
         "--reference",
         action="append",
@@ -580,6 +714,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         checkpoint_identity=_parse_checkpoint_identity(args.checkpoint_identity),
         checkpoint_manifest=args.checkpoint_manifest,
         prompt_path=args.prompt_path,
+        official_reference_summary=args.official_reference_summary,
         references=_parse_references(args.reference),
         fps=args.fps,
         video_sample_fps=args.video_sample_fps,

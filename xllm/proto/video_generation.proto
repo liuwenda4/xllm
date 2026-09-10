@@ -40,6 +40,14 @@ message VideoInput {
 
   // Last image (base64 encoded)
   optional string last_image = 6;
+
+  // MiniMax-H3 token classification tags paired with prompt_embed
+  optional Tensor text_token_tags = 7;
+
+  // Versioned MiniMax-H3 conditioning bundle metadata
+  optional string condition_schema = 8;
+  optional string condition_source_backend = 9;
+  optional string condition_manifest_json = 10;
 }
 
 // Generation parameters container
