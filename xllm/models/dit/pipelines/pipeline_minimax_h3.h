@@ -32,6 +32,7 @@ limitations under the License.
 #include "core/framework/dit_model_loader.h"
 #include "core/runtime/dit_forward_params.h"
 #include "core/util/json_reader.h"
+#include "models/dit/autoencoders/autoencoder_kl_minimax_h3.h"
 #include "models/dit/transformers/minimax_h3_denoiser.h"
 #include "models/dit/transformers/transformer_minimax_h3.h"
 #include "models/dit/utils/minimax_h3_packing.h"
@@ -550,6 +551,27 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
 
   MiniMaxH3StreamingDenoiser c5_denoiser() const { return c5_denoiser_; }
 
+  void load_c6a_video_vae() {
+    if (!loaded_) {
+      throw std::logic_error(
+          "MiniMax-H3 C6a video VAE requires retained component weights");
+    }
+    if (c6a_video_vae_) {
+      throw std::logic_error("MiniMax-H3 C6a video VAE is already loaded");
+    }
+    auto loader = component_loaders_.find("video_vae");
+    if (loader == component_loaders_.end() || loader->second == nullptr) {
+      throw std::logic_error(
+          "MiniMax-H3 C6a video VAE component loader is unavailable");
+    }
+    MiniMaxH3VideoVAE candidate(options_);
+    candidate->load_model(*loader->second);
+    c6a_video_vae_ = register_module("c6a_video_vae", candidate);
+    component_loaders_.erase(loader);
+  }
+
+  MiniMaxH3VideoVAE c6a_video_vae() const { return c6a_video_vae_; }
+
  private:
   static MiniMaxH3TransformerConfig validate_context(
       const DiTModelContext& context) {
@@ -592,6 +614,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
   std::optional<MiniMaxH3SourceLayoutSummary> source_layout_summary_;
   MiniMaxH3C4Harness c4_harness_{nullptr};
   MiniMaxH3StreamingDenoiser c5_denoiser_{nullptr};
+  MiniMaxH3VideoVAE c6a_video_vae_{nullptr};
   bool loaded_ = false;
 };
 TORCH_MODULE(MiniMaxH3Pipeline);

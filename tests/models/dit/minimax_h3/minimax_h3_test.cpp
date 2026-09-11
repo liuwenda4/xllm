@@ -1359,6 +1359,81 @@ TEST(MiniMaxH3DenoiserTest, RegistersOneStreamingBlockAndFixedWeights) {
   EXPECT_EQ(denoiser->loaded_block_index(), -1);
 }
 
+TEST(MiniMaxH3VideoVAEHelpersTest, DeclaresExactFP32SourceModuleTree) {
+  const auto specs =
+      MiniMaxH3VideoVAESourceLayoutValidator::expected_source_tensors();
+  ASSERT_EQ(specs.size(), 560);
+  MiniMaxH3VideoVAE vae(
+      torch::TensorOptions().device(torch::kMeta).dtype(torch::kBFloat16));
+  const auto parameters = vae->named_parameters(/*recurse=*/true);
+  const auto buffers = vae->named_buffers(/*recurse=*/true);
+  EXPECT_EQ(parameters.size() + buffers.size(), 560);
+  for (const auto& parameter : parameters) {
+    EXPECT_EQ(parameter.value().scalar_type(), torch::kFloat32)
+        << parameter.key();
+  }
+  for (const auto& buffer : buffers) {
+    EXPECT_EQ(buffer.value().scalar_type(), torch::kFloat32) << buffer.key();
+  }
+}
+
+TEST(MiniMaxH3VideoVAEHelpersTest, CausalConvDoesNotReadFutureFrames) {
+  torch::NoGradGuard no_grad;
+  MiniMaxH3VAECausalConv3d conv(
+      /*input_channels=*/1,
+      /*output_channels=*/1,
+      /*kernel_size=*/3,
+      torch::TensorOptions().dtype(torch::kFloat32));
+  auto parameters = conv->named_parameters(/*recurse=*/true);
+  parameters["weight"].fill_(1.0);
+  parameters["bias"].zero_();
+  const torch::Tensor input =
+      torch::arange(4 * 4 * 4, torch::kFloat32).view({1, 1, 4, 4, 4});
+  torch::Tensor changed = input.clone();
+  changed.select(2, 3).add_(1000.0);
+  const torch::Tensor baseline = conv->forward(input);
+  const torch::Tensor modified = conv->forward(changed);
+  EXPECT_TRUE(torch::equal(baseline.slice(2, 0, 3), modified.slice(2, 0, 3)));
+  EXPECT_FALSE(torch::equal(baseline.select(2, 3), modified.select(2, 3)));
+}
+
+TEST(MiniMaxH3VideoVAEHelpersTest, GroupNormIsolatesTemporalFrames) {
+  torch::NoGradGuard no_grad;
+  MiniMaxH3VAEGroupNorm norm(
+      /*channels=*/32, torch::TensorOptions().dtype(torch::kFloat32));
+  auto parameters = norm->named_parameters(/*recurse=*/true);
+  parameters["weight"].fill_(1.0);
+  parameters["bias"].zero_();
+  torch::manual_seed(19);
+  const torch::Tensor input = torch::randn({1, 32, 2, 3, 3});
+  torch::Tensor changed = input.clone();
+  changed.select(2, 1).mul_(17.0).add_(31.0);
+  const torch::Tensor baseline = norm->forward(input);
+  const torch::Tensor modified = norm->forward(changed);
+  EXPECT_TRUE(torch::equal(baseline.select(2, 0), modified.select(2, 0)));
+}
+
+TEST(MiniMaxH3VideoVAEHelpersTest, PosteriorClampAndNormalizeRoundTrip) {
+  torch::Tensor mean =
+      torch::arange(24, torch::kFloat32).view({1, 24, 1, 1, 1}) / 16.0;
+  torch::Tensor raw_logvar =
+      torch::linspace(-40.0, 30.0, 24).view({1, 24, 1, 1, 1});
+  MiniMaxH3VAEDiagonalGaussianDistribution posterior(
+      torch::cat({mean, raw_logvar}, 1));
+  EXPECT_EQ(posterior.logvar().min().item<float>(), -30.0F);
+  EXPECT_EQ(posterior.logvar().max().item<float>(), 20.0F);
+  const torch::Tensor epsilon = torch::full_like(mean, 0.25);
+  const torch::Tensor sample = posterior.sample(epsilon);
+  EXPECT_TRUE(torch::equal(
+      sample,
+      mean + torch::exp(0.5 * raw_logvar.clamp(-30.0, 20.0)) * epsilon));
+  const torch::Tensor normalized =
+      MiniMaxH3VideoVAEImpl::normalize_latents(sample);
+  const torch::Tensor restored =
+      MiniMaxH3VideoVAEImpl::denormalize_latents(normalized);
+  EXPECT_TRUE(torch::allclose(restored, sample, 1e-5, 1e-5));
+}
+
 TEST(MiniMaxH3BlockHelpersTest, ReordersGroupedQKVToAllQAllKAllV) {
   const torch::Tensor grouped =
       torch::arange(12, torch::kBFloat16).view({12, 1});
@@ -1975,6 +2050,223 @@ TEST(MiniMaxH3C5DiagnosticTest, StreamingBlockMatchesC4ResidentBlock) {
   EXPECT_TRUE(torch::equal(resident.mlp_delta, streaming.mlp_delta));
   EXPECT_TRUE(torch::equal(resident.output, streaming.output));
   std::cout << "H3_C5_STREAMING_BLOCK_LOAD_AB=PASS" << std::endl;
+}
+
+TEST(MiniMaxH3C6aGoldenTest, MatchesOfficialTiledVideoVAEFixture) {
+  const char* golden_value = std::getenv("MINIMAX_H3_VIDEO_VAE_GOLDEN");
+  const char* checkpoint_value = std::getenv("MINIMAX_H3_CHECKPOINT");
+  if (golden_value == nullptr || std::string(golden_value).empty() ||
+      checkpoint_value == nullptr || std::string(checkpoint_value).empty()) {
+    GTEST_SKIP() << "Set MINIMAX_H3_VIDEO_VAE_GOLDEN and "
+                    "MINIMAX_H3_CHECKPOINT for the real NPU C6a Gate";
+  }
+  std::filesystem::path golden_path(golden_value);
+  if (std::filesystem::is_directory(golden_path)) {
+    golden_path /= "minimax_h3_video_vae_reference.safetensors";
+  }
+  const std::unique_ptr<StateDict> golden =
+      StateDictFromSafeTensor::load(golden_path.string());
+  ASSERT_NE(golden, nullptr);
+
+  auto loader = std::make_unique<DiTModelLoader>(checkpoint_value);
+  DiTModelContext context(ParallelArgs(0, 1, nullptr),
+                          loader->get_model_args(),
+                          loader->get_quant_args(),
+                          torch::TensorOptions()
+                              .device(torch::Device("npu:0"))
+                              .dtype(torch::kBFloat16),
+                          DiTCacheConfig(),
+                          loader->get_model_type());
+  MiniMaxH3Pipeline pipeline(context);
+  pipeline->load_model(std::move(loader));
+  pipeline->load_c6a_video_vae();
+  MiniMaxH3VideoVAE vae = pipeline->c6a_video_vae();
+  ASSERT_TRUE(vae->is_loaded());
+
+  bool gate_pass = true;
+  const auto report = [&golden, &gate_pass](const std::string& name,
+                                            const torch::Tensor& actual) {
+    const torch::Tensor* expected = find_raw_tensor(*golden, name);
+    EXPECT_NE(expected, nullptr) << name;
+    if (expected == nullptr) {
+      gate_pass = false;
+      return;
+    }
+    EXPECT_EQ(actual.sizes(), expected->sizes()) << name;
+    EXPECT_EQ(actual.scalar_type(), expected->scalar_type()) << name;
+    EXPECT_TRUE(torch::isfinite(actual).all().item<bool>()) << name;
+    if (actual.sizes() != expected->sizes() ||
+        actual.scalar_type() != expected->scalar_type()) {
+      gate_pass = false;
+      return;
+    }
+    const H3ComparisonMetrics metrics =
+        h3_comparison_metrics(actual, *expected);
+    std::cout << "H3-C6a node=" << name
+              << " relative_l2=" << metrics.relative_l2
+              << " cosine=" << metrics.cosine << " max_abs=" << metrics.max_abs
+              << std::endl;
+    H3ComparisonThreshold threshold{0.0, 1.0};
+    if (name.ends_with(".rope_cos") || name.ends_with(".rope_sin")) {
+      threshold = {1e-7, 0.999999999};
+    } else if (name.ends_with(".block_00_output")) {
+      threshold = {0.0004, 0.9999999};
+    } else if (name.ends_with(".block_35_output")) {
+      threshold = {0.0008, 0.9999995};
+    } else if (name == "decoder.raw") {
+      threshold = {0.001, 0.999999};
+    } else if (name == "decoder.postprocessed") {
+      threshold = {0.0005, 0.999999};
+    }
+    const bool passed = threshold.relative_l2 == 0.0
+                            ? torch::equal(actual.to(torch::kCPU), *expected)
+                            : metrics.relative_l2 <= threshold.relative_l2 &&
+                                  metrics.cosine >= threshold.minimum_cosine;
+    if (!passed) {
+      ADD_FAILURE() << "H3-C6a node failed Gate: " << name
+                    << " relative_l2=" << metrics.relative_l2
+                    << " threshold=" << threshold.relative_l2
+                    << " cosine=" << metrics.cosine
+                    << " minimum=" << threshold.minimum_cosine;
+      gate_pass = false;
+    }
+  };
+
+  int64_t encoder_tile = 0;
+  int64_t decoder_tile = 0;
+  int64_t decoder_rope = 0;
+  int64_t decoder_block0 = 0;
+  int64_t decoder_block35 = 0;
+  const MiniMaxH3VideoVAETraceHook hook =
+      [&](std::string_view name, int64_t index, const torch::Tensor& value) {
+        if (name == "encoder.quant_conv") {
+          std::ostringstream key;
+          key << "encoder.tile_call_" << std::setw(2) << std::setfill('0')
+              << encoder_tile++ << ".moments";
+          report(key.str(), value);
+        } else if (name == "decoder.post_quant_conv") {
+          std::ostringstream key;
+          key << "decoder.tile_call_" << std::setw(2) << std::setfill('0')
+              << decoder_tile++ << ".post_quant";
+          report(key.str(), value);
+        } else if (name == "decoder.rope.position_ids") {
+          std::ostringstream key;
+          key << "decoder.tile_call_" << std::setw(2) << std::setfill('0')
+              << decoder_rope << ".rope_position_ids";
+          report(key.str(), value);
+        } else if (name == "decoder.rope.cos") {
+          std::ostringstream key;
+          key << "decoder.tile_call_" << std::setw(2) << std::setfill('0')
+              << decoder_rope << ".rope_cos";
+          report(key.str(), value);
+        } else if (name == "decoder.rope.sin") {
+          std::ostringstream key;
+          key << "decoder.tile_call_" << std::setw(2) << std::setfill('0')
+              << decoder_rope++ << ".rope_sin";
+          report(key.str(), value);
+        } else if (name == "decoder.block" && index == 0) {
+          std::ostringstream key;
+          key << "decoder.tile_call_" << std::setw(2) << std::setfill('0')
+              << decoder_block0++ << ".block_00_output";
+          report(key.str(), value);
+        } else if (name == "decoder.block" && index == 35) {
+          std::ostringstream key;
+          key << "decoder.tile_call_" << std::setw(2) << std::setfill('0')
+              << decoder_block35++ << ".block_35_output";
+          report(key.str(), value);
+        }
+      };
+
+  const torch::Tensor input = golden->get_tensor("input.imagenet_normalized")
+                                  .to(torch::Device("npu:0"));
+  MiniMaxH3VAEDiagonalGaussianDistribution posterior = vae->encode(input, hook);
+  report("encoder.final_moments", posterior.parameters());
+  report("posterior.mean", posterior.mean());
+  report("posterior.raw_logvar", posterior.raw_logvar());
+  report("posterior.logvar", posterior.logvar());
+  report("posterior.std", posterior.std());
+  const torch::Tensor epsilon =
+      golden->get_tensor("posterior.epsilon").to(input.device());
+  const torch::Tensor sample = posterior.sample(epsilon);
+  report("posterior.sample", sample);
+  const torch::Tensor rounded_fp16 = sample.to(torch::kFloat16);
+  const torch::Tensor rounded_fp32 = rounded_fp16.to(torch::kFloat32);
+  report("posterior.rounded_fp16", rounded_fp16);
+  report("posterior.rounded_fp32", rounded_fp32);
+  const torch::Tensor normalized =
+      MiniMaxH3VideoVAEImpl::normalize_latents(rounded_fp32);
+  report("posterior.normalized", normalized);
+
+  const torch::Tensor independent =
+      golden->get_tensor("decoder.independent_normalized_latent")
+          .to(input.device());
+  const torch::Tensor denormalized =
+      MiniMaxH3VideoVAEImpl::denormalize_latents(independent);
+  report("decoder.denormalized_latent", denormalized);
+  const torch::Tensor decoded = vae->decode(denormalized, hook);
+  report("decoder.raw", decoded);
+  const torch::Tensor postprocessed =
+      MiniMaxH3VideoVAEImpl::imagenet_postprocess(decoded);
+  report("decoder.postprocessed", postprocessed);
+
+  gate_pass = gate_pass && encoder_tile == 12 && decoder_tile == 8 &&
+              decoder_rope == 8 && decoder_block0 == 8 && decoder_block35 == 8;
+  ASSERT_TRUE(gate_pass);
+  std::cout << "H3_C6A_VIDEO_VAE=PASS" << std::endl;
+}
+
+TEST(MiniMaxH3C6aTargetTest, DecodesProductionGeometryWithRealWeights) {
+  const char* checkpoint_value = std::getenv("MINIMAX_H3_CHECKPOINT");
+  const char* smoke_value = std::getenv("MINIMAX_H3_VIDEO_VAE_TARGET_SMOKE");
+  if (checkpoint_value == nullptr || std::string(checkpoint_value).empty() ||
+      smoke_value == nullptr || std::string(smoke_value) != "1") {
+    GTEST_SKIP() << "Set checkpoint and MINIMAX_H3_VIDEO_VAE_TARGET_SMOKE=1";
+  }
+  auto loader = std::make_unique<DiTModelLoader>(checkpoint_value);
+  DiTModelContext context(ParallelArgs(0, 1, nullptr),
+                          loader->get_model_args(),
+                          loader->get_quant_args(),
+                          torch::TensorOptions()
+                              .device(torch::Device("npu:0"))
+                              .dtype(torch::kBFloat16),
+                          DiTCacheConfig(),
+                          loader->get_model_type());
+  MiniMaxH3Pipeline pipeline(context);
+  pipeline->load_model(std::move(loader));
+  pipeline->load_c6a_video_vae();
+  MiniMaxH3VideoVAE vae = pipeline->c6a_video_vae();
+
+  constexpr int64_t kElements = 24 * 37 * 48 * 84;
+  torch::Tensor normalized = torch::arange(kElements, torch::kFloat32)
+                                 .remainder(257)
+                                 .sub(128)
+                                 .div(128)
+                                 .view({1, 24, 37, 48, 84})
+                                 .to(torch::Device("npu:0"));
+  int64_t post_quant_calls = 0;
+  int64_t block0_calls = 0;
+  int64_t block35_calls = 0;
+  const MiniMaxH3VideoVAETraceHook hook =
+      [&](std::string_view name, int64_t index, const torch::Tensor&) {
+        if (name == "decoder.post_quant_conv") {
+          ++post_quant_calls;
+        } else if (name == "decoder.block" && index == 0) {
+          ++block0_calls;
+        } else if (name == "decoder.block" && index == 35) {
+          ++block35_calls;
+        }
+      };
+  const torch::Tensor decoded = vae->decode_normalized(normalized, hook);
+  EXPECT_EQ(decoded.sizes().vec(),
+            (std::vector<int64_t>{1, 3, 124, 768, 1344}));
+  EXPECT_EQ(decoded.scalar_type(), torch::kFloat32);
+  EXPECT_TRUE(torch::isfinite(decoded).all().item<bool>());
+  EXPECT_GE(decoded.min().item<float>(), 0.0F);
+  EXPECT_LE(decoded.max().item<float>(), 1.0F);
+  EXPECT_EQ(post_quant_calls, 196);
+  EXPECT_EQ(block0_calls, 196);
+  EXPECT_EQ(block35_calls, 196);
+  std::cout << "H3_C6A_TARGET_GEOMETRY=PASS" << std::endl;
 }
 
 TEST(MiniMaxH3PipelineTest, ForwardFailsInsteadOfReturningFakeMedia) {
