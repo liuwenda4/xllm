@@ -20,7 +20,10 @@ limitations under the License.
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <functional>
+#include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -1240,10 +1243,397 @@ TEST(MiniMaxH3PackingTest, RejectsBadConditionAbiAndSequenceLength) {
       "divisible by 64");
 }
 
+TEST(MiniMaxH3BlockHelpersTest, ReordersGroupedQKVToAllQAllKAllV) {
+  const torch::Tensor grouped =
+      torch::arange(12, torch::kBFloat16).view({12, 1});
+  const torch::Tensor reordered =
+      minimax_h3_reorder_grouped_qkv(grouped, /*num_heads=*/2, /*head_dim=*/2);
+  const torch::Tensor expected =
+      torch::tensor({0, 1, 6, 7, 2, 3, 8, 9, 4, 5, 10, 11}, torch::kBFloat16)
+          .view({12, 1});
+  EXPECT_TRUE(torch::equal(reordered, expected));
+  EXPECT_EQ(reordered.scalar_type(), grouped.scalar_type());
+}
+
+TEST(MiniMaxH3BlockHelpersTest, RMSNormAccumulatesInFP32AndReturnsBF16) {
+  const torch::Tensor input =
+      torch::tensor({{1.0, 2.0, 3.0, 4.0}}, torch::kBFloat16);
+  const torch::Tensor weight =
+      torch::tensor({1.0, 1.5, 0.5, 2.0}, torch::kBFloat16);
+  const torch::Tensor actual = minimax_h3_rms_norm(input, weight, 1e-5);
+  const torch::Tensor fp32 = input.to(torch::kFloat32);
+  const torch::Tensor expected =
+      (fp32 * torch::rsqrt(fp32.pow(2).mean(-1, true) + 1e-5) *
+       weight.to(torch::kFloat32))
+          .to(torch::kBFloat16);
+  EXPECT_EQ(actual.scalar_type(), torch::kBFloat16);
+  EXPECT_TRUE(torch::equal(actual, expected));
+}
+
+TEST(MiniMaxH3BlockHelpersTest, TimestepUsesHalfAsExactDenominator) {
+  const torch::Tensor timestep = torch::tensor({1.0}, torch::kFloat32);
+  const torch::Tensor actual =
+      minimax_h3_timestep_embedding(timestep, /*embedding_size=*/8);
+  const torch::Tensor frequency =
+      torch::exp(-std::log(10000.0) * torch::arange(4, torch::kFloat32) / 4.0);
+  const torch::Tensor expected =
+      torch::cat({torch::cos(frequency), torch::sin(frequency)}).view({1, 8});
+  EXPECT_TRUE(torch::allclose(actual, expected, 0.0, 0.0));
+}
+
+TEST(MiniMaxH3BlockHelpersTest, RopeRotatesFirst96AndPreservesFinal32) {
+  const torch::Tensor position_ids =
+      torch::tensor({{1.5707963267948966, 0.5, -0.25}}, torch::kFloat64);
+  const torch::Tensor inv_freq = torch::linspace(1.0, 0.1, 16);
+  const torch::Tensor frequencies =
+      minimax_h3_rope_frequencies(position_ids, inv_freq);
+  ASSERT_EQ(frequencies.sizes().vec(), (std::vector<int64_t>{1, 96}));
+  EXPECT_TRUE(
+      torch::equal(frequencies.slice(1, 0, 48), frequencies.slice(1, 48, 96)));
+
+  const torch::Tensor input = torch::arange(128, torch::kFloat32)
+                                  .to(torch::kBFloat16)
+                                  .view({1, 1, 128});
+  const torch::Tensor output = minimax_h3_apply_rope(input, frequencies);
+  EXPECT_FALSE(torch::equal(output.slice(2, 0, 96), input.slice(2, 0, 96)));
+  EXPECT_TRUE(torch::equal(output.slice(2, 96, 128), input.slice(2, 96, 128)));
+}
+
+TEST(MiniMaxH3BlockHelpersTest, AdaLNUsesTimestepMajorModalityRows) {
+  const torch::Tensor inverse = torch::tensor({0, 1, 0, 1}, torch::kInt64);
+  const torch::Tensor tags = torch::tensor({0, 1, 2, -1}, torch::kInt64);
+  const torch::Tensor combined =
+      minimax_h3_combined_adaln_indices(inverse, tags);
+  EXPECT_TRUE(
+      torch::equal(combined, torch::tensor({0, 4, 2, 3}, torch::kInt64)));
+
+  const torch::Tensor parameters =
+      torch::arange(2 * 3 * 6 * 2, torch::kFloat32).view({2, 3, 6, 2});
+  const torch::Tensor actual =
+      minimax_h3_select_adaln_parameter(parameters, 4, combined);
+  const torch::Tensor expected = torch::stack({parameters[0][0][4],
+                                               parameters[1][1][4],
+                                               parameters[0][2][4],
+                                               parameters[1][0][4]});
+  EXPECT_TRUE(torch::equal(actual, expected));
+}
+
+TEST(MiniMaxH3BlockHelpersTest, SegmentedSDPAIsolatesDocuments) {
+  torch::manual_seed(17);
+  const torch::Tensor query = torch::randn({6, 2, 4});
+  const torch::Tensor key = torch::randn({6, 2, 4});
+  const torch::Tensor value = torch::randn({6, 2, 4});
+  const torch::Tensor cu_seqlens = torch::tensor({0, 3, 6}, torch::kInt32);
+  const torch::Tensor baseline =
+      minimax_h3_segmented_sdpa(query, key, value, cu_seqlens);
+  const torch::Tensor changed = minimax_h3_segmented_sdpa(
+      torch::cat({query.slice(0, 0, 3), query.slice(0, 3, 6) + 1000}, 0),
+      torch::cat({key.slice(0, 0, 3), key.slice(0, 3, 6) - 1000}, 0),
+      torch::cat({value.slice(0, 0, 3), value.slice(0, 3, 6) + 1000}, 0),
+      cu_seqlens);
+  EXPECT_TRUE(torch::equal(baseline.slice(0, 0, 3), changed.slice(0, 0, 3)));
+}
+
+std::vector<std::unique_ptr<StateDict>> synthetic_c4_source(
+    const std::optional<std::string>& omitted = std::nullopt,
+    const std::optional<std::string>& unknown = std::nullopt) {
+  std::unordered_map<std::string, torch::Tensor> tensors;
+  const c10::Device meta_device(c10::DeviceType::Meta);
+  for (const MiniMaxH3C4SourceTensorSpec& spec :
+       MiniMaxH3C4SourceLayoutValidator::expected_source_tensors()) {
+    if (omitted == spec.name) {
+      continue;
+    }
+    tensors.emplace(
+        spec.name,
+        torch::empty(
+            spec.shape,
+            torch::TensorOptions().dtype(spec.dtype).device(meta_device)));
+  }
+  if (unknown.has_value()) {
+    tensors.emplace(*unknown,
+                    torch::empty({1},
+                                 torch::TensorOptions()
+                                     .dtype(torch::kBFloat16)
+                                     .device(meta_device)));
+  }
+  std::vector<std::unique_ptr<StateDict>> shards;
+  shards.emplace_back(std::make_unique<StateDict>(std::move(tensors)));
+  return shards;
+}
+
+TEST(MiniMaxH3C4SourceTest, RequiresExactSelectedTensorInventory) {
+  const auto specs =
+      MiniMaxH3C4SourceLayoutValidator::expected_source_tensors();
+  ASSERT_EQ(specs.size(), 45);
+  EXPECT_EQ(
+      MiniMaxH3C4SourceLayoutValidator::validate(synthetic_c4_source()).size(),
+      45);
+  expect_invalid_argument_contains(
+      [] {
+        MiniMaxH3C4SourceLayoutValidator::validate(
+            synthetic_c4_source("blocks.0.mlp.fc2.weight"));
+      },
+      "missing tensor `blocks.0.mlp.fc2.weight`");
+  expect_invalid_argument_contains(
+      [] {
+        MiniMaxH3C4SourceLayoutValidator::validate(
+            synthetic_c4_source(std::nullopt, "blocks.0.unknown.weight"));
+      },
+      "unknown selected tensor");
+
+  auto duplicate = synthetic_c4_source();
+  std::unordered_map<std::string, torch::Tensor> duplicate_tensor;
+  duplicate_tensor.emplace(
+      "rope.inv_freq",
+      torch::empty({16},
+                   torch::TensorOptions()
+                       .dtype(torch::kFloat32)
+                       .device(c10::Device(c10::DeviceType::Meta))));
+  duplicate.emplace_back(
+      std::make_unique<StateDict>(std::move(duplicate_tensor)));
+  expect_invalid_argument_contains(
+      [&duplicate] { MiniMaxH3C4SourceLayoutValidator::validate(duplicate); },
+      "loaded more than once");
+}
+
+TEST(MiniMaxH3C4SourceTest, RegisteredModuleTreePreservesMixedDtypes) {
+  const torch::TensorOptions options =
+      torch::TensorOptions().device(torch::kMeta).dtype(torch::kBFloat16);
+  MiniMaxH3C4Harness harness(options);
+  std::unordered_map<std::string, torch::ScalarType> expected;
+  for (const MiniMaxH3C4SourceTensorSpec& spec :
+       MiniMaxH3C4SourceLayoutValidator::expected_source_tensors()) {
+    expected.emplace(spec.name, spec.dtype);
+  }
+  const auto parameters = harness->named_parameters(/*recurse=*/true);
+  const auto buffers = harness->named_buffers(/*recurse=*/true);
+  ASSERT_EQ(parameters.size() + buffers.size(), 45);
+  for (const auto& parameter : parameters) {
+    ASSERT_TRUE(expected.contains(parameter.key())) << parameter.key();
+    EXPECT_EQ(parameter.value().scalar_type(), expected.at(parameter.key()));
+  }
+  for (const auto& buffer : buffers) {
+    ASSERT_TRUE(expected.contains(buffer.key())) << buffer.key();
+    EXPECT_EQ(buffer.value().scalar_type(), expected.at(buffer.key()));
+  }
+}
+
+struct H3ComparisonThreshold {
+  double relative_l2;
+  double minimum_cosine;
+};
+
+struct H3ComparisonMetrics {
+  double relative_l2;
+  double cosine;
+  double max_abs;
+};
+
+H3ComparisonMetrics h3_comparison_metrics(const torch::Tensor& actual,
+                                          const torch::Tensor& expected) {
+  const torch::Tensor actual_fp64 = actual.to(torch::kCPU).to(torch::kFloat64);
+  const torch::Tensor expected_fp64 =
+      expected.to(torch::kCPU).to(torch::kFloat64);
+  const torch::Tensor difference = actual_fp64 - expected_fp64;
+  const double expected_norm = expected_fp64.norm().item<double>();
+  const double denominator =
+      std::max(expected_norm, std::numeric_limits<double>::min());
+  const double actual_norm = actual_fp64.norm().item<double>();
+  double cosine = 1.0;
+  if (actual_norm > 0.0 && expected_norm > 0.0) {
+    cosine = (actual_fp64.flatten().dot(expected_fp64.flatten()) /
+              (actual_norm * expected_norm))
+                 .item<double>();
+  }
+  return {.relative_l2 = difference.norm().item<double>() / denominator,
+          .cosine = cosine,
+          .max_abs = difference.abs().max().item<double>()};
+}
+
+bool compare_h3_golden_node(const std::string& name,
+                            const torch::Tensor& actual,
+                            const StateDict& golden,
+                            const H3ComparisonThreshold& threshold) {
+  const torch::Tensor* expected = find_raw_tensor(golden, name);
+  if (expected == nullptr) {
+    ADD_FAILURE() << "Golden tensor is missing for node " << name;
+    return false;
+  }
+  if (!actual.defined() || actual.sizes() != expected->sizes() ||
+      actual.scalar_type() != expected->scalar_type()) {
+    ADD_FAILURE() << "Node metadata mismatch for " << name;
+    return false;
+  }
+  if (!torch::isfinite(actual).all().item<bool>() ||
+      !torch::isfinite(*expected).all().item<bool>()) {
+    ADD_FAILURE() << "NaN or Inf at node " << name;
+    return false;
+  }
+  const H3ComparisonMetrics metrics = h3_comparison_metrics(actual, *expected);
+  std::cout << "H3-C4 node=" << name << " relative_l2=" << metrics.relative_l2
+            << " cosine=" << metrics.cosine << " max_abs=" << metrics.max_abs
+            << std::endl;
+  if (metrics.relative_l2 > threshold.relative_l2 ||
+      metrics.cosine < threshold.minimum_cosine) {
+    ADD_FAILURE() << "First divergent H3-C4 node: " << name
+                  << " relative_l2=" << metrics.relative_l2 << " > "
+                  << threshold.relative_l2 << ", cosine=" << metrics.cosine
+                  << " < " << threshold.minimum_cosine
+                  << ", max_abs=" << metrics.max_abs;
+    return false;
+  }
+  return true;
+}
+
+TEST(MiniMaxH3BlockGoldenTest, MatchesOfficialUsedRowsAndIsolatesPadding) {
+  const char* golden_value = std::getenv("MINIMAX_H3_BLOCK_GOLDEN");
+  const char* checkpoint_value = std::getenv("MINIMAX_H3_CHECKPOINT");
+  if (golden_value == nullptr || std::string(golden_value).empty() ||
+      checkpoint_value == nullptr || std::string(checkpoint_value).empty()) {
+    GTEST_SKIP() << "Set MINIMAX_H3_BLOCK_GOLDEN and MINIMAX_H3_CHECKPOINT for "
+                    "the real NPU C4 gate";
+  }
+  std::filesystem::path golden_path(golden_value);
+  if (std::filesystem::is_directory(golden_path)) {
+    golden_path /= "minimax_h3_block_reference.safetensors";
+  }
+  const std::unique_ptr<StateDict> golden =
+      StateDictFromSafeTensor::load(golden_path.string());
+  ASSERT_NE(golden, nullptr);
+
+  auto loader = std::make_unique<DiTModelLoader>(checkpoint_value);
+  DiTModelContext context(ParallelArgs(0, 1, nullptr),
+                          loader->get_model_args(),
+                          loader->get_quant_args(),
+                          torch::TensorOptions()
+                              .device(torch::Device("npu:0"))
+                              .dtype(torch::kBFloat16),
+                          DiTCacheConfig(),
+                          loader->get_model_type());
+  MiniMaxH3Pipeline pipeline(context);
+  pipeline->load_model(std::move(loader));
+  pipeline->load_c4_probe();
+  pipeline->c4_harness()->verify_loaded_weights();
+
+  const H3PackedLayout layout = h3_layout({h3_image()});
+  const torch::Tensor video_rows = golden->get_tensor("input.video_rows");
+  const torch::Tensor audio_rows = golden->get_tensor("input.audio_rows");
+  const torch::Tensor timesteps = golden->get_tensor("input.timesteps");
+  const torch::Tensor inverse_indices =
+      golden->get_tensor("input.inverse_indices");
+  torch::NoGradGuard no_grad;
+  const MiniMaxH3C4Trace trace = pipeline->probe_c4(
+      layout, video_rows, audio_rows, timesteps, inverse_indices);
+  const int64_t used = layout.used_length;
+  const auto used_rows = [used](const torch::Tensor& tensor) {
+    return tensor.slice(0, 0, used);
+  };
+
+  const std::unordered_map<std::string, H3ComparisonThreshold> thresholds = {
+      {"condition_projection", {1e-6, 0.999999999}},
+      {"video_embedding", {1e-6, 0.999999999}},
+      {"audio_embedding", {1e-6, 0.999999999}},
+      {"time_embedding", {1e-6, 0.999999999}},
+      {"rope_frequencies", {1e-6, 0.999999999}},
+      {"token_refiner.block0.attention_delta", {0.002, 0.999999}},
+      {"token_refiner.block0.mlp_delta", {0.004, 0.99999}},
+      {"token_refiner.block0.output", {0.004, 0.99999}},
+      {"token_refiner.block1.attention_delta", {0.006, 0.99998}},
+      {"token_refiner.block1.mlp_delta", {0.006, 0.99998}},
+      {"token_refiner.block1.output", {0.004, 0.99999}},
+      {"refined_condition", {0.004, 0.99999}},
+      {"packed_hidden", {0.003, 0.999995}},
+      {"block0.attention_delta", {0.002, 0.999999}},
+      {"block0.mlp_delta", {0.003, 0.999995}},
+      {"block0.output", {0.003, 0.999995}},
+      {"final_activation", {0.003, 0.999995}},
+      {"all_video_logits", {0.002, 0.999999}},
+      {"all_audio_logits", {0.001, 0.999999}},
+      {"selected_video_logits", {0.003, 0.999995}},
+      {"selected_audio_logits", {0.001, 0.999999}},
+  };
+  const std::vector<std::pair<std::string, torch::Tensor>> projection_nodes = {
+      {"condition_projection", trace.condition_projection},
+      {"video_embedding", trace.video_embedding},
+      {"audio_embedding", trace.audio_embedding},
+      {"time_embedding", trace.time_embedding},
+      {"rope_frequencies", used_rows(trace.rope_frequencies)},
+  };
+  for (const auto& [name, actual] : projection_nodes) {
+    if (!compare_h3_golden_node(name, actual, *golden, thresholds.at(name))) {
+      return;
+    }
+  }
+  for (size_t index = 0; index < trace.token_refiner_blocks.size(); ++index) {
+    const MiniMaxH3ResidualBranchTrace& block =
+        trace.token_refiner_blocks[index];
+    const std::string prefix =
+        "token_refiner.block" + std::to_string(index) + ".";
+    for (const auto& [suffix, actual] :
+         std::vector<std::pair<std::string, torch::Tensor>>{
+             {"attention_delta", block.attention_delta},
+             {"mlp_delta", block.mlp_delta},
+             {"output", block.output}}) {
+      const std::string name = prefix + suffix;
+      if (!compare_h3_golden_node(name, actual, *golden, thresholds.at(name))) {
+        return;
+      }
+    }
+  }
+  if (!compare_h3_golden_node("refined_condition",
+                              trace.refined_condition,
+                              *golden,
+                              thresholds.at("refined_condition"))) {
+    return;
+  }
+  if (!compare_h3_golden_node("packed_hidden",
+                              used_rows(trace.packed_hidden),
+                              *golden,
+                              thresholds.at("packed_hidden"))) {
+    return;
+  }
+  for (const auto& [name, actual] :
+       std::vector<std::pair<std::string, torch::Tensor>>{
+           {"block0.attention_delta", used_rows(trace.block0.attention_delta)},
+           {"block0.mlp_delta", used_rows(trace.block0.mlp_delta)},
+           {"block0.output", used_rows(trace.block0.output)}}) {
+    if (!compare_h3_golden_node(name, actual, *golden, thresholds.at(name))) {
+      return;
+    }
+  }
+  for (const auto& [name, actual] :
+       std::vector<std::pair<std::string, torch::Tensor>>{
+           {"final_activation", used_rows(trace.final_output.activation)},
+           {"all_video_logits", used_rows(trace.final_output.all_video_logits)},
+           {"all_audio_logits", used_rows(trace.final_output.all_audio_logits)},
+           {"selected_video_logits", trace.final_output.selected_video_logits},
+           {"selected_audio_logits",
+            trace.final_output.selected_audio_logits}}) {
+    if (!compare_h3_golden_node(name, actual, *golden, thresholds.at(name))) {
+      return;
+    }
+  }
+
+  torch::Tensor changed_padding = trace.packed_hidden.clone();
+  changed_padding.slice(0, used, layout.aligned_length).fill_(17.0);
+  const MiniMaxH3ResidualBranchTrace changed =
+      pipeline->c4_harness()->block0()->forward(changed_padding,
+                                                trace.time_embedding,
+                                                trace.combined_indices,
+                                                trace.rope_frequencies,
+                                                layout.cu_seqlens);
+  ASSERT_TRUE(torch::isfinite(changed.output).all().item<bool>());
+  ASSERT_TRUE(
+      torch::equal(used_rows(trace.block0.output), used_rows(changed.output)))
+      << "Changing [used,aligned) padding affected a real packed row";
+  std::cout << "G5_SINGLE_DIT_BLOCK=PASS" << std::endl;
+}
+
 TEST(MiniMaxH3PipelineTest, ForwardFailsInsteadOfReturningFakeMedia) {
   try {
     MiniMaxH3PipelineImpl::throw_forward_unavailable();
-    FAIL() << "Expected H3-C2 forward failure";
+    FAIL() << "Expected H3-C4 forward failure";
   } catch (const std::logic_error& error) {
     EXPECT_NE(std::string(error.what()).find("has no denoiser"),
               std::string::npos);

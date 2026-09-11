@@ -368,8 +368,8 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
 
   [[noreturn]] static void throw_forward_unavailable() {
     throw std::logic_error(
-        "MiniMax-H3 H3-C2 pipeline skeleton has no denoiser; generation is "
-        "not implemented");
+        "MiniMax-H3 H3-C4 pipeline has a single-block probe but has no "
+        "denoiser for production; generation is not implemented");
   }
 
   static MiniMaxH3DryRunShapeTrace dry_run_shape_trace(
@@ -446,6 +446,33 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     return source_layout_summary_;
   }
 
+  void load_c4_probe() {
+    if (!loaded_) {
+      throw std::logic_error(
+          "MiniMax-H3 C4 probe requires retained transformer weights");
+    }
+    if (c4_harness_) {
+      throw std::logic_error("MiniMax-H3 C4 probe is already loaded");
+    }
+    c4_harness_ = register_module("c4_harness", MiniMaxH3C4Harness(options_));
+    c4_harness_->load_source_weights(
+        component_loaders_.at("transformer")->get_state_dicts());
+  }
+
+  MiniMaxH3C4Trace probe_c4(const H3PackedLayout& layout,
+                            const torch::Tensor& video_rows,
+                            const torch::Tensor& audio_rows,
+                            const torch::Tensor& timesteps,
+                            const torch::Tensor& inverse_indices) const {
+    if (!c4_harness_) {
+      throw std::logic_error("MiniMax-H3 C4 probe has not been loaded");
+    }
+    return c4_harness_->forward(
+        layout, video_rows, audio_rows, timesteps, inverse_indices);
+  }
+
+  MiniMaxH3C4Harness c4_harness() const { return c4_harness_; }
+
  private:
   static MiniMaxH3TransformerConfig validate_context(
       const DiTModelContext& context) {
@@ -486,6 +513,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
       component_loaders_;
   std::optional<MiniMaxH3ModelIndexSummary> model_index_summary_;
   std::optional<MiniMaxH3SourceLayoutSummary> source_layout_summary_;
+  MiniMaxH3C4Harness c4_harness_{nullptr};
   bool loaded_ = false;
 };
 TORCH_MODULE(MiniMaxH3Pipeline);

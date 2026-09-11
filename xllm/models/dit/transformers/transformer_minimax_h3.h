@@ -30,6 +30,7 @@ limitations under the License.
 #include "core/framework/model/model_args.h"
 #include "core/framework/state_dict/state_dict.h"
 #include "core/util/json_reader.h"
+#include "models/dit/transformers/minimax_h3_blocks.h"
 #include "models/model_registry.h"
 
 namespace xllm {
