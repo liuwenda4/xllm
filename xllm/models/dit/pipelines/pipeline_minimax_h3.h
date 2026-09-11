@@ -32,6 +32,7 @@ limitations under the License.
 #include "core/framework/dit_model_loader.h"
 #include "core/runtime/dit_forward_params.h"
 #include "core/util/json_reader.h"
+#include "models/dit/transformers/minimax_h3_denoiser.h"
 #include "models/dit/transformers/transformer_minimax_h3.h"
 #include "models/dit/utils/minimax_h3_packing.h"
 #include "models/model_registry.h"
@@ -368,8 +369,8 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
 
   [[noreturn]] static void throw_forward_unavailable() {
     throw std::logic_error(
-        "MiniMax-H3 H3-C4 pipeline has a single-block probe but has no "
-        "denoiser for production; generation is not implemented");
+        "MiniMax-H3 H3-C5 pipeline has a full streaming denoiser but no "
+        "VAE-backed production generation path");
   }
 
   static MiniMaxH3DryRunShapeTrace dry_run_shape_trace(
@@ -473,6 +474,82 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
 
   MiniMaxH3C4Harness c4_harness() const { return c4_harness_; }
 
+  void load_c5_denoiser() {
+    if (!loaded_) {
+      throw std::logic_error(
+          "MiniMax-H3 C5 denoiser requires retained transformer weights");
+    }
+    if (c5_denoiser_) {
+      throw std::logic_error("MiniMax-H3 C5 denoiser is already loaded");
+    }
+    MiniMaxH3StreamingDenoiser candidate(options_);
+    candidate->load_fixed_weights(
+        component_loaders_.at("transformer")->get_state_dicts());
+    c5_denoiser_ = register_module("c5_denoiser", candidate);
+  }
+
+  MiniMaxH3TrajectoryOutput probe_c5_trajectory(
+      const H3PackedLayout& layout,
+      const torch::Tensor& initial_video_rows,
+      const torch::Tensor& initial_audio_rows,
+      const MiniMaxH3LayerObserver& layer_observer = nullptr,
+      const MiniMaxH3StepObserver& step_observer = nullptr) {
+    if (!c5_denoiser_) {
+      throw std::logic_error("MiniMax-H3 C5 denoiser has not been loaded");
+    }
+    return c5_denoiser_->run_base_trajectory(
+        component_loaders_.at("transformer")->get_state_dicts(),
+        layout,
+        initial_video_rows,
+        initial_audio_rows,
+        layer_observer,
+        step_observer);
+  }
+
+  MiniMaxH3DenoiserOutput probe_c5_forward(
+      const H3PackedLayout& layout,
+      const torch::Tensor& video_rows,
+      const torch::Tensor& audio_rows,
+      const torch::Tensor& timesteps,
+      const torch::Tensor& inverse_indices,
+      int64_t step,
+      const MiniMaxH3LayerObserver& layer_observer = nullptr) {
+    if (!c5_denoiser_) {
+      throw std::logic_error("MiniMax-H3 C5 denoiser has not been loaded");
+    }
+    return c5_denoiser_->forward(
+        component_loaders_.at("transformer")->get_state_dicts(),
+        layout,
+        video_rows,
+        audio_rows,
+        timesteps,
+        inverse_indices,
+        step,
+        layer_observer);
+  }
+
+  MiniMaxH3ResidualBranchTrace probe_c5_streaming_block(
+      int64_t layer,
+      const torch::Tensor& hidden,
+      const torch::Tensor& time_embedding,
+      const torch::Tensor& combined_indices,
+      const torch::Tensor& rope_frequencies,
+      const torch::Tensor& cu_seqlens) {
+    if (!c5_denoiser_) {
+      throw std::logic_error("MiniMax-H3 C5 denoiser has not been loaded");
+    }
+    return c5_denoiser_->probe_streaming_block(
+        component_loaders_.at("transformer")->get_state_dicts(),
+        layer,
+        hidden,
+        time_embedding,
+        combined_indices,
+        rope_frequencies,
+        cu_seqlens);
+  }
+
+  MiniMaxH3StreamingDenoiser c5_denoiser() const { return c5_denoiser_; }
+
  private:
   static MiniMaxH3TransformerConfig validate_context(
       const DiTModelContext& context) {
@@ -514,6 +591,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
   std::optional<MiniMaxH3ModelIndexSummary> model_index_summary_;
   std::optional<MiniMaxH3SourceLayoutSummary> source_layout_summary_;
   MiniMaxH3C4Harness c4_harness_{nullptr};
+  MiniMaxH3StreamingDenoiser c5_denoiser_{nullptr};
   bool loaded_ = false;
 };
 TORCH_MODULE(MiniMaxH3Pipeline);

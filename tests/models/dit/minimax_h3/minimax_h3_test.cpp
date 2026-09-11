@@ -22,6 +22,7 @@ limitations under the License.
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -33,6 +34,7 @@ limitations under the License.
 
 #include "framework/state_dict/state_dict.h"
 #include "models/dit/pipelines/pipeline_minimax_h3.h"
+#include "models/dit/schedulers/minimax_h3_scheduler.h"
 
 namespace xllm {
 namespace {
@@ -1243,6 +1245,120 @@ TEST(MiniMaxH3PackingTest, RejectsBadConditionAbiAndSequenceLength) {
       "divisible by 64");
 }
 
+TEST(MiniMaxH3SchedulerTest, BuildsExactBaseDualSchedule) {
+  const MiniMaxH3DualSigmaSchedule schedule = MiniMaxH3Scheduler::build_base();
+  ASSERT_EQ(schedule.video.point_count(), 50);
+  ASSERT_EQ(schedule.video.forward_count(), 49);
+  ASSERT_EQ(schedule.audio.point_count(), 50);
+  ASSERT_EQ(schedule.audio.forward_count(), 49);
+  EXPECT_EQ(schedule.video.sigmas.scalar_type(), torch::kFloat32);
+  EXPECT_EQ(schedule.audio.sigmas.scalar_type(), torch::kFloat32);
+  EXPECT_EQ(schedule.video.sigmas[0].item<float>(), 1.0F);
+  EXPECT_EQ(schedule.video.sigmas[1].item<float>(), 0.998266875743866F);
+  EXPECT_EQ(schedule.video.sigmas[24].item<float>(), 0.9259259700775146F);
+  EXPECT_EQ(schedule.video.sigmas[48].item<float>(), 0.20000000298023224F);
+  EXPECT_EQ(schedule.video.sigmas[49].item<float>(), 0.0F);
+  EXPECT_EQ(schedule.audio.sigmas[1].item<float>(), 0.9931034445762634F);
+  EXPECT_EQ(schedule.audio.sigmas[24].item<float>(), 0.7575757503509521F);
+  EXPECT_EQ(schedule.audio.sigmas[48].item<float>(), 0.05882352963089943F);
+  EXPECT_EQ(schedule.audio.sigmas[49].item<float>(), 0.0F);
+  EXPECT_TRUE((schedule.video.sigmas.slice(0, 1) <
+               schedule.video.sigmas.slice(0, 0, -1))
+                  .all()
+                  .item<bool>());
+  EXPECT_TRUE(torch::equal(schedule.video.timesteps,
+                           1.0F - schedule.video.sigmas.slice(
+                                      0, 0, schedule.video.point_count() - 1)));
+}
+
+TEST(MiniMaxH3SchedulerTest, UsesDataWardVelocityAndEtaZeroBlend) {
+  const torch::Tensor state = torch::tensor({2.0F}, torch::kFloat32);
+  const torch::Tensor velocity = torch::tensor({3.0F}, torch::kFloat32);
+  const torch::Tensor timestep = torch::tensor(0.25F, torch::kFloat32);
+  const torch::Tensor denoised =
+      MiniMaxH3Scheduler::velocity_to_x0(state, velocity, timestep);
+  EXPECT_TRUE(torch::equal(denoised, torch::tensor({4.25F})));
+  const torch::Tensor next =
+      MiniMaxH3Scheduler::step_eta0(state, denoised, 0.75F, 0.25F);
+  EXPECT_TRUE(torch::allclose(next, torch::tensor({3.5F}), 0.0, 0.0));
+}
+
+TEST(MiniMaxH3SchedulerTest, RejectsMalformedInputs) {
+  expect_invalid_argument_contains([] { MiniMaxH3Scheduler::build(1, 12.0F); },
+                                   "at least two");
+  expect_invalid_argument_contains([] { MiniMaxH3Scheduler::build(50, 0.0F); },
+                                   "positive");
+  expect_invalid_argument_contains(
+      [] {
+        MiniMaxH3Scheduler::velocity_to_x0(
+            torch::ones({2}), torch::ones({3}), torch::tensor(0.0F));
+      },
+      "same-shape");
+  expect_invalid_argument_contains(
+      [] {
+        MiniMaxH3Scheduler::step_eta0(
+            torch::ones({1}), torch::ones({1}), 0.25F, 0.5F);
+      },
+      "must not exceed");
+}
+
+TEST(MiniMaxH3DenoiserTest, BuildsAnchorAwareRowTimestepPlan) {
+  const H3PackedLayout layout = h3_layout({h3_image(), h3_audio()}, {1, 0, 1});
+  const MiniMaxH3RowTimestepPlan plan =
+      minimax_h3_build_row_timestep_plan(layout, 0.25F, 0.5F);
+
+  EXPECT_EQ(layout.used_length, 27);
+  EXPECT_EQ(plan.row_timesteps.sizes().vec(), (std::vector<int64_t>{64}));
+  EXPECT_EQ(plan.row_timesteps.scalar_type(), torch::kFloat32);
+  EXPECT_TRUE(torch::equal(
+      plan.unique_timesteps,
+      torch::tensor({0.25F, 0.5F, 0.999F, 1.0F}, torch::kFloat32)));
+  EXPECT_TRUE(
+      torch::equal(plan.unique_timesteps.index_select(0, plan.inverse_indices),
+                   plan.row_timesteps));
+  EXPECT_TRUE(
+      plan.row_timesteps.index({layout.img_pos.index({~layout.update_mask})})
+          .eq(0.999F)
+          .all()
+          .item<bool>());
+  EXPECT_TRUE(plan.row_timesteps
+                  .index({layout.audio_pos.index({~layout.audio_update_mask})})
+                  .eq(1.0F)
+                  .all()
+                  .item<bool>());
+  EXPECT_TRUE(
+      plan.row_timesteps.slice(0, layout.used_length, layout.aligned_length)
+          .eq(0.25F)
+          .all()
+          .item<bool>());
+}
+
+TEST(MiniMaxH3DenoiserTest, RejectsOutOfRangeMediaPosition) {
+  H3PackedLayout layout = h3_layout({h3_image(), h3_audio()}, {1, 0, 1});
+  layout.img_pos = layout.img_pos.clone();
+  layout.img_pos[0] = layout.used_length;
+  expect_invalid_argument_contains(
+      [&layout] { minimax_h3_build_row_timestep_plan(layout, 0.25F, 0.5F); },
+      "outside used rows");
+}
+
+TEST(MiniMaxH3DenoiserTest, RegistersOneStreamingBlockAndFixedWeights) {
+  MiniMaxH3StreamingDenoiser denoiser(
+      torch::TensorOptions().device(torch::kMeta).dtype(torch::kBFloat16));
+  const auto parameters = denoiser->named_parameters(/*recurse=*/true);
+  const auto buffers = denoiser->named_buffers(/*recurse=*/true);
+  EXPECT_EQ(parameters.size() + buffers.size(), 45);
+  size_t block_tensors = 0;
+  for (const auto& parameter : parameters) {
+    if (parameter.key().starts_with("streaming_block.")) {
+      ++block_tensors;
+    }
+  }
+  EXPECT_EQ(block_tensors, MiniMaxH3StreamingDenoiserImpl::kBlockTensorCount);
+  EXPECT_EQ(denoiser->loaded_fixed_tensor_count(), 0);
+  EXPECT_EQ(denoiser->loaded_block_index(), -1);
+}
+
 TEST(MiniMaxH3BlockHelpersTest, ReordersGroupedQKVToAllQAllKAllV) {
   const torch::Tensor grouped =
       torch::arange(12, torch::kBFloat16).view({12, 1});
@@ -1253,6 +1369,15 @@ TEST(MiniMaxH3BlockHelpersTest, ReordersGroupedQKVToAllQAllKAllV) {
           .view({12, 1});
   EXPECT_TRUE(torch::equal(reordered, expected));
   EXPECT_EQ(reordered.scalar_type(), grouped.scalar_type());
+}
+
+TEST(MiniMaxH3BlockHelpersTest, ReordersGateUpRowsToOfficialUpGateLayout) {
+  const torch::Tensor gate_up =
+      torch::tensor({1, 2, 3, 4, 5, 6, 7, 8}, torch::kBFloat16).view({4, 2});
+  const torch::Tensor actual = minimax_h3_reorder_gate_up_to_up_gate(gate_up);
+  const torch::Tensor expected =
+      torch::tensor({5, 6, 7, 8, 1, 2, 3, 4}, torch::kBFloat16).view({4, 2});
+  EXPECT_TRUE(torch::equal(actual, expected));
 }
 
 TEST(MiniMaxH3BlockHelpersTest, RMSNormAccumulatesInFP32AndReturnsBF16) {
@@ -1630,12 +1755,234 @@ TEST(MiniMaxH3BlockGoldenTest, MatchesOfficialUsedRowsAndIsolatesPadding) {
   std::cout << "G5_SINGLE_DIT_BLOCK=PASS" << std::endl;
 }
 
+TEST(MiniMaxH3C5GoldenTest, MatchesOfficialFullBaseTrajectory) {
+  const char* golden_value = std::getenv("MINIMAX_H3_TRAJECTORY_GOLDEN");
+  const char* checkpoint_value = std::getenv("MINIMAX_H3_CHECKPOINT");
+  if (golden_value == nullptr || std::string(golden_value).empty() ||
+      checkpoint_value == nullptr || std::string(checkpoint_value).empty()) {
+    GTEST_SKIP() << "Set MINIMAX_H3_TRAJECTORY_GOLDEN and "
+                    "MINIMAX_H3_CHECKPOINT for the real NPU C5 Gate";
+  }
+  std::filesystem::path golden_path(golden_value);
+  if (std::filesystem::is_directory(golden_path)) {
+    golden_path /= "minimax_h3_trajectory_reference.safetensors";
+  }
+  const std::unique_ptr<StateDict> golden =
+      StateDictFromSafeTensor::load(golden_path.string());
+  ASSERT_NE(golden, nullptr);
+
+  const MiniMaxH3DualSigmaSchedule schedule = MiniMaxH3Scheduler::build_base();
+  ASSERT_TRUE(torch::equal(schedule.video.sigmas,
+                           golden->get_tensor("schedule.video_sigmas")));
+  ASSERT_TRUE(torch::equal(schedule.audio.sigmas,
+                           golden->get_tensor("schedule.audio_sigmas")));
+  ASSERT_TRUE(torch::equal(schedule.video.timesteps,
+                           golden->get_tensor("schedule.video_timesteps")));
+  ASSERT_TRUE(torch::equal(schedule.audio.timesteps,
+                           golden->get_tensor("schedule.audio_timesteps")));
+
+  auto loader = std::make_unique<DiTModelLoader>(checkpoint_value);
+  DiTModelContext context(ParallelArgs(0, 1, nullptr),
+                          loader->get_model_args(),
+                          loader->get_quant_args(),
+                          torch::TensorOptions()
+                              .device(torch::Device("npu:0"))
+                              .dtype(torch::kBFloat16),
+                          DiTCacheConfig(),
+                          loader->get_model_type());
+  MiniMaxH3Pipeline pipeline(context);
+  pipeline->load_model(std::move(loader));
+  pipeline->load_c5_denoiser();
+  ASSERT_EQ(pipeline->c5_denoiser()->loaded_fixed_tensor_count(), 35);
+
+  const H3PackedLayout layout = h3_layout({h3_image(), h3_audio()}, {1, 0, 1});
+  const torch::Tensor initial_video =
+      golden->get_tensor("input.initial_video_rows");
+  const torch::Tensor initial_audio =
+      golden->get_tensor("input.initial_audio_rows");
+  bool gate_pass = true;
+  const auto report = [&golden, &gate_pass](const std::string& name,
+                                            const torch::Tensor& actual) {
+    const torch::Tensor* expected = find_raw_tensor(*golden, name);
+    EXPECT_NE(expected, nullptr) << name;
+    if (expected == nullptr) {
+      gate_pass = false;
+      return;
+    }
+    EXPECT_EQ(actual.sizes(), expected->sizes()) << name;
+    EXPECT_EQ(actual.scalar_type(), expected->scalar_type()) << name;
+    EXPECT_TRUE(torch::isfinite(actual).all().item<bool>()) << name;
+    if (actual.sizes() != expected->sizes() ||
+        actual.scalar_type() != expected->scalar_type()) {
+      gate_pass = false;
+      return;
+    }
+    const torch::Tensor actual_cpu = actual.to(torch::kCPU);
+    const H3ComparisonMetrics metrics =
+        h3_comparison_metrics(actual_cpu, *expected);
+    std::cout << "H3-C5 node=" << name << " relative_l2=" << metrics.relative_l2
+              << " cosine=" << metrics.cosine << " max_abs=" << metrics.max_abs
+              << std::endl;
+    if (!torch::equal(actual_cpu, *expected)) {
+      ADD_FAILURE() << "H3-C5 node is not bit-exact: " << name;
+      gate_pass = false;
+    }
+  };
+  const MiniMaxH3LayerObserver layer_observer =
+      [&report](int64_t step,
+                int64_t layer,
+                const MiniMaxH3ResidualBranchTrace& trace) {
+        std::ostringstream name;
+        name << "step_" << std::setw(3) << std::setfill('0') << step
+             << ".block_" << std::setw(2) << layer << ".output";
+        report(name.str(), trace.output);
+        if (step == 0 && layer == 0) {
+          report("step_000.block_00.adaln", trace.adaln_parameters);
+          report("step_000.block_00.shift_msa_selected", trace.shift_msa);
+          report("step_000.block_00.scale_msa_selected", trace.scale_msa);
+          report("step_000.block_00.gate_msa_selected", trace.gate_msa);
+          report("step_000.block_00.shift_mlp_selected", trace.shift_mlp);
+          report("step_000.block_00.scale_mlp_selected", trace.scale_mlp);
+          report("step_000.block_00.gate_mlp_selected", trace.gate_mlp);
+          report("step_000.block_00.norm1_output", trace.norm1_output);
+          report("step_000.block_00.attention_input", trace.attention_input);
+          report("step_000.block_00.attention_output", trace.attention_output);
+          report("step_000.block_00.attention_delta", trace.attention_delta);
+          report("step_000.block_00.norm2_output", trace.norm2_output);
+          report("step_000.block_00.mlp_input", trace.mlp_input);
+          report("step_000.block_00.mlp_output", trace.mlp_output);
+          report("step_000.block_00.mlp_delta", trace.mlp_delta);
+        }
+      };
+  const MiniMaxH3StepObserver step_observer =
+      [&golden, &report, &gate_pass](const MiniMaxH3TrajectoryStep& trace) {
+        std::ostringstream prefix;
+        prefix << "step_" << std::setw(3) << std::setfill('0') << trace.step
+               << ".";
+        const std::string base = prefix.str();
+        const bool row_times_exact =
+            torch::equal(trace.timestep_plan.row_timesteps,
+                         golden->get_tensor(base + "row_timesteps"));
+        const bool unique_times_exact =
+            torch::equal(trace.timestep_plan.unique_timesteps,
+                         golden->get_tensor(base + "unique_timesteps"));
+        const bool inverse_exact =
+            torch::equal(trace.timestep_plan.inverse_indices,
+                         golden->get_tensor(base + "inverse_indices"));
+        EXPECT_TRUE(row_times_exact);
+        EXPECT_TRUE(unique_times_exact);
+        EXPECT_TRUE(inverse_exact);
+        gate_pass =
+            gate_pass && row_times_exact && unique_times_exact && inverse_exact;
+        report(base + "video_velocity", trace.denoiser.video_velocity);
+        report(base + "audio_velocity", trace.denoiser.audio_velocity);
+        report(base + "video_x0", trace.video_x0);
+        report(base + "audio_x0", trace.audio_x0);
+        report(base + "video_rows_after", trace.video_rows_after);
+        report(base + "audio_rows_after", trace.audio_rows_after);
+        if (trace.step == 0) {
+          report("step_000.packed_hidden", trace.denoiser.packed_hidden);
+          report("step_000.condition_projection",
+                 trace.denoiser.condition_projection);
+          report("step_000.refined_condition",
+                 trace.denoiser.refined_condition);
+          report("step_000.video_embedding", trace.denoiser.video_embedding);
+          report("step_000.audio_embedding", trace.denoiser.audio_embedding);
+          report("step_000.time_embedding", trace.denoiser.time_embedding);
+          report("step_000.rope_frequencies", trace.denoiser.rope_frequencies);
+          const bool combined_exact =
+              torch::equal(trace.denoiser.combined_indices.to(torch::kCPU),
+                           golden->get_tensor("step_000.combined_indices"));
+          EXPECT_TRUE(combined_exact);
+          gate_pass = gate_pass && combined_exact;
+          report("step_000.final_activation", trace.denoiser.final_activation);
+        }
+      };
+
+  const MiniMaxH3TrajectoryOutput output = pipeline->probe_c5_trajectory(
+      layout, initial_video, initial_audio, layer_observer, step_observer);
+  ASSERT_EQ(output.transformer_forwards, 49);
+  ASSERT_EQ(output.block_forwards, 2450);
+  ASSERT_EQ(pipeline->c5_denoiser()->loaded_block_index(), 49);
+  report("step_048.video_rows_after", output.video_rows);
+  report("step_048.audio_rows_after", output.audio_rows);
+  ASSERT_TRUE(gate_pass);
+  std::cout << "G6_FULL_DENOISE=PASS" << std::endl;
+}
+
+TEST(MiniMaxH3C5DiagnosticTest, StreamingBlockMatchesC4ResidentBlock) {
+  const char* golden_value = std::getenv("MINIMAX_H3_TRAJECTORY_GOLDEN");
+  const char* checkpoint_value = std::getenv("MINIMAX_H3_CHECKPOINT");
+  if (golden_value == nullptr || std::string(golden_value).empty() ||
+      checkpoint_value == nullptr || std::string(checkpoint_value).empty()) {
+    GTEST_SKIP() << "Set C5 Golden and checkpoint paths for block loader A/B";
+  }
+  std::filesystem::path golden_path(golden_value);
+  if (std::filesystem::is_directory(golden_path)) {
+    golden_path /= "minimax_h3_trajectory_reference.safetensors";
+  }
+  const std::unique_ptr<StateDict> golden =
+      StateDictFromSafeTensor::load(golden_path.string());
+  ASSERT_NE(golden, nullptr);
+  auto loader = std::make_unique<DiTModelLoader>(checkpoint_value);
+  DiTModelContext context(ParallelArgs(0, 1, nullptr),
+                          loader->get_model_args(),
+                          loader->get_quant_args(),
+                          torch::TensorOptions()
+                              .device(torch::Device("npu:0"))
+                              .dtype(torch::kBFloat16),
+                          DiTCacheConfig(),
+                          loader->get_model_type());
+  MiniMaxH3Pipeline pipeline(context);
+  pipeline->load_model(std::move(loader));
+  pipeline->load_c4_probe();
+  pipeline->load_c5_denoiser();
+
+  const H3PackedLayout layout = h3_layout({h3_image(), h3_audio()}, {1, 0, 1});
+  const torch::Tensor video = golden->get_tensor("input.initial_video_rows");
+  const torch::Tensor audio = golden->get_tensor("input.initial_audio_rows");
+  const torch::Tensor timesteps =
+      golden->get_tensor("step_000.unique_timesteps");
+  const torch::Tensor inverse = golden->get_tensor("step_000.inverse_indices");
+  const MiniMaxH3C4Trace preparation =
+      pipeline->probe_c4(layout, video, audio, timesteps, inverse);
+  torch::Tensor hidden = torch::zeros(
+      {layout.aligned_length, MiniMaxH3TransformerConfig::kHiddenSize},
+      preparation.packed_hidden.options());
+  hidden.slice(0, 0, layout.used_length)
+      .copy_(golden->get_tensor("step_000.packed_hidden").to(hidden.device()));
+  const MiniMaxH3ResidualBranchTrace resident =
+      pipeline->c4_harness()->block0()->forward(hidden,
+                                                preparation.time_embedding,
+                                                preparation.combined_indices,
+                                                preparation.rope_frequencies,
+                                                layout.cu_seqlens);
+  const MiniMaxH3ResidualBranchTrace streaming =
+      pipeline->probe_c5_streaming_block(0,
+                                         hidden,
+                                         preparation.time_embedding,
+                                         preparation.combined_indices,
+                                         preparation.rope_frequencies,
+                                         layout.cu_seqlens);
+  EXPECT_TRUE(
+      torch::equal(resident.attention_input, streaming.attention_input));
+  EXPECT_TRUE(
+      torch::equal(resident.attention_output, streaming.attention_output));
+  EXPECT_TRUE(
+      torch::equal(resident.attention_delta, streaming.attention_delta));
+  EXPECT_TRUE(torch::equal(resident.mlp_input, streaming.mlp_input));
+  EXPECT_TRUE(torch::equal(resident.mlp_output, streaming.mlp_output));
+  EXPECT_TRUE(torch::equal(resident.mlp_delta, streaming.mlp_delta));
+  EXPECT_TRUE(torch::equal(resident.output, streaming.output));
+  std::cout << "H3_C5_STREAMING_BLOCK_LOAD_AB=PASS" << std::endl;
+}
+
 TEST(MiniMaxH3PipelineTest, ForwardFailsInsteadOfReturningFakeMedia) {
   try {
     MiniMaxH3PipelineImpl::throw_forward_unavailable();
-    FAIL() << "Expected H3-C4 forward failure";
+    FAIL() << "Expected H3-C5 forward failure";
   } catch (const std::logic_error& error) {
-    EXPECT_NE(std::string(error.what()).find("has no denoiser"),
+    EXPECT_NE(std::string(error.what()).find("no VAE-backed"),
               std::string::npos);
   }
 }

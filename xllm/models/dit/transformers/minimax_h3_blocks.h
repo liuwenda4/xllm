@@ -59,7 +59,20 @@ struct MiniMaxH3C4SourceTensorSpec {
 };
 
 struct MiniMaxH3ResidualBranchTrace {
+  torch::Tensor adaln_parameters;
+  torch::Tensor shift_msa;
+  torch::Tensor scale_msa;
+  torch::Tensor gate_msa;
+  torch::Tensor shift_mlp;
+  torch::Tensor scale_mlp;
+  torch::Tensor gate_mlp;
+  torch::Tensor norm1_output;
+  torch::Tensor attention_input;
+  torch::Tensor attention_output;
   torch::Tensor attention_delta;
+  torch::Tensor norm2_output;
+  torch::Tensor mlp_input;
+  torch::Tensor mlp_output;
   torch::Tensor mlp_delta;
   torch::Tensor output;
 };
@@ -68,6 +81,8 @@ struct MiniMaxH3FinalOutput {
   torch::Tensor activation;
   torch::Tensor all_video_logits;
   torch::Tensor all_audio_logits;
+  torch::Tensor raw_selected_video_logits;
+  torch::Tensor raw_selected_audio_logits;
   torch::Tensor selected_video_logits;
   torch::Tensor selected_audio_logits;
 };
@@ -107,6 +122,16 @@ inline torch::Tensor minimax_h3_reorder_grouped_qkv(const torch::Tensor& weight,
   torch::Tensor value =
       grouped.narrow(1, 2 * head_dim, head_dim).reshape(output_shape);
   return torch::cat({query, key, value}, 0).contiguous();
+}
+
+inline torch::Tensor minimax_h3_reorder_gate_up_to_up_gate(
+    const torch::Tensor& weight) {
+  if (!weight.defined() || weight.dim() < 1 || weight.size(0) % 2 != 0) {
+    throw std::invalid_argument(
+        "MiniMax-H3 gate/up weight has incompatible shape");
+  }
+  const std::vector<torch::Tensor> gate_up = weight.chunk(2, 0);
+  return torch::cat({gate_up[1], gate_up[0]}, 0).contiguous();
 }
 
 inline torch::Tensor minimax_h3_rms_norm(const torch::Tensor& input,
@@ -209,8 +234,8 @@ inline torch::Tensor minimax_h3_select_adaln_parameter(
     throw std::invalid_argument(
         "MiniMax-H3 AdaLN parameter selection mismatch");
   }
-  return parameters.select(2, logical_parameter)
-      .reshape({parameters.size(0) * 3, parameters.size(3)})
+  return parameters.flatten(0, 1)
+      .select(1, logical_parameter)
       .index_select(0, combined_indices);
 }
 
@@ -365,8 +390,13 @@ class MiniMaxH3AttentionImpl final : public torch::nn::Module {
     }
     const int64_t row_count = input.size(0);
     const int64_t inner_size = num_heads_ * head_dim_;
-    std::vector<torch::Tensor> qkv = qkv_proj_->forward(input).split(
-        {inner_size, inner_size, inner_size}, -1);
+    const std::vector<torch::Tensor> qkv_weights =
+        qkv_proj_->weight().split({inner_size, inner_size, inner_size}, 0);
+    std::vector<torch::Tensor> qkv;
+    qkv.reserve(3);
+    for (const torch::Tensor& weight : qkv_weights) {
+      qkv.emplace_back(torch::nn::functional::linear(input, weight));
+    }
     torch::Tensor query =
         q_norm_->forward(qkv[0].view({row_count, num_heads_, head_dim_}));
     torch::Tensor key =
@@ -409,8 +439,8 @@ class MiniMaxH3MLPImpl final : public torch::nn::Module {
   }
 
   torch::Tensor forward(const torch::Tensor& input) const {
-    std::vector<torch::Tensor> gate_up = fc1_->forward(input).chunk(2, -1);
-    return fc2_->forward(torch::silu(gate_up[0]) * gate_up[1]);
+    std::vector<torch::Tensor> up_gate = fc1_->forward(input).chunk(2, -1);
+    return fc2_->forward(up_gate[0] * torch::silu(up_gate[1]));
   }
 
  private:
@@ -573,17 +603,25 @@ class MiniMaxH3DiTBlockImpl final : public torch::nn::Module {
     torch::Tensor gate_mlp =
         minimax_h3_select_adaln_parameter(parameters, 5, combined_indices);
 
-    torch::Tensor attention_input =
-        norm1_->forward(input) * (scale_msa + 1.0) + shift_msa;
-    torch::Tensor attention_output =
-        attn_->forward(attention_input, rope_frequencies, cu_seqlens);
     MiniMaxH3ResidualBranchTrace trace;
-    trace.attention_delta = gate_msa * attention_output;
+    trace.adaln_parameters = parameters;
+    trace.shift_msa = shift_msa;
+    trace.scale_msa = scale_msa;
+    trace.gate_msa = gate_msa;
+    trace.shift_mlp = shift_mlp;
+    trace.scale_mlp = scale_mlp;
+    trace.gate_mlp = gate_mlp;
+    trace.norm1_output = norm1_->forward(input);
+    trace.attention_input = trace.norm1_output * (scale_msa + 1.0) + shift_msa;
+    trace.attention_output =
+        attn_->forward(trace.attention_input, rope_frequencies, cu_seqlens);
+    trace.attention_delta = gate_msa * trace.attention_output;
     torch::Tensor after_attention = input + trace.attention_delta;
 
-    torch::Tensor mlp_input =
-        norm2_->forward(after_attention) * (scale_mlp + 1.0) + shift_mlp;
-    trace.mlp_delta = gate_mlp * mlp_->forward(mlp_input);
+    trace.norm2_output = norm2_->forward(after_attention);
+    trace.mlp_input = trace.norm2_output * (scale_mlp + 1.0) + shift_mlp;
+    trace.mlp_output = mlp_->forward(trace.mlp_input);
+    trace.mlp_delta = gate_mlp * trace.mlp_output;
     trace.output = after_attention + trace.mlp_delta;
     return trace;
   }
@@ -682,17 +720,19 @@ class MiniMaxH3FinalLayerImpl final : public torch::nn::Module {
 
     torch::Tensor image_positions = layout.img_pos.to(input.device());
     torch::Tensor audio_positions = layout.audio_pos.to(input.device());
-    output.selected_video_logits =
+    output.raw_selected_video_logits =
         output.all_video_logits.index_select(0, image_positions);
-    output.selected_audio_logits =
+    output.raw_selected_audio_logits =
         output.all_audio_logits.index_select(0, audio_positions);
     torch::Tensor video_mask =
         layout.update_mask.to(input.device()).to(torch::kFloat32).unsqueeze(-1);
     torch::Tensor audio_mask = layout.audio_update_mask.to(input.device())
                                    .to(torch::kFloat32)
                                    .unsqueeze(-1);
-    output.selected_video_logits = output.selected_video_logits * video_mask;
-    output.selected_audio_logits = output.selected_audio_logits * audio_mask;
+    output.selected_video_logits =
+        output.raw_selected_video_logits * video_mask;
+    output.selected_audio_logits =
+        output.raw_selected_audio_logits * audio_mask;
     return output;
   }
 
@@ -976,6 +1016,8 @@ class MiniMaxH3C4HarnessImpl final : public torch::nn::Module {
       if (spec.name.ends_with(".attn.qkv_proj.weight")) {
         value = minimax_h3_reorder_grouped_qkv(
             value, config_.num_attention_heads, config_.attention_head_dim);
+      } else if (spec.name.ends_with(".mlp.fc1.weight")) {
+        value = minimax_h3_reorder_gate_up_to_up_gate(value);
       }
       target.copy_(value.to(target.device()));
       loaded_source_names_.emplace(spec.name);
