@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include <gtest/gtest.h>
+#include <torch/fft.h>
 
 #include <algorithm>
 #include <array>
@@ -1434,6 +1435,108 @@ TEST(MiniMaxH3VideoVAEHelpersTest, PosteriorClampAndNormalizeRoundTrip) {
   EXPECT_TRUE(torch::allclose(restored, sample, 1e-5, 1e-5));
 }
 
+TEST(MiniMaxH3AudioVAEHelpersTest, DeclaresExactSourceAndNativeInventories) {
+  const auto specs =
+      MiniMaxH3AudioVAESourceLayoutValidator::expected_source_tensors();
+  ASSERT_EQ(specs.size(), 1087);
+  MiniMaxH3AudioVAE vae(
+      torch::TensorOptions().device(torch::kMeta).dtype(torch::kBFloat16));
+  const auto parameters = vae->named_parameters(/*recurse=*/true);
+  const auto buffers = vae->named_buffers(/*recurse=*/true);
+  EXPECT_EQ(parameters.size() + buffers.size(), 915);
+  EXPECT_EQ(parameters.size(), 660);
+  EXPECT_EQ(buffers.size(), 255);
+  for (const auto& parameter : parameters) {
+    EXPECT_EQ(parameter.value().scalar_type(), torch::kFloat32)
+        << parameter.key();
+    EXPECT_FALSE(parameter.key().ends_with(".weight_g"));
+    EXPECT_FALSE(parameter.key().ends_with(".weight_v"));
+  }
+  size_t filters = 0;
+  for (const auto& buffer : buffers) {
+    EXPECT_EQ(buffer.value().scalar_type(), torch::kFloat32) << buffer.key();
+    filters += buffer.key().ends_with(".filter") ? 1 : 0;
+  }
+  EXPECT_EQ(filters, 254);
+}
+
+TEST(MiniMaxH3AudioVAEHelpersTest, FoldsWeightNormAlongOutputDimension) {
+  const torch::Tensor weight_v =
+      torch::tensor({{{3.0F, 4.0F}}, {{0.0F, 5.0F}}});
+  const torch::Tensor weight_g = torch::tensor({2.0F, 3.0F}).view({2, 1, 1});
+  const torch::Tensor folded =
+      MiniMaxH3AudioVAEImpl::fold_weight_norm_dim0(weight_g, weight_v);
+  const torch::Tensor expected =
+      weight_v / weight_v.square().sum({1, 2}, true).sqrt() * weight_g;
+  EXPECT_TRUE(torch::equal(folded, expected));
+}
+
+TEST(MiniMaxH3AudioVAEHelpersTest, SnakeVariantsUseCheckpointEquations) {
+  torch::NoGradGuard no_grad;
+  const torch::Tensor input =
+      torch::tensor({{{-1.0F, 0.25F, 2.0F}}}, torch::kFloat32);
+  MiniMaxH3AudioSnake1d snake(
+      /*channels=*/1, torch::TensorOptions().dtype(torch::kFloat32));
+  snake->named_parameters()["alpha"].fill_(2.0F);
+  const torch::Tensor expected_snake =
+      input + torch::sin(2.0F * input).square() / (2.0F + 1e-9F);
+  EXPECT_TRUE(torch::equal(snake->forward(input), expected_snake));
+
+  MiniMaxH3AudioSnakeBeta snake_beta(
+      /*channels=*/1, torch::TensorOptions().dtype(torch::kFloat32));
+  snake_beta->named_parameters()["alpha"].fill_(std::log(2.0F));
+  snake_beta->named_parameters()["beta"].fill_(std::log(3.0F));
+  const torch::Tensor expected_beta =
+      input + torch::sin(2.0F * input).square() / (3.0F + 1e-9F);
+  EXPECT_TRUE(torch::equal(snake_beta->forward(input), expected_beta));
+}
+
+TEST(MiniMaxH3AudioVAEHelpersTest, PosteriorUsesLogStandardDeviationAndMode) {
+  const torch::Tensor mean =
+      torch::arange(64, torch::kFloat32).view({2, 32, 1}) / 16.0F;
+  const torch::Tensor logs = torch::full_like(mean, std::log(4.0F));
+  const torch::Tensor epsilon = torch::full_like(mean, 0.25F);
+  MiniMaxH3AudioDiagonalGaussianDistribution posterior(mean, logs);
+  EXPECT_TRUE(torch::equal(posterior.mode(), mean));
+  EXPECT_TRUE(torch::allclose(posterior.std(), torch::full_like(mean, 4.0F)));
+  EXPECT_TRUE(torch::allclose(posterior.sample(epsilon), mean + 1.0F));
+
+  const torch::Tensor normalized =
+      MiniMaxH3AudioVAEImpl::normalize_latents(mean);
+  const torch::Tensor restored =
+      MiniMaxH3AudioVAEImpl::denormalize_latents(normalized);
+  EXPECT_TRUE(torch::allclose(restored, mean, 1e-6, 1e-6));
+}
+
+TEST(MiniMaxH3AudioVAEHelpersTest, RejectsInvalidWeightsPosteriorAndStereoAbi) {
+  expect_invalid_argument_contains(
+      [] {
+        MiniMaxH3AudioVAEImpl::fold_weight_norm_dim0(torch::ones({1, 1, 1}),
+                                                     torch::zeros({2, 1, 3}));
+      },
+      "weight_g/weight_v");
+  expect_invalid_argument_contains(
+      [] {
+        MiniMaxH3AudioVAEImpl::fold_weight_norm_dim0(torch::ones({2, 1, 1}),
+                                                     torch::zeros({2, 1, 3}));
+      },
+      "invalid dimension-0 norm");
+  expect_invalid_argument_contains(
+      [] {
+        MiniMaxH3AudioDiagonalGaussianDistribution(torch::zeros({2, 32, 4}),
+                                                   torch::zeros({2, 31, 4}));
+      },
+      "matching FP32");
+  MiniMaxH3AudioVAE vae(
+      torch::TensorOptions().device(torch::kMeta).dtype(torch::kFloat32));
+  expect_invalid_argument_contains(
+      [&vae] { vae->encode_condition(torch::zeros({1, 1, 800})); },
+      "stereo-as-batch");
+  expect_invalid_argument_contains(
+      [&vae] { vae->decode_normalized(torch::zeros({1, 32, 8})); },
+      "stereo-as-batch");
+}
+
 TEST(MiniMaxH3BlockHelpersTest, ReordersGroupedQKVToAllQAllKAllV) {
   const torch::Tensor grouped =
       torch::arange(12, torch::kBFloat16).view({12, 1});
@@ -1649,6 +1752,59 @@ H3ComparisonMetrics h3_comparison_metrics(const torch::Tensor& actual,
   return {.relative_l2 = difference.norm().item<double>() / denominator,
           .cosine = cosine,
           .max_abs = difference.abs().max().item<double>()};
+}
+
+void validate_h3_audio_golden_manifest(
+    const std::filesystem::path& golden_path) {
+  const std::filesystem::path manifest_path =
+      golden_path.parent_path() / "minimax_h3_audio_vae_reference.json";
+  JsonReader reader;
+  if (!reader.parse(manifest_path.string())) {
+    throw std::invalid_argument(
+        "MiniMax-H3 C6b cannot parse the Golden manifest");
+  }
+  const nlohmann::json& manifest = reader.data();
+  const auto fail = [](const std::string& field) {
+    throw std::invalid_argument(
+        "MiniMax-H3 C6b Golden manifest failed attestation at `" + field + "`");
+  };
+  if (manifest.value("schema", "") !=
+      "xllm.minimax_h3.audio_vae_reference/v1") {
+    fail("schema");
+  }
+  if (manifest.value("status", "") != "OFFICIAL_H3_C6B_AUDIO_VAE_GOLDEN") {
+    fail("status");
+  }
+  if (manifest.at("source").value("revision", "") !=
+      "d30c748f5f5d0925a5af14dc0e6a6de983025e63") {
+    fail("source.revision");
+  }
+  if (manifest.at("checkpoint").value("tensor_count", 0) != 1087 ||
+      manifest.at("checkpoint").value("tensor_dtype", "") != "float32") {
+    fail("checkpoint");
+  }
+  const std::string diffusers_path =
+      manifest.at("runtime").value("diffusers_path", "");
+  if (!diffusers_path.starts_with(
+          "/data/workspace/lwd/minimax/diffusers-reference/src/")) {
+    fail("runtime.diffusers_path");
+  }
+  if (manifest.at("runtime").value("attention_backend", "") != "_native_math") {
+    fail("runtime.attention_backend");
+  }
+  if (manifest.at("production_smoke").value("status", "") != "PASS" ||
+      manifest.at("production_smoke").at("pipeline_stereo").at("shape") !=
+          nlohmann::json({1, 2, 165600})) {
+    fail("production_smoke");
+  }
+  const std::string artifact_digest =
+      manifest.at("artifact").value("sha256", "");
+  if (manifest.at("artifact").value("path", "") !=
+          golden_path.filename().string() ||
+      artifact_digest !=
+          "08359fff731dc76ff821fe819458db3ecb41a40012d05a6d22397f3b8003ac45") {
+    fail("artifact");
+  }
 }
 
 bool compare_h3_golden_node(const std::string& name,
@@ -2269,12 +2425,314 @@ TEST(MiniMaxH3C6aTargetTest, DecodesProductionGeometryWithRealWeights) {
   std::cout << "H3_C6A_TARGET_GEOMETRY=PASS" << std::endl;
 }
 
+TEST(MiniMaxH3C6bGoldenTest, MatchesOfficialAudioVAEFixture) {
+  const char* golden_value = std::getenv("MINIMAX_H3_AUDIO_VAE_GOLDEN");
+  const char* checkpoint_value = std::getenv("MINIMAX_H3_CHECKPOINT");
+  if (golden_value == nullptr || std::string(golden_value).empty() ||
+      checkpoint_value == nullptr || std::string(checkpoint_value).empty()) {
+    GTEST_SKIP() << "Set MINIMAX_H3_AUDIO_VAE_GOLDEN and "
+                    "MINIMAX_H3_CHECKPOINT for the real NPU C6b Gate";
+  }
+  std::filesystem::path golden_path(golden_value);
+  if (std::filesystem::is_directory(golden_path)) {
+    golden_path /= "minimax_h3_audio_vae_reference.safetensors";
+  }
+  validate_h3_audio_golden_manifest(golden_path);
+  const std::unique_ptr<StateDict> golden =
+      StateDictFromSafeTensor::load(golden_path.string());
+  ASSERT_NE(golden, nullptr);
+
+  auto loader = std::make_unique<DiTModelLoader>(checkpoint_value);
+  DiTModelContext context(ParallelArgs(0, 1, nullptr),
+                          loader->get_model_args(),
+                          loader->get_quant_args(),
+                          torch::TensorOptions()
+                              .device(torch::Device("npu:0"))
+                              .dtype(torch::kBFloat16),
+                          DiTCacheConfig(),
+                          loader->get_model_type());
+  MiniMaxH3Pipeline pipeline(context);
+  pipeline->load_model(std::move(loader));
+  pipeline->load_c6b_audio_vae();
+  MiniMaxH3AudioVAE vae = pipeline->c6b_audio_vae();
+  ASSERT_TRUE(vae->is_loaded());
+
+  bool gate_pass = true;
+  const auto report = [&golden, &gate_pass](const std::string& name,
+                                            const torch::Tensor& actual) {
+    const torch::Tensor* expected = find_raw_tensor(*golden, name);
+    EXPECT_NE(expected, nullptr) << name;
+    if (expected == nullptr) {
+      gate_pass = false;
+      return;
+    }
+    EXPECT_EQ(actual.sizes(), expected->sizes()) << name;
+    EXPECT_EQ(actual.scalar_type(), expected->scalar_type()) << name;
+    EXPECT_TRUE(torch::isfinite(actual).all().item<bool>()) << name;
+    if (actual.sizes() != expected->sizes() ||
+        actual.scalar_type() != expected->scalar_type()) {
+      gate_pass = false;
+      return;
+    }
+    const H3ComparisonMetrics metrics =
+        h3_comparison_metrics(actual, *expected);
+    std::cout << "H3-C6b node=" << name
+              << " relative_l2=" << metrics.relative_l2
+              << " cosine=" << metrics.cosine << " max_abs=" << metrics.max_abs
+              << std::endl;
+    static const std::unordered_set<std::string> kExactNodes = {
+        "encoder.input_padded",
+        "encoder.block_00",
+        "decoder.denormalized_latent",
+        "decoder.dec_in",
+        "decoder.conv_pre",
+        "decoder.stage_0.upsample",
+    };
+    H3ComparisonThreshold threshold{0.0002, 0.999999};
+    if (name == "posterior.std") {
+      threshold = {0.0003, 0.999999};
+    } else if (name.starts_with("decoder.stage_") ||
+               name == "decoder.final_pre_clamp" ||
+               name == "decoder.final_clamped" || name == "pipeline.stereo") {
+      threshold = {0.0008, 0.999999};
+    }
+    bool passed = kExactNodes.contains(name)
+                      ? torch::equal(actual.to(torch::kCPU), *expected)
+                      : metrics.relative_l2 <= threshold.relative_l2 &&
+                            metrics.cosine >= threshold.minimum_cosine;
+    if (name == "decoder.final_pre_clamp" || name == "decoder.final_clamped" ||
+        name == "pipeline.stereo") {
+      passed = passed && metrics.max_abs <= 0.0015;
+    }
+    if (!passed) {
+      ADD_FAILURE() << "H3-C6b node failed Gate: " << name
+                    << " relative_l2=" << metrics.relative_l2
+                    << " threshold=" << threshold.relative_l2
+                    << " cosine=" << metrics.cosine
+                    << " minimum=" << threshold.minimum_cosine;
+      gate_pass = false;
+    }
+  };
+
+  std::unordered_map<std::string, int64_t> trace_counts;
+  const MiniMaxH3AudioVAETraceHook hook =
+      [&report, &trace_counts](
+          std::string_view name, int64_t index, const torch::Tensor& value) {
+        ++trace_counts[std::string(name) + ":" + std::to_string(index)];
+        if (name == "encoder.padded_input") {
+          report("encoder.input_padded", value);
+        } else if (name == "encoder.block") {
+          std::ostringstream key;
+          key << "encoder.block_" << std::setw(2) << std::setfill('0') << index;
+          report(key.str(), value);
+        } else if (name.starts_with("pre_block.")) {
+          report(std::string(name), value);
+        } else if (name == "posterior.mean") {
+          report("posterior.mean_head", value);
+        } else if (name == "posterior.logs") {
+          report("posterior.logs_head", value);
+        } else if (name == "decoder.denormalized_latents") {
+          report("decoder.denormalized_latent", value);
+        } else if (name == "decoder.dec_in_proj") {
+          report("decoder.dec_in", value);
+        } else if (name == "decoder.conv_pre") {
+          report("decoder.conv_pre", value);
+        } else if (name == "decoder.ups") {
+          report("decoder.stage_" + std::to_string(index) + ".upsample", value);
+        } else if (name == "decoder.stage") {
+          report("decoder.stage_" + std::to_string(index) + ".average", value);
+        } else if (name == "decoder.final_pre_clamp") {
+          report("decoder.final_pre_clamp", value);
+        } else if (name == "decoder.final_clamped") {
+          report("decoder.final_clamped", value);
+        } else if (name == "decoder.stereo") {
+          report("pipeline.stereo", value);
+        }
+      };
+
+  const torch::Device device("npu:0");
+  const torch::Tensor network_input =
+      golden->get_tensor("preprocess.mono_network_batch").to(device);
+  MiniMaxH3AudioDiagonalGaussianDistribution posterior =
+      vae->encode(network_input, hook);
+  report("posterior.mean", posterior.mean());
+  report("posterior.logs", posterior.logs());
+  report("posterior.std", posterior.std());
+  report("posterior.mode", posterior.mode());
+  const torch::Tensor epsilon =
+      golden->get_tensor("posterior.epsilon").to(device);
+  report("posterior.sample", posterior.sample(epsilon));
+  const torch::Tensor normalized_mode =
+      MiniMaxH3AudioVAEImpl::normalize_latents(posterior.mode());
+  report("posterior.normalized_mode", normalized_mode);
+  const torch::Tensor rows =
+      normalized_mode.transpose(1, 2).reshape({-1, 32}).contiguous();
+  report("posterior.normalized_channel_major_rows", rows);
+
+  const torch::Tensor normalized_decode =
+      golden->get_tensor("decoder.independent_normalized_latent").to(device);
+  const torch::Tensor stereo = vae->decode_normalized(normalized_decode, hook);
+  report("pipeline.stereo", stereo);
+  std::unordered_map<std::string, int64_t> expected_trace_counts = {
+      {"encoder.padded_input:-1", 1},
+      {"pre_block.qkv:-1", 1},
+      {"pre_block.query:-1", 1},
+      {"pre_block.key:-1", 1},
+      {"pre_block.value:-1", 1},
+      {"pre_block.projection_branch:-1", 1},
+      {"pre_block.attention_branch:-1", 1},
+      {"pre_block.mlp_branch:-1", 1},
+      {"pre_block.final:-1", 1},
+      {"encoder.pre_block:-1", 1},
+      {"posterior.mean:-1", 1},
+      {"posterior.logs:-1", 1},
+      {"decoder.denormalized_latents:-1", 1},
+      {"decoder.dec_in_proj:-1", 1},
+      {"decoder.conv_pre:-1", 1},
+      {"decoder.activation_post:-1", 1},
+      {"decoder.final_pre_clamp:-1", 1},
+      {"decoder.final_clamped:-1", 1},
+      {"decoder.raw:-1", 1},
+      {"decoder.stereo:-1", 1},
+  };
+  for (int64_t index = 0; index < 8; ++index) {
+    expected_trace_counts.emplace("encoder.block:" + std::to_string(index), 1);
+  }
+  for (int64_t index = 0; index < 7; ++index) {
+    expected_trace_counts.emplace("decoder.ups:" + std::to_string(index), 1);
+    expected_trace_counts.emplace("decoder.stage:" + std::to_string(index), 1);
+  }
+  if (trace_counts != expected_trace_counts) {
+    ADD_FAILURE() << "H3-C6b trace event inventory is incomplete";
+    gate_pass = false;
+  }
+  const torch::Tensor actual_waveform =
+      stereo.to(torch::kCPU).to(torch::kFloat64);
+  const torch::Tensor expected_waveform =
+      golden->get_tensor("pipeline.stereo").to(torch::kFloat64);
+  const torch::Tensor actual_centered =
+      actual_waveform - actual_waveform.mean(-1, true);
+  const torch::Tensor expected_centered =
+      expected_waveform - expected_waveform.mean(-1, true);
+  const torch::Tensor correlation =
+      (actual_centered * expected_centered).sum(-1) /
+      (actual_centered.square().sum(-1).sqrt() *
+       expected_centered.square().sum(-1).sqrt());
+  const double minimum_correlation = correlation.min().item<double>();
+  const torch::Tensor rms_ratio = actual_waveform.square().mean(-1).sqrt() /
+                                  expected_waveform.square().mean(-1).sqrt();
+  const double minimum_rms_ratio = rms_ratio.min().item<double>();
+  const double maximum_rms_ratio = rms_ratio.max().item<double>();
+  std::cout << "H3-C6b waveform correlation=" << minimum_correlation
+            << " rms_ratio_min=" << minimum_rms_ratio
+            << " rms_ratio_max=" << maximum_rms_ratio << std::endl;
+  if (minimum_correlation < 0.99999 || minimum_rms_ratio < 0.999 ||
+      maximum_rms_ratio > 1.001) {
+    ADD_FAILURE() << "H3-C6b waveform correlation or RMS ratio failed";
+    gate_pass = false;
+  }
+  for (int64_t fft_size : {512, 1024, 2048}) {
+    const int64_t hop = fft_size / 4;
+    const torch::Tensor window = torch::hann_window(fft_size, torch::kFloat64);
+    const torch::Tensor actual_frames =
+        actual_waveform.unfold(-1, fft_size, hop) * window;
+    const torch::Tensor expected_frames =
+        expected_waveform.unfold(-1, fft_size, hop) * window;
+    const torch::Tensor actual_magnitude =
+        torch::abs(torch::fft::rfft(actual_frames));
+    const torch::Tensor expected_magnitude =
+        torch::abs(torch::fft::rfft(expected_frames));
+    const double spectral_cosine =
+        (actual_magnitude.flatten().dot(expected_magnitude.flatten()) /
+         (actual_magnitude.norm() * expected_magnitude.norm()))
+            .item<double>();
+    std::cout << "H3-C6b spectral_cosine fft=" << fft_size
+              << " value=" << spectral_cosine << std::endl;
+    if (spectral_cosine < 0.9999) {
+      ADD_FAILURE() << "H3-C6b spectral cosine failed for FFT " << fft_size;
+      gate_pass = false;
+    }
+  }
+  torch::npu::synchronize();
+  ASSERT_TRUE(gate_pass);
+  std::cout << "H3_C6B_AUDIO_VAE=PASS" << std::endl;
+  std::cout << "G7_DUAL_VAE=PASS" << std::endl;
+}
+
+TEST(MiniMaxH3C6bTargetTest, DecodesProductionAudioGeometryWithRealWeights) {
+  const char* checkpoint_value = std::getenv("MINIMAX_H3_CHECKPOINT");
+  const char* golden_value = std::getenv("MINIMAX_H3_AUDIO_VAE_GOLDEN");
+  const char* smoke_value = std::getenv("MINIMAX_H3_AUDIO_VAE_TARGET_SMOKE");
+  if (checkpoint_value == nullptr || std::string(checkpoint_value).empty() ||
+      golden_value == nullptr || std::string(golden_value).empty() ||
+      smoke_value == nullptr || std::string(smoke_value) != "1") {
+    GTEST_SKIP() << "Set checkpoint, C6b Golden, and "
+                    "MINIMAX_H3_AUDIO_VAE_TARGET_SMOKE=1";
+  }
+  std::filesystem::path golden_path(golden_value);
+  if (std::filesystem::is_directory(golden_path)) {
+    golden_path /= "minimax_h3_audio_vae_reference.safetensors";
+  }
+  validate_h3_audio_golden_manifest(golden_path);
+  const std::unique_ptr<StateDict> golden =
+      StateDictFromSafeTensor::load(golden_path.string());
+  ASSERT_NE(golden, nullptr);
+  auto loader = std::make_unique<DiTModelLoader>(checkpoint_value);
+  DiTModelContext context(ParallelArgs(0, 1, nullptr),
+                          loader->get_model_args(),
+                          loader->get_quant_args(),
+                          torch::TensorOptions()
+                              .device(torch::Device("npu:0"))
+                              .dtype(torch::kBFloat16),
+                          DiTCacheConfig(),
+                          loader->get_model_type());
+  MiniMaxH3Pipeline pipeline(context);
+  pipeline->load_model(std::move(loader));
+  pipeline->load_c6b_audio_vae();
+  MiniMaxH3AudioVAE vae = pipeline->c6b_audio_vae();
+
+  const torch::Tensor normalized =
+      golden->get_tensor("production.normalized_latent")
+          .to(torch::Device("npu:0"));
+  const torch::Tensor stereo = vae->decode_normalized(normalized);
+  EXPECT_EQ(stereo.sizes().vec(), (std::vector<int64_t>{1, 2, 165600}));
+  EXPECT_EQ(stereo.scalar_type(), torch::kFloat32);
+  EXPECT_TRUE(torch::isfinite(stereo).all().item<bool>());
+  EXPECT_GE(stereo.min().item<float>(), -1.0F);
+  EXPECT_LE(stereo.max().item<float>(), 1.0F);
+  const torch::Tensor expected =
+      golden->get_tensor("production.pipeline_stereo");
+  const H3ComparisonMetrics metrics = h3_comparison_metrics(stereo, expected);
+  std::cout << "H3-C6b target relative_l2=" << metrics.relative_l2
+            << " cosine=" << metrics.cosine << " max_abs=" << metrics.max_abs
+            << std::endl;
+  EXPECT_LE(metrics.relative_l2, 0.001);
+  EXPECT_GE(metrics.cosine, 0.999999);
+  EXPECT_LE(metrics.max_abs, 0.002);
+  const torch::Tensor actual_fp64 = stereo.to(torch::kCPU).to(torch::kFloat64);
+  const torch::Tensor actual_centered =
+      actual_fp64 - actual_fp64.mean(-1, true);
+  const torch::Tensor expected_fp64 = expected.to(torch::kFloat64);
+  const torch::Tensor expected_centered =
+      expected_fp64 - expected_fp64.mean(-1, true);
+  const double minimum_correlation =
+      ((actual_centered * expected_centered).sum(-1) /
+       (actual_centered.square().sum(-1).sqrt() *
+        expected_centered.square().sum(-1).sqrt()))
+          .min()
+          .item<double>();
+  std::cout << "H3-C6b target correlation=" << minimum_correlation << std::endl;
+  EXPECT_GE(minimum_correlation, 0.99999);
+  torch::npu::synchronize();
+  std::cout << "H3_C6B_TARGET_GEOMETRY=PASS" << std::endl;
+}
+
 TEST(MiniMaxH3PipelineTest, ForwardFailsInsteadOfReturningFakeMedia) {
   try {
     MiniMaxH3PipelineImpl::throw_forward_unavailable();
-    FAIL() << "Expected H3-C5 forward failure";
+    FAIL() << "Expected H3-C6b forward failure";
   } catch (const std::logic_error& error) {
-    EXPECT_NE(std::string(error.what()).find("no VAE-backed"),
+    EXPECT_NE(std::string(error.what()).find("no production Ref2VA"),
               std::string::npos);
   }
 }

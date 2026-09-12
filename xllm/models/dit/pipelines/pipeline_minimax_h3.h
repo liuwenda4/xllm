@@ -33,6 +33,7 @@ limitations under the License.
 #include "core/runtime/dit_forward_params.h"
 #include "core/util/json_reader.h"
 #include "models/dit/autoencoders/autoencoder_kl_minimax_h3.h"
+#include "models/dit/autoencoders/autoencoder_kl_minimax_h3_audio.h"
 #include "models/dit/transformers/minimax_h3_denoiser.h"
 #include "models/dit/transformers/transformer_minimax_h3.h"
 #include "models/dit/utils/minimax_h3_packing.h"
@@ -370,8 +371,8 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
 
   [[noreturn]] static void throw_forward_unavailable() {
     throw std::logic_error(
-        "MiniMax-H3 H3-C5 pipeline has a full streaming denoiser but no "
-        "VAE-backed production generation path");
+        "MiniMax-H3 H3-C6b pipeline has a full streaming denoiser and dual "
+        "native VAEs but no production Ref2VA request/media output path");
   }
 
   static MiniMaxH3DryRunShapeTrace dry_run_shape_trace(
@@ -572,6 +573,27 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
 
   MiniMaxH3VideoVAE c6a_video_vae() const { return c6a_video_vae_; }
 
+  void load_c6b_audio_vae() {
+    if (!loaded_) {
+      throw std::logic_error(
+          "MiniMax-H3 C6b audio VAE requires retained component weights");
+    }
+    if (c6b_audio_vae_) {
+      throw std::logic_error("MiniMax-H3 C6b audio VAE is already loaded");
+    }
+    auto loader = component_loaders_.find("audio_vae");
+    if (loader == component_loaders_.end() || loader->second == nullptr) {
+      throw std::logic_error(
+          "MiniMax-H3 C6b audio VAE component loader is unavailable");
+    }
+    MiniMaxH3AudioVAE candidate(options_);
+    candidate->load_model(*loader->second);
+    c6b_audio_vae_ = register_module("c6b_audio_vae", candidate);
+    component_loaders_.erase(loader);
+  }
+
+  MiniMaxH3AudioVAE c6b_audio_vae() const { return c6b_audio_vae_; }
+
  private:
   static MiniMaxH3TransformerConfig validate_context(
       const DiTModelContext& context) {
@@ -615,6 +637,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
   MiniMaxH3C4Harness c4_harness_{nullptr};
   MiniMaxH3StreamingDenoiser c5_denoiser_{nullptr};
   MiniMaxH3VideoVAE c6a_video_vae_{nullptr};
+  MiniMaxH3AudioVAE c6b_audio_vae_{nullptr};
   bool loaded_ = false;
 };
 TORCH_MODULE(MiniMaxH3Pipeline);
