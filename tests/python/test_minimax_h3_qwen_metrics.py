@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from tools.minimax_h3_qwen_xllm import _compare, _legacy_max_abs_pass, _metric_summary, _ordered_bf16
+from xllm.python.models.qwen3 import _apply_official_eager_mrope
 
 
 def test_metric_summary_reports_relative_l2_and_stable_cosine() -> None:
@@ -83,3 +84,36 @@ def test_legacy_gate_rejects_nonfinite_mismatches() -> None:
     assert comparison["max_abs_error"] == 0.0
     assert comparison["nonfinite_mismatch_count"] == 1
     assert not _legacy_max_abs_pass([comparison], 0.25)
+
+
+def test_official_eager_mrope_interleaves_axes_like_hf() -> None:
+    positions = torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.int64)
+    head_dim = 8
+    cache = torch.arange(6 * head_dim, dtype=torch.float32).reshape(6, head_dim)
+    q = torch.arange(2 * head_dim, dtype=torch.float32).reshape(2, head_dim)
+    k = q + 1.0
+
+    actual_q, actual_k = _apply_official_eager_mrope(
+        positions,
+        q,
+        k,
+        cache,
+        head_dim,
+        [2, 1, 1],
+    )
+
+    cos_axes, sin_axes = cache[:, :4], cache[:, 4:]
+    axis = torch.tensor([0, 1, 2, 0])
+    frequency = torch.arange(4).unsqueeze(0)
+    selected_positions = positions[axis].transpose(0, 1)
+    cos = cos_axes[selected_positions, frequency]
+    sin = sin_axes[selected_positions, frequency]
+    cos = torch.cat((cos, cos), dim=-1)
+    sin = torch.cat((sin, sin), dim=-1)
+
+    def rotate_half(value: torch.Tensor) -> torch.Tensor:
+        first, second = value.chunk(2, dim=-1)
+        return torch.cat((-second, first), dim=-1)
+
+    torch.testing.assert_close(actual_q, q * cos + rotate_half(q) * sin)
+    torch.testing.assert_close(actual_k, k * cos + rotate_half(k) * sin)

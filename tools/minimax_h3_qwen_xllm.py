@@ -22,6 +22,7 @@ import hashlib
 import json
 import math
 import os
+import subprocess
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -184,6 +185,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--residual-mode", choices=["exact", "fused", "hybrid"], default="hybrid")
     parser.add_argument("--activation-backend", choices=["xllm_swiglu", "torch_eager"], default="xllm_swiglu")
     parser.add_argument("--norm-backend", choices=["xllm", "torch_eager"], default="xllm")
+    parser.add_argument("--mrope-backend", choices=["npu_fused", "official_eager"], default="npu_fused")
     parser.add_argument("--split-projections", action="store_true")
     parser.add_argument("--reset-interval", type=int, default=0)
     parser.add_argument("--gate-mode", choices=["report_only", "legacy_max_abs"], default="report_only")
@@ -234,6 +236,14 @@ def _digest(tensor: Any) -> str:
     import torch
 
     return hashlib.sha256(tensor.detach().to("cpu").contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(16 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _ordered_bf16(value: Any) -> Any:
@@ -631,6 +641,7 @@ def main() -> None:
     from xllm.python import initialize_runtime
 
     initialize_runtime()
+    import xllm.python.models.qwen3 as qwen3_module
     from xllm.python import kernels
     from xllm.python.model_executor.forward_context import ForwardContext, forward_context
     from xllm.python.models.qwen3_vl import Qwen3VLForConditionalGeneration
@@ -671,6 +682,17 @@ def main() -> None:
             raise ValueError("teacher-forcing golden is missing reset states: " + ", ".join(missing[:3]))
     config = _load_flat_config(text_checkpoint, "cpu")
     output_dir.mkdir(parents=True, exist_ok=True)
+    repository_root = Path(__file__).resolve().parents[1]
+    loaded_qwen3_path = Path(qwen3_module.__file__).resolve()
+    repository_qwen3_path = repository_root / "xllm/python/models/qwen3.py"
+    if _file_digest(loaded_qwen3_path) != _file_digest(repository_qwen3_path):
+        raise RuntimeError("loaded Qwen3 source differs from the attested repository source")
+    source_paths = {
+        "tools/minimax_h3_qwen_xllm.py": Path(__file__).resolve(),
+        "xllm/python/models/qwen3.py": repository_qwen3_path,
+        "loaded/xllm/python/models/qwen3.py": loaded_qwen3_path,
+    }
+    source_files = {name: {"path": str(path), "sha256": _file_digest(path)} for name, path in source_paths.items()}
     run_config = {
         "device": str(device),
         "golden_path": str(golden_path),
@@ -681,16 +703,24 @@ def main() -> None:
         "residual_mode": args.residual_mode,
         "activation_backend": args.activation_backend,
         "norm_backend": args.norm_backend,
+        "mrope_backend": args.mrope_backend,
         "split_projections": args.split_projections,
         "reset_interval": args.reset_interval,
         "gate_mode": args.gate_mode,
         "isolated_layer": isolated_layer,
         "torch_version": torch.__version__,
-        "xllm_commit": os.popen("git -C /data/workspace/lwd/xllm rev-parse HEAD").read().strip(),
+        "xllm_commit": subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repository_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip(),
+        "source_files": source_files,
     }
-    (output_dir / "run_config.json").write_text(
-        json.dumps(run_config, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    run_config_bytes = (json.dumps(run_config, indent=2, sort_keys=True) + "\n").encode()
+    (output_dir / "run_config.json").write_bytes(run_config_bytes)
+    run_config_sha256 = hashlib.sha256(run_config_bytes).hexdigest()
 
     logger.info("Constructing xLLM Qwen3-VL on CPU")
     model = Qwen3VLForConditionalGeneration(config)
@@ -700,6 +730,9 @@ def main() -> None:
         for layer in model.model.layers:
             layer.self_attn.split_qkv = True
             layer.mlp.split_gate_up = True
+    if args.mrope_backend == "official_eager":
+        for layer in model.model.layers:
+            layer.self_attn.use_official_eager_mrope = True
     if args.norm_backend == "torch_eager":
         for layer in model.model.layers:
             layer.self_attn.use_qk_norm_modules = True
@@ -830,6 +863,8 @@ def main() -> None:
             },
             "peak_device_memory_bytes": int(torch.npu.max_memory_allocated(device)),
             "peak_device_reserved_bytes": int(torch.npu.max_memory_reserved(device)),
+            "run_config": run_config,
+            "run_config_sha256": run_config_sha256,
         }
         torch.save(
             {
@@ -951,6 +986,8 @@ def main() -> None:
         "xllm_tensor_archive_sha256": _digest(torch.cat([value.flatten() for value in model_state.values()])),
         "peak_device_memory_bytes": int(torch.npu.max_memory_allocated(device)),
         "peak_device_reserved_bytes": int(torch.npu.max_memory_reserved(device)),
+        "run_config": run_config,
+        "run_config_sha256": run_config_sha256,
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if args.gate_mode == "legacy_max_abs" and not legacy_pass:

@@ -50,6 +50,48 @@ from xllm.python.models.base import PyModelBase
 from xllm.python.models.weight_utils import WeightLoader, kv_replica_shard
 
 
+def _apply_official_eager_mrope(
+    positions: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    head_dim: int,
+    mrope_section: list[int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply Qwen3-VL's interleaved M-RoPE with OfficialHF op boundaries."""
+    if positions.ndim != 2 or positions.shape[0] != 3:
+        raise ValueError("M-RoPE positions must have shape [3, num_tokens]")
+    half_dim = head_dim // 2
+    if len(mrope_section) != 3 or sum(mrope_section) != half_dim:
+        raise ValueError("M-RoPE sections must contain three entries summing to head_dim / 2")
+
+    cos_axes = cos_sin_cache[:, :half_dim]
+    sin_axes = cos_sin_cache[:, half_dim:]
+    cos = cos_axes[positions[0]].clone()
+    sin = sin_axes[positions[0]].clone()
+    for dim, offset in enumerate((1, 2), start=1):
+        index = slice(offset, mrope_section[dim] * 3, 3)
+        cos[:, index] = cos_axes[positions[dim], index]
+        sin[:, index] = sin_axes[positions[dim], index]
+    cos = torch.cat((cos, cos), dim=-1).unsqueeze(0).unsqueeze(0)
+    sin = torch.cat((sin, sin), dim=-1).unsqueeze(0).unsqueeze(0)
+
+    num_tokens = q.shape[0]
+    q_bnsd = q.view(num_tokens, -1, head_dim).transpose(0, 1).unsqueeze(0)
+    k_bnsd = k.view(num_tokens, -1, head_dim).transpose(0, 1).unsqueeze(0)
+
+    def rotate_half(value: torch.Tensor) -> torch.Tensor:
+        first, second = value.chunk(2, dim=-1)
+        return torch.cat((-second, first), dim=-1)
+
+    q = q_bnsd * cos + rotate_half(q_bnsd) * sin
+    k = k_bnsd * cos + rotate_half(k_bnsd) * sin
+    return (
+        q.squeeze(0).transpose(0, 1).reshape(num_tokens, -1),
+        k.squeeze(0).transpose(0, 1).reshape(num_tokens, -1),
+    )
+
+
 @dataclass
 class Qwen3Config:
     hidden_size: int = 1024
@@ -146,6 +188,7 @@ class Qwen3Attention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps, dtype=dtype, device=device)
         self.split_qkv = False
         self.use_qk_norm_modules = False
+        self.use_official_eager_mrope = False
         self.diagnostic_callback: Callable[[str, torch.Tensor], None] | None = None
         self.attn = Attention(
             num_heads=self.num_heads,
@@ -185,11 +228,10 @@ class Qwen3Attention(nn.Module):
             callback("v_projection", qkv[:, self.q_size + self.kv_size :])
 
         if mrope_section is not None and positions.dim() == 2:
-            # mRoPE prefill: per-head Q/K RMSNorm (same math as the fused
-            # kernel) then kernels.mrope, which does the time/height/width
-            # section combination + rotation in one op.
+            # mRoPE prefill: per-head Q/K RMSNorm, then either the native fused
+            # kernel or the OfficialHF-compatible eager multiply/add boundary.
             # cos_sin_cache here is the [max_pos, head_dim]=[cos_half|sin_half]
-            # table; q/k stay 2D [N, num_heads*head_dim] as npu_mrope requires.
+            # table; q/k enter and leave this block as 2D packed-head tensors.
             num_tokens = qkv.size(0)
             q = qkv[:, : self.q_size].reshape(num_tokens * self.num_heads, self.head_dim)
             k = qkv[:, self.q_size : self.q_size + self.kv_size].reshape(num_tokens * self.num_kv_heads, self.head_dim)
@@ -205,16 +247,26 @@ class Qwen3Attention(nn.Module):
             q = q.view(num_tokens, self.q_size)
             k = k.view(num_tokens, self.kv_size)
             v = qkv[:, self.q_size + self.kv_size :]
-            q, k = kernels.mrope(
-                positions,
-                q,
-                k,
-                cos_sin_cache,
-                self.head_dim,
-                mrope_section=list(mrope_section),
-                rotary_mode="half",
-                cache_mode="interleave",
-            )
+            if self.use_official_eager_mrope:
+                q, k = _apply_official_eager_mrope(
+                    positions,
+                    q,
+                    k,
+                    cos_sin_cache,
+                    self.head_dim,
+                    list(mrope_section),
+                )
+            else:
+                q, k = kernels.mrope(
+                    positions,
+                    q,
+                    k,
+                    cos_sin_cache,
+                    self.head_dim,
+                    mrope_section=list(mrope_section),
+                    rotary_mode="half",
+                    cache_mode="interleave",
+                )
             if callback is not None:
                 callback("mrope_q", q)
                 callback("mrope_k", k)

@@ -237,7 +237,8 @@ class MiniMaxH3StreamingDenoiserImpl final : public torch::nn::Module {
       const torch::Tensor& timesteps,
       const torch::Tensor& inverse_indices,
       int64_t step,
-      const MiniMaxH3LayerObserver& observer = nullptr) {
+      const MiniMaxH3LayerObserver& observer = nullptr,
+      bool retain_preparation = false) {
     verify_fixed_weights();
     validate_inputs(layout, video_rows, audio_rows, timesteps, inverse_indices);
     const SourceIndex source = build_source_index(shards);
@@ -249,9 +250,8 @@ class MiniMaxH3StreamingDenoiserImpl final : public torch::nn::Module {
     torch::Tensor refiner_cu = torch::tensor(
         std::vector<int64_t>{0, condition.size(0)},
         torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
-    auto [refined_condition, ignored_refiner_trace] =
-        token_refiner_->forward(projected_condition, refiner_cu);
-    (void)ignored_refiner_trace;
+    torch::Tensor refined_condition =
+        token_refiner_->forward_output_only(projected_condition, refiner_cu);
     torch::Tensor video_embedding =
         video_patch_proj_->forward(video_rows.to(device));
     torch::Tensor audio_embedding =
@@ -271,16 +271,24 @@ class MiniMaxH3StreamingDenoiserImpl final : public torch::nn::Module {
     torch::Tensor device_inverse = inverse_indices.to(device);
     torch::Tensor combined_indices = minimax_h3_combined_adaln_indices(
         device_inverse, layout.token_tags.to(device));
-    MiniMaxH3DenoiserOutput output{
-        .condition_projection = projected_condition,
-        .refined_condition = refined_condition,
-        .video_embedding = video_embedding,
-        .audio_embedding = audio_embedding,
-        .packed_hidden = hidden.slice(0, 0, layout.used_length),
-        .time_embedding = time_embedding,
-        .rope_frequencies = rope_frequencies.slice(0, 0, layout.used_length),
-        .combined_indices = combined_indices.slice(0, 0, layout.used_length),
-    };
+    MiniMaxH3DenoiserOutput output;
+    if (observer || retain_preparation) {
+      output.condition_projection = projected_condition;
+      output.refined_condition = refined_condition;
+      output.video_embedding = video_embedding;
+      output.audio_embedding = audio_embedding;
+      output.packed_hidden = hidden.slice(0, 0, layout.used_length);
+      output.time_embedding = time_embedding;
+      output.rope_frequencies =
+          rope_frequencies.slice(0, 0, layout.used_length);
+      output.combined_indices =
+          combined_indices.slice(0, 0, layout.used_length);
+    }
+    condition = torch::Tensor();
+    projected_condition = torch::Tensor();
+    refined_condition = torch::Tensor();
+    video_embedding = torch::Tensor();
+    audio_embedding = torch::Tensor();
     hidden = hidden.slice(0, 0, layout.used_length);
     combined_indices = combined_indices.slice(0, 0, layout.used_length);
     rope_frequencies = rope_frequencies.slice(0, 0, layout.used_length);
@@ -290,18 +298,18 @@ class MiniMaxH3StreamingDenoiserImpl final : public torch::nn::Module {
     for (int64_t layer = 0; layer < MiniMaxH3TransformerConfig::kNumLayers;
          ++layer) {
       load_block_weights(source, layer);
-      MiniMaxH3ResidualBranchTrace block_trace =
-          streaming_block_->forward(hidden,
-                                    time_embedding,
-                                    combined_indices,
-                                    rope_frequencies,
-                                    used_cu_seqlens);
-      hidden = block_trace.output;
-      if (!torch::isfinite(hidden).all().item<bool>()) {
-        throw std::runtime_error("MiniMax-H3 block " + std::to_string(layer) +
-                                 " produced NaN or Inf");
-      }
       if (observer) {
+        MiniMaxH3ResidualBranchTrace block_trace =
+            streaming_block_->forward(hidden,
+                                      time_embedding,
+                                      combined_indices,
+                                      rope_frequencies,
+                                      used_cu_seqlens);
+        hidden = block_trace.output;
+        if (!torch::isfinite(hidden).all().item<bool>()) {
+          throw std::runtime_error("MiniMax-H3 block " + std::to_string(layer) +
+                                   " produced NaN or Inf");
+        }
         observer(
             step,
             layer,
@@ -327,11 +335,24 @@ class MiniMaxH3StreamingDenoiserImpl final : public torch::nn::Module {
                  block_trace.mlp_output.slice(0, 0, layout.used_length),
              .mlp_delta = block_trace.mlp_delta.slice(0, 0, layout.used_length),
              .output = hidden.slice(0, 0, layout.used_length)});
+      } else {
+        hidden = streaming_block_->forward_output_only(hidden,
+                                                       time_embedding,
+                                                       combined_indices,
+                                                       rope_frequencies,
+                                                       used_cu_seqlens);
+        if (!torch::isfinite(hidden).all().item<bool>()) {
+          throw std::runtime_error("MiniMax-H3 block " + std::to_string(layer) +
+                                   " produced NaN or Inf");
+        }
       }
     }
     MiniMaxH3FinalOutput final =
         final_layer_->forward(hidden, time_embedding, device_inverse, layout);
-    output.final_activation = final.activation.slice(0, 0, layout.used_length);
+    if (observer || retain_preparation) {
+      output.final_activation =
+          final.activation.slice(0, 0, layout.used_length);
+    }
     output.video_velocity = final.raw_selected_video_logits;
     output.audio_velocity = final.raw_selected_audio_logits;
     output.executed_layers = MiniMaxH3TransformerConfig::kNumLayers;
@@ -369,14 +390,17 @@ class MiniMaxH3StreamingDenoiserImpl final : public torch::nn::Module {
       const float audio_timestep = schedule.audio.timesteps[step].item<float>();
       MiniMaxH3RowTimestepPlan plan = minimax_h3_build_row_timestep_plan(
           layout, video_timestep, audio_timestep);
-      MiniMaxH3DenoiserOutput denoiser = forward(shards,
-                                                 layout,
-                                                 video_rows,
-                                                 audio_rows,
-                                                 plan.unique_timesteps,
-                                                 plan.inverse_indices,
-                                                 step,
-                                                 layer_observer);
+      MiniMaxH3DenoiserOutput denoiser =
+          forward(shards,
+                  layout,
+                  video_rows,
+                  audio_rows,
+                  plan.unique_timesteps,
+                  plan.inverse_indices,
+                  step,
+                  layer_observer,
+                  /*retain_preparation=*/
+                  static_cast<bool>(step_observer));
       torch::Tensor video_target = video_rows.index({image_update});
       torch::Tensor audio_target = audio_rows.index({audio_update});
       torch::Tensor video_velocity =

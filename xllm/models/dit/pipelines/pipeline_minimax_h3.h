@@ -34,6 +34,7 @@ limitations under the License.
 #include "core/util/json_reader.h"
 #include "models/dit/autoencoders/autoencoder_kl_minimax_h3.h"
 #include "models/dit/autoencoders/autoencoder_kl_minimax_h3_audio.h"
+#include "models/dit/pipelines/minimax_h3_ref2va_eager.h"
 #include "models/dit/transformers/minimax_h3_denoiser.h"
 #include "models/dit/transformers/transformer_minimax_h3.h"
 #include "models/dit/utils/minimax_h3_packing.h"
@@ -371,8 +372,8 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
 
   [[noreturn]] static void throw_forward_unavailable() {
     throw std::logic_error(
-        "MiniMax-H3 H3-C6b pipeline has a full streaming denoiser and dual "
-        "native VAEs but no production Ref2VA request/media output path");
+        "MiniMax-H3 H3-C7 pipeline has an internal typed eager Ref2VA path "
+        "but no production Ref2VA request/media output path");
   }
 
   static MiniMaxH3DryRunShapeTrace dry_run_shape_trace(
@@ -527,7 +528,8 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
         timesteps,
         inverse_indices,
         step,
-        layer_observer);
+        layer_observer,
+        /*retain_preparation=*/true);
   }
 
   MiniMaxH3ResidualBranchTrace probe_c5_streaming_block(
@@ -593,6 +595,39 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
   }
 
   MiniMaxH3AudioVAE c6b_audio_vae() const { return c6b_audio_vae_; }
+
+  void load_c7_eager() {
+    if (!loaded_) {
+      throw std::logic_error(
+          "MiniMax-H3 C7 eager path requires retained component weights");
+    }
+    if (c5_denoiser_ && c6a_video_vae_ && c6b_audio_vae_) {
+      throw std::logic_error("MiniMax-H3 C7 eager path is already loaded");
+    }
+    if (!c5_denoiser_) {
+      load_c5_denoiser();
+    }
+    if (!c6a_video_vae_) {
+      load_c6a_video_vae();
+    }
+    if (!c6b_audio_vae_) {
+      load_c6b_audio_vae();
+    }
+  }
+
+  MiniMaxH3Ref2VAEagerOutput run_c7_eager(
+      const MiniMaxH3Ref2VAEagerInput& input) {
+    if (!c5_denoiser_ || !c6a_video_vae_ || !c6b_audio_vae_) {
+      throw std::logic_error(
+          "MiniMax-H3 C7 eager path has not been fully loaded");
+    }
+    return minimax_h3_run_ref2va_eager(
+        input,
+        component_loaders_.at("transformer")->get_state_dicts(),
+        c5_denoiser_,
+        c6a_video_vae_,
+        c6b_audio_vae_);
+  }
 
  private:
   static MiniMaxH3TransformerConfig validate_context(

@@ -475,6 +475,17 @@ class MiniMaxH3TokenRefinerBlockImpl final : public torch::nn::Module {
     return trace;
   }
 
+  torch::Tensor forward_output_only(const torch::Tensor& input,
+                                    const torch::Tensor& cu_seqlens) const {
+    torch::Tensor after_attention;
+    {
+      torch::Tensor attention_delta =
+          attn_->forward(norm1_->forward(input), std::nullopt, cu_seqlens);
+      after_attention = input + attention_delta;
+    }
+    return after_attention + mlp_->forward(norm2_->forward(after_attention));
+  }
+
  private:
   MiniMaxH3RMSNorm norm1_{nullptr};
   MiniMaxH3RMSNorm norm2_{nullptr};
@@ -513,6 +524,15 @@ class MiniMaxH3TokenRefinerImpl final : public torch::nn::Module {
       traces.emplace_back(std::move(trace));
     }
     return {final_norm_->forward(hidden), std::move(traces)};
+  }
+
+  torch::Tensor forward_output_only(const torch::Tensor& input,
+                                    const torch::Tensor& cu_seqlens) const {
+    torch::Tensor hidden = input;
+    for (const MiniMaxH3TokenRefinerBlock& block : block_layers_) {
+      hidden = block->forward_output_only(hidden, cu_seqlens);
+    }
+    return final_norm_->forward(hidden);
   }
 
  private:
@@ -624,6 +644,37 @@ class MiniMaxH3DiTBlockImpl final : public torch::nn::Module {
     trace.mlp_delta = gate_mlp * trace.mlp_output;
     trace.output = after_attention + trace.mlp_delta;
     return trace;
+  }
+
+  torch::Tensor forward_output_only(const torch::Tensor& input,
+                                    const torch::Tensor& time_embedding,
+                                    const torch::Tensor& combined_indices,
+                                    const torch::Tensor& rope_frequencies,
+                                    const torch::Tensor& cu_seqlens) const {
+    torch::Tensor parameters = adaln_proj_->forward(time_embedding);
+    torch::Tensor after_attention;
+    {
+      torch::Tensor shift_msa =
+          minimax_h3_select_adaln_parameter(parameters, 0, combined_indices);
+      torch::Tensor scale_msa =
+          minimax_h3_select_adaln_parameter(parameters, 1, combined_indices);
+      torch::Tensor gate_msa =
+          minimax_h3_select_adaln_parameter(parameters, 2, combined_indices);
+      torch::Tensor attention_input =
+          norm1_->forward(input) * (scale_msa + 1.0) + shift_msa;
+      torch::Tensor attention_output =
+          attn_->forward(attention_input, rope_frequencies, cu_seqlens);
+      after_attention = input + gate_msa * attention_output;
+    }
+    torch::Tensor shift_mlp =
+        minimax_h3_select_adaln_parameter(parameters, 3, combined_indices);
+    torch::Tensor scale_mlp =
+        minimax_h3_select_adaln_parameter(parameters, 4, combined_indices);
+    torch::Tensor gate_mlp =
+        minimax_h3_select_adaln_parameter(parameters, 5, combined_indices);
+    torch::Tensor mlp_input =
+        norm2_->forward(after_attention) * (scale_mlp + 1.0) + shift_mlp;
+    return after_attention + gate_mlp * mlp_->forward(mlp_input);
   }
 
  private:

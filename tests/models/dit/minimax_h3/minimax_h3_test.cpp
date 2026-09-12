@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include <gtest/gtest.h>
+#include <openssl/evp.h>
 #include <torch/fft.h>
 
 #include <algorithm>
@@ -22,6 +23,7 @@ limitations under the License.
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -1754,6 +1756,44 @@ H3ComparisonMetrics h3_comparison_metrics(const torch::Tensor& actual,
           .max_abs = difference.abs().max().item<double>()};
 }
 
+std::string h3_file_sha256(const std::filesystem::path& path) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    throw std::invalid_argument("Cannot open H3 artifact for SHA256: " +
+                                path.string());
+  }
+  std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> context(
+      EVP_MD_CTX_new(), EVP_MD_CTX_free);
+  if (!context ||
+      EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1) {
+    throw std::runtime_error("Cannot initialize H3 artifact SHA256");
+  }
+  std::array<char, 1 << 20> buffer{};
+  while (input) {
+    input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+    const std::streamsize count = input.gcount();
+    if (count > 0 &&
+        EVP_DigestUpdate(context.get(), buffer.data(), count) != 1) {
+      throw std::runtime_error("Cannot update H3 artifact SHA256");
+    }
+  }
+  if (!input.eof()) {
+    throw std::runtime_error("Cannot read H3 artifact for SHA256");
+  }
+  std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+  unsigned int digest_size = 0;
+  if (EVP_DigestFinal_ex(context.get(), digest.data(), &digest_size) != 1 ||
+      digest_size != 32) {
+    throw std::runtime_error("Cannot finalize H3 artifact SHA256");
+  }
+  std::ostringstream encoded;
+  encoded << std::hex << std::setfill('0');
+  for (unsigned int index = 0; index < digest_size; ++index) {
+    encoded << std::setw(2) << static_cast<int>(digest[index]);
+  }
+  return encoded.str();
+}
+
 void validate_h3_audio_golden_manifest(
     const std::filesystem::path& golden_path) {
   const std::filesystem::path manifest_path =
@@ -1804,6 +1844,125 @@ void validate_h3_audio_golden_manifest(
       artifact_digest !=
           "08359fff731dc76ff821fe819458db3ecb41a40012d05a6d22397f3b8003ac45") {
     fail("artifact");
+  }
+}
+
+void validate_h3_c7_golden_manifest(const std::filesystem::path& golden_path) {
+  const std::filesystem::path manifest_path =
+      golden_path.parent_path() / "minimax_h3_ref2va_e2e_reference.json";
+  JsonReader reader;
+  if (!reader.parse(manifest_path.string())) {
+    throw std::invalid_argument(
+        "MiniMax-H3 C7 cannot parse the Golden manifest");
+  }
+  const nlohmann::json& manifest = reader.data();
+  const auto fail = [](const std::string& field) {
+    throw std::invalid_argument(
+        "MiniMax-H3 C7 Golden manifest failed attestation at `" + field + "`");
+  };
+  if (manifest.value("schema", "") !=
+      "xllm.minimax_h3.ref2va_e2e_reference/v1") {
+    fail("schema");
+  }
+  if (manifest.value("status", "") !=
+      "OFFICIAL_H3_C7_TYPED_EAGER_COMPOSITE_GOLDEN") {
+    fail("status");
+  }
+  if (manifest.at("source").value("revision", "") !=
+      "d30c748f5f5d0925a5af14dc0e6a6de983025e63") {
+    fail("source.revision");
+  }
+  if (manifest.at("checkpoint")
+              .at("transformer_ref")
+              .value("tensor_count", 0) != 638 ||
+      manifest.at("checkpoint").at("audio_vae").value("tensor_count", 0) !=
+          1087) {
+    fail("checkpoint");
+  }
+  if (!manifest.at("runtime").value("pinned_diffusers_import", false) ||
+      manifest.at("execution").value("attention_backend", "") != "native" ||
+      manifest.at("execution").value("transformer_forwards", 0) != 49 ||
+      manifest.at("execution").value("transformer_block_forwards", 0) != 2450) {
+    fail("execution");
+  }
+  if (manifest.at("fixture").value("packed_sequence_length", 0) != 539 ||
+      manifest.at("fixture").at("decoded_video_shape") !=
+          nlohmann::json({1, 3, 22, 256, 256}) ||
+      manifest.at("fixture").at("decoded_audio_shape") !=
+          nlohmann::json({1, 2, 6400})) {
+    fail("fixture");
+  }
+  if (manifest.at("artifact").value("path", "") !=
+          golden_path.filename().string() ||
+      manifest.at("artifact").value("sha256", "") !=
+          "b08e67294163f9e9ee1a7c3fb52fb66ef9baaeecf5ef9eb5f6bc9252826b9dd7" ||
+      h3_file_sha256(golden_path) !=
+          "b08e67294163f9e9ee1a7c3fb52fb66ef9baaeecf5ef9eb5f6bc9252826b9dd7") {
+    fail("artifact");
+  }
+}
+
+void validate_h3_c7_production_manifests(
+    const std::filesystem::path& prepared_path,
+    const std::filesystem::path& official_path) {
+  const auto load_manifest = [](const std::filesystem::path& path) {
+    JsonReader reader;
+    if (!reader.parse(path.string())) {
+      throw std::invalid_argument("MiniMax-H3 C7 cannot parse `" +
+                                  path.string() + "`");
+    }
+    return reader.data();
+  };
+  const nlohmann::json prepared =
+      load_manifest(prepared_path.parent_path() /
+                    "minimax_h3_ref2va_production_prepared.json");
+  const nlohmann::json official =
+      load_manifest(official_path.parent_path() /
+                    "minimax_h3_ref2va_production_official_hf_full.json");
+  const auto fail = [](const std::string& field) {
+    throw std::invalid_argument(
+        "MiniMax-H3 C7 production manifest failed attestation at `" + field +
+        "`");
+  };
+  if (prepared.value("schema", "") !=
+          "xllm.minimax_h3.ref2va_production_prepared/v1" ||
+      prepared.value("status", "") != "C7_PRODUCTION_PREPARED" ||
+      prepared.at("artifact").value("path", "") !=
+          prepared_path.filename().string() ||
+      prepared.at("artifact").value("sha256", "") !=
+          "8bdb0ffe3a091bafb16ec09c7f176830d1797ba46d2ca48f53c708ce92277bea" ||
+      h3_file_sha256(prepared_path) !=
+          "8bdb0ffe3a091bafb16ec09c7f176830d1797ba46d2ca48f53c708ce92277bea") {
+    fail("prepared");
+  }
+  const auto& backends = prepared.at("condition_backends");
+  if (backends.at("official_hf").value("hidden_sha256", "") !=
+          "c6c68cc020b976843aafde9b115eb50a84bea89d16bd8ee7fba70a2ef249a1b5" ||
+      backends.at("xllm_native").value("hidden_sha256", "") !=
+          "c6c68cc020b976843aafde9b115eb50a84bea89d16bd8ee7fba70a2ef249a1b5" ||
+      prepared.at("geometry").at("row_counts").value("used", 0) != 60132 ||
+      prepared.at("geometry").at("row_counts").value("aligned", 0) != 60160) {
+    fail("prepared.condition_and_geometry");
+  }
+  if (official.value("schema", "") !=
+          "xllm.minimax_h3.ref2va_production_execution/v1" ||
+      official.value("status", "") != "C7_49_FORWARD_REFERENCE_COMPLETE" ||
+      official.value("condition_backend", "") != "official_hf" ||
+      official.at("artifact").value("path", "") !=
+          official_path.filename().string() ||
+      official.at("artifact").value("sha256", "") !=
+          "459248e62ed7c49899d7ceda6f7d7b8ec4fa8eca6f477f86eaa148aae36d7e93" ||
+      h3_file_sha256(official_path) !=
+          "459248e62ed7c49899d7ceda6f7d7b8ec4fa8eca6f477f86eaa148aae36d7e93") {
+    fail("official");
+  }
+  if (official.at("prepared").value("artifact_sha256", "") !=
+          prepared.at("artifact").value("sha256", "") ||
+      official.at("execution").value("transformer_forwards", 0) != 49 ||
+      official.at("execution").value("transformer_block_forwards", 0) != 2450 ||
+      official.at("media").value("sha256", "") !=
+          "4e61b5b5b1e12a81a7b5752a1e5c149fbd4eb7a5528edbb5311c8c0cdf656398") {
+    fail("official.execution");
   }
 }
 
@@ -2727,10 +2886,322 @@ TEST(MiniMaxH3C6bTargetTest, DecodesProductionAudioGeometryWithRealWeights) {
   std::cout << "H3_C6B_TARGET_GEOMETRY=PASS" << std::endl;
 }
 
+TEST(MiniMaxH3C7ContractTest, RejectsUnknownConditionBackend) {
+  expect_invalid_argument_contains(
+      [] {
+        (void)minimax_h3_ref2va_source_backend_name(
+            static_cast<MiniMaxH3Ref2VASourceBackend>(7));
+      },
+      "source backend is unsupported");
+}
+
+TEST(MiniMaxH3C7GoldenTest, RunsTypedImageAudioRef2VAEndToEnd) {
+  const char* golden_value = std::getenv("MINIMAX_H3_REF2VA_E2E_GOLDEN");
+  const char* checkpoint_value = std::getenv("MINIMAX_H3_CHECKPOINT");
+  if (golden_value == nullptr || std::string(golden_value).empty() ||
+      checkpoint_value == nullptr || std::string(checkpoint_value).empty()) {
+    GTEST_SKIP() << "Set MINIMAX_H3_REF2VA_E2E_GOLDEN and "
+                    "MINIMAX_H3_CHECKPOINT for the real NPU C7 Gate";
+  }
+  std::filesystem::path golden_path(golden_value);
+  if (std::filesystem::is_directory(golden_path)) {
+    golden_path /= "minimax_h3_ref2va_e2e_reference.safetensors";
+  }
+  validate_h3_c7_golden_manifest(golden_path);
+  const std::unique_ptr<StateDict> golden =
+      StateDictFromSafeTensor::load(golden_path.string());
+  ASSERT_NE(golden, nullptr);
+
+  auto loader = std::make_unique<DiTModelLoader>(checkpoint_value);
+  const torch::Device device("npu:0");
+  DiTModelContext context(
+      ParallelArgs(0, 1, nullptr),
+      loader->get_model_args(),
+      loader->get_quant_args(),
+      torch::TensorOptions().device(device).dtype(torch::kBFloat16),
+      DiTCacheConfig(),
+      loader->get_model_type());
+  MiniMaxH3Pipeline pipeline(context);
+  pipeline->load_model(std::move(loader));
+  pipeline->load_c7_eager();
+
+  const auto input_tensor = [&golden, &device](const std::string& name) {
+    return golden->get_tensor(name).to(device).contiguous();
+  };
+  MiniMaxH3Ref2VAEagerInput input{
+      .condition =
+          {
+              .schema = std::string(kMiniMaxH3ConditionSchemaV1),
+              .source_backend = MiniMaxH3Ref2VASourceBackend::OFFICIAL_HF,
+              .hidden = input_tensor("input.condition_hidden"),
+              .token_tags = input_tensor("input.condition_tags"),
+          },
+      .references =
+          {
+              {
+                  .kind = H3ReferenceBlockKind::IMAGE,
+                  .normalized_visual_latent =
+                      input_tensor("input.visual_reference_normalized"),
+                  .visual_anchor_noise =
+                      input_tensor("input.visual_reference_noise"),
+              },
+              {
+                  .kind = H3ReferenceBlockKind::AUDIO,
+                  .normalized_audio_latent =
+                      input_tensor("input.audio_reference_normalized"),
+              },
+          },
+      .target =
+          {
+              .initial_normalized_video_latent =
+                  input_tensor("input.target_video_initial_normalized"),
+              .initial_normalized_audio_latent =
+                  input_tensor("input.target_audio_initial_normalized"),
+          },
+  };
+  torch::NoGradGuard no_grad;
+  const MiniMaxH3Ref2VAEagerOutput output = pipeline->run_c7_eager(input);
+
+  EXPECT_EQ(output.condition_schema, kMiniMaxH3ConditionSchemaV1);
+  EXPECT_EQ(output.source_backend, MiniMaxH3Ref2VASourceBackend::OFFICIAL_HF);
+  EXPECT_EQ(output.layout.used_length, 539);
+  EXPECT_EQ(output.layout.aligned_length, 576);
+  expect_golden_tensor(*golden,
+                       "layout.position_ids",
+                       output.layout.position_ids.slice(0, 0, 539),
+                       /*allow_one_ulp=*/true);
+  expect_golden_tensor(
+      *golden, "layout.token_tags", output.layout.token_tags.slice(0, 0, 539));
+  expect_golden_tensor(*golden, "layout.video_indices", output.layout.img_pos);
+  expect_golden_tensor(
+      *golden, "layout.audio_indices", output.layout.audio_pos);
+  expect_golden_tensor(*golden, "layout.text_indices", output.layout.text_pos);
+  expect_golden_tensor(*golden,
+                       "initial.video_compact_rows",
+                       output.initial_compact_rows.video_rows.to(torch::kCPU));
+  expect_golden_tensor(*golden,
+                       "initial.audio_compact_rows",
+                       output.initial_compact_rows.audio_rows.to(torch::kCPU));
+  expect_golden_tensor(*golden,
+                       "trajectory.forward_049.video_rows",
+                       output.final_compact_rows.video_rows.to(torch::kCPU));
+  expect_golden_tensor(*golden,
+                       "trajectory.forward_049.audio_rows",
+                       output.final_compact_rows.audio_rows.to(torch::kCPU));
+  expect_golden_tensor(*golden,
+                       "final.target_video_latent",
+                       output.final_normalized_video_latent.to(torch::kCPU));
+  expect_golden_tensor(*golden,
+                       "final.target_audio_latent",
+                       output.final_normalized_audio_latent.to(torch::kCPU));
+
+  const H3ComparisonMetrics video_metrics =
+      h3_comparison_metrics(output.video, golden->get_tensor("decoded.video"));
+  const H3ComparisonMetrics audio_metrics =
+      h3_comparison_metrics(output.audio, golden->get_tensor("decoded.audio"));
+  std::cout << "H3-C7 video relative_l2=" << video_metrics.relative_l2
+            << " cosine=" << video_metrics.cosine
+            << " max_abs=" << video_metrics.max_abs << std::endl;
+  std::cout << "H3-C7 audio relative_l2=" << audio_metrics.relative_l2
+            << " cosine=" << audio_metrics.cosine
+            << " max_abs=" << audio_metrics.max_abs << std::endl;
+  EXPECT_LE(video_metrics.relative_l2, 0.001);
+  EXPECT_GE(video_metrics.cosine, 0.999999);
+  EXPECT_LE(audio_metrics.relative_l2, 0.001);
+  EXPECT_GE(audio_metrics.cosine, 0.999999);
+  EXPECT_LE(audio_metrics.max_abs, 0.002);
+  EXPECT_EQ(output.video.sizes().vec(),
+            (std::vector<int64_t>{1, 3, 22, 256, 256}));
+  EXPECT_EQ(output.audio.sizes().vec(), (std::vector<int64_t>{1, 2, 6400}));
+  EXPECT_EQ(output.geometry.video_frames, 22);
+  EXPECT_EQ(output.geometry.video_height, 256);
+  EXPECT_EQ(output.geometry.video_width, 256);
+  EXPECT_EQ(output.geometry.video_fps, 24);
+  EXPECT_EQ(output.geometry.audio_samples, 6400);
+  EXPECT_EQ(output.geometry.audio_sample_rate, 32000);
+  EXPECT_EQ(output.counters.reference_blocks, 2);
+  EXPECT_EQ(output.counters.visual_references, 1);
+  EXPECT_EQ(output.counters.audio_references, 1);
+  EXPECT_EQ(output.counters.transformer_forwards, 49);
+  EXPECT_EQ(output.counters.block_forwards, 2450);
+  EXPECT_EQ(output.counters.video_vae_decodes, 1);
+  EXPECT_EQ(output.counters.audio_vae_decodes, 1);
+  torch::npu::synchronize();
+  ASSERT_FALSE(HasFailure());
+  std::cout << "H3_C7_TYPED_EAGER_COMPOSITE=PASS" << std::endl;
+}
+
+TEST(MiniMaxH3C7ProductionTest, AttestsPinnedProductionArtifacts) {
+  const char* prepared_value =
+      std::getenv("MINIMAX_H3_REF2VA_PRODUCTION_PREPARED");
+  const char* official_value =
+      std::getenv("MINIMAX_H3_REF2VA_PRODUCTION_OFFICIAL");
+  if (prepared_value == nullptr || std::string(prepared_value).empty() ||
+      official_value == nullptr || std::string(official_value).empty()) {
+    GTEST_SKIP() << "Set the C7 prepared and Official production paths";
+  }
+  std::filesystem::path prepared_path(prepared_value);
+  if (std::filesystem::is_directory(prepared_path)) {
+    prepared_path /= "minimax_h3_ref2va_production_prepared.safetensors";
+  }
+  std::filesystem::path official_path(official_value);
+  if (std::filesystem::is_directory(official_path)) {
+    official_path /=
+        "minimax_h3_ref2va_production_official_hf_full.safetensors";
+  }
+  EXPECT_NO_THROW(
+      validate_h3_c7_production_manifests(prepared_path, official_path));
+}
+
+TEST(MiniMaxH3C7ProductionTest, MatchesOfficialFullResolutionRef2VA) {
+  const char* prepared_value =
+      std::getenv("MINIMAX_H3_REF2VA_PRODUCTION_PREPARED");
+  const char* official_value =
+      std::getenv("MINIMAX_H3_REF2VA_PRODUCTION_OFFICIAL");
+  const char* checkpoint_value = std::getenv("MINIMAX_H3_CHECKPOINT");
+  if (prepared_value == nullptr || std::string(prepared_value).empty() ||
+      official_value == nullptr || std::string(official_value).empty() ||
+      checkpoint_value == nullptr || std::string(checkpoint_value).empty()) {
+    GTEST_SKIP() << "Set the C7 prepared, Official production, and checkpoint "
+                    "paths for the real NPU production Gate";
+  }
+  std::filesystem::path prepared_path(prepared_value);
+  if (std::filesystem::is_directory(prepared_path)) {
+    prepared_path /= "minimax_h3_ref2va_production_prepared.safetensors";
+  }
+  std::filesystem::path official_path(official_value);
+  if (std::filesystem::is_directory(official_path)) {
+    official_path /=
+        "minimax_h3_ref2va_production_official_hf_full.safetensors";
+  }
+  validate_h3_c7_production_manifests(prepared_path, official_path);
+  const std::unique_ptr<StateDict> prepared =
+      StateDictFromSafeTensor::load(prepared_path.string());
+  const std::unique_ptr<StateDict> official =
+      StateDictFromSafeTensor::load(official_path.string());
+  ASSERT_NE(prepared, nullptr);
+  ASSERT_NE(official, nullptr);
+
+  auto loader = std::make_unique<DiTModelLoader>(checkpoint_value);
+  const torch::Device device("npu:0");
+  DiTModelContext context(
+      ParallelArgs(0, 1, nullptr),
+      loader->get_model_args(),
+      loader->get_quant_args(),
+      torch::TensorOptions().device(device).dtype(torch::kBFloat16),
+      DiTCacheConfig(),
+      loader->get_model_type());
+  MiniMaxH3Pipeline pipeline(context);
+  pipeline->load_model(std::move(loader));
+  pipeline->load_c7_eager();
+
+  const auto input_tensor = [&prepared, &device](const std::string& name) {
+    return prepared->get_tensor(name).to(device).contiguous();
+  };
+  MiniMaxH3Ref2VAEagerInput input{
+      .condition =
+          {
+              .schema = std::string(kMiniMaxH3ConditionSchemaV1),
+              .source_backend = MiniMaxH3Ref2VASourceBackend::OFFICIAL_HF,
+              .hidden =
+                  input_tensor("condition.official_hf.hidden").unsqueeze(0),
+              .token_tags =
+                  input_tensor("condition.text_token_tags").unsqueeze(0),
+          },
+      .references =
+          {
+              {
+                  .kind = H3ReferenceBlockKind::IMAGE,
+                  .normalized_visual_latent =
+                      input_tensor("input.visual_latent_normalized"),
+                  .visual_anchor_noise =
+                      input_tensor("input.visual_anchor_noise"),
+              },
+          },
+      .target =
+          {
+              .initial_normalized_video_latent =
+                  input_tensor("input.target_video_initial"),
+              .initial_normalized_audio_latent =
+                  input_tensor("input.target_audio_initial_latent"),
+          },
+      .sequence_length = 60160,
+  };
+  torch::NoGradGuard no_grad;
+  const MiniMaxH3Ref2VAEagerOutput output = pipeline->run_c7_eager(input);
+
+  EXPECT_EQ(output.layout.used_length, 60132);
+  EXPECT_EQ(output.layout.aligned_length, 60160);
+  expect_golden_tensor(*prepared,
+                       "layout.position_ids",
+                       output.layout.position_ids.slice(0, 0, 60132),
+                       /*allow_one_ulp=*/true);
+  expect_golden_tensor(*prepared,
+                       "layout.token_tags",
+                       output.layout.token_tags.slice(0, 0, 60132));
+  expect_golden_tensor(
+      *prepared, "layout.video_indices", output.layout.img_pos);
+  expect_golden_tensor(
+      *prepared, "layout.audio_indices", output.layout.audio_pos);
+  expect_golden_tensor(
+      *prepared, "layout.text_indices", output.layout.text_pos);
+  expect_golden_tensor(*prepared,
+                       "initial.video_rows",
+                       output.initial_compact_rows.video_rows.to(torch::kCPU));
+  expect_golden_tensor(*prepared,
+                       "initial.audio_rows",
+                       output.initial_compact_rows.audio_rows.to(torch::kCPU));
+  expect_golden_tensor(*official,
+                       "trajectory.forward_049.video_rows",
+                       output.final_compact_rows.video_rows.to(torch::kCPU));
+  expect_golden_tensor(*official,
+                       "trajectory.forward_049.audio_rows",
+                       output.final_compact_rows.audio_rows.to(torch::kCPU));
+  expect_golden_tensor(*official,
+                       "final.target_video_latent",
+                       output.final_normalized_video_latent.to(torch::kCPU));
+  expect_golden_tensor(*official,
+                       "final.target_audio_latent",
+                       output.final_normalized_audio_latent.to(torch::kCPU));
+
+  const torch::Tensor official_video =
+      official->get_tensor("decoded.video_uint8").to(torch::kFloat32) / 255.0;
+  const torch::Tensor official_audio =
+      official->get_tensor("decoded.audio_float32");
+  const H3ComparisonMetrics video_metrics =
+      h3_comparison_metrics(output.video, official_video);
+  const H3ComparisonMetrics audio_metrics =
+      h3_comparison_metrics(output.audio, official_audio);
+  std::cout << "H3-C7 production video relative_l2="
+            << video_metrics.relative_l2 << " cosine=" << video_metrics.cosine
+            << " max_abs=" << video_metrics.max_abs << std::endl;
+  std::cout << "H3-C7 production audio relative_l2="
+            << audio_metrics.relative_l2 << " cosine=" << audio_metrics.cosine
+            << " max_abs=" << audio_metrics.max_abs << std::endl;
+  EXPECT_LE(video_metrics.relative_l2, 0.005);
+  EXPECT_GE(video_metrics.cosine, 0.99999);
+  EXPECT_LE(audio_metrics.relative_l2, 0.001);
+  EXPECT_GE(audio_metrics.cosine, 0.999999);
+  EXPECT_LE(audio_metrics.max_abs, 0.002);
+  EXPECT_EQ(output.video.sizes().vec(),
+            (std::vector<int64_t>{1, 3, 124, 768, 1344}));
+  EXPECT_EQ(output.audio.sizes().vec(), (std::vector<int64_t>{1, 2, 165600}));
+  EXPECT_EQ(output.geometry.video_frames, 124);
+  EXPECT_EQ(output.geometry.video_height, 768);
+  EXPECT_EQ(output.geometry.video_width, 1344);
+  EXPECT_EQ(output.geometry.audio_samples, 165600);
+  EXPECT_EQ(output.counters.transformer_forwards, 49);
+  EXPECT_EQ(output.counters.block_forwards, 2450);
+  torch::npu::synchronize();
+  ASSERT_FALSE(HasFailure());
+  std::cout << "H3_C7_PRODUCTION_TYPED_EAGER=PASS" << std::endl;
+  std::cout << "G8_REF2VA_E2E=PASS" << std::endl;
+}
+
 TEST(MiniMaxH3PipelineTest, ForwardFailsInsteadOfReturningFakeMedia) {
   try {
     MiniMaxH3PipelineImpl::throw_forward_unavailable();
-    FAIL() << "Expected H3-C6b forward failure";
+    FAIL() << "Expected H3-C7 public forward failure";
   } catch (const std::logic_error& error) {
     EXPECT_NE(std::string(error.what()).find("no production Ref2VA"),
               std::string::npos);
