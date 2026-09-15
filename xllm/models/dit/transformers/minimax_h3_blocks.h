@@ -775,6 +775,12 @@ class MiniMaxH3DiTBlockImpl final : public torch::nn::Module {
 };
 TORCH_MODULE(MiniMaxH3DiTBlock);
 
+struct MiniMaxH3TPAttentionQKV {
+  torch::Tensor query;
+  torch::Tensor key;
+  torch::Tensor value;
+};
+
 class MiniMaxH3TPAttentionImpl final : public torch::nn::Module {
  public:
   MiniMaxH3TPAttentionImpl(const MiniMaxH3C4Config& config,
@@ -854,6 +860,13 @@ class MiniMaxH3TPAttentionImpl final : public torch::nn::Module {
       const torch::Tensor& input,
       const std::optional<torch::Tensor>& rope_frequencies,
       const torch::Tensor& cu_seqlens) {
+    MiniMaxH3TPAttentionQKV qkv = project_local_qkv(input, rope_frequencies);
+    return minimax_h3_segmented_sdpa(qkv.query, qkv.key, qkv.value, cu_seqlens);
+  }
+
+  MiniMaxH3TPAttentionQKV project_local_qkv(
+      const torch::Tensor& input,
+      const std::optional<torch::Tensor>& rope_frequencies) {
     verify_loaded_weights();
     if (!input.defined() || input.dim() != 2 ||
         input.scalar_type() != torch::kBFloat16) {
@@ -868,12 +881,15 @@ class MiniMaxH3TPAttentionImpl final : public torch::nn::Module {
         q_norm_->forward(qkv[0].view({rows, local_heads_, head_dim_}));
     torch::Tensor key =
         k_norm_->forward(qkv[1].view({rows, local_heads_, head_dim_}));
-    torch::Tensor value = qkv[2].view({rows, local_heads_, head_dim_});
+    torch::Tensor value =
+        qkv[2].view({rows, local_heads_, head_dim_}).contiguous();
     if (rope_frequencies.has_value()) {
       query = minimax_h3_apply_rope(query, *rope_frequencies);
       key = minimax_h3_apply_rope(key, *rope_frequencies);
     }
-    return minimax_h3_segmented_sdpa(query, key, value, cu_seqlens);
+    return {.query = std::move(query),
+            .key = std::move(key),
+            .value = std::move(value)};
   }
 
   torch::Tensor project_local_output(const torch::Tensor& local_heads) {

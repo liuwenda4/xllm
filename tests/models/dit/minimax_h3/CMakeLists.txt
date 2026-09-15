@@ -26,4 +26,20 @@ if(USE_NPU)
       glog::glog
       GTest::gtest_main
   )
+
+  cc_test(
+    NAME
+      minimax_h3_tp_uaa_test
+    SRCS
+      minimax_h3_tp_uaa_test.cpp
+    DEPS
+      :model_loader
+      :parallel_state
+      state_dict
+      torch
+      glog::glog
+      GTest::gtest_main
+    COPTS
+      -DXLLM_MINIMAX_H3_DISABLE_REGISTRATION
+  )
 endif()
