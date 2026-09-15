@@ -35,9 +35,12 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "framework/parallel_state/parallel_state.h"
+#include "framework/parallel_state/process_group.h"
 #include "framework/state_dict/state_dict.h"
 #include "models/dit/pipelines/pipeline_minimax_h3.h"
 #include "models/dit/schedulers/minimax_h3_scheduler.h"
+#include "platform/device.h"
 
 namespace xllm {
 namespace {
@@ -1560,6 +1563,172 @@ TEST(MiniMaxH3BlockHelpersTest, ReordersGateUpRowsToOfficialUpGateLayout) {
   EXPECT_TRUE(torch::equal(actual, expected));
 }
 
+TEST(MiniMaxH3TPBlockHelpersTest, ShardsCompleteGroupedHeadsBeforeQKVReorder) {
+  const torch::Tensor grouped =
+      torch::arange(24, torch::kBFloat16).view({24, 1});
+  const torch::Tensor rank0 = minimax_h3_tp_shard_grouped_qkv(
+      grouped, /*tp_rank=*/0, /*tp_size=*/2, /*num_heads=*/4, /*head_dim=*/2);
+  const torch::Tensor rank1 = minimax_h3_tp_shard_grouped_qkv(
+      grouped, /*tp_rank=*/1, /*tp_size=*/2, /*num_heads=*/4, /*head_dim=*/2);
+  EXPECT_TRUE(torch::equal(
+      rank0,
+      torch::tensor({0, 1, 6, 7, 2, 3, 8, 9, 4, 5, 10, 11}, torch::kBFloat16)
+          .view({12, 1})));
+  EXPECT_TRUE(torch::equal(
+      rank1,
+      torch::tensor({12, 13, 18, 19, 14, 15, 20, 21, 16, 17, 22, 23},
+                    torch::kBFloat16)
+          .view({12, 1})));
+  expect_invalid_argument_contains(
+      [&grouped] {
+        minimax_h3_tp_shard_grouped_qkv(grouped,
+                                        /*tp_rank=*/2,
+                                        /*tp_size=*/2,
+                                        /*num_heads=*/4,
+                                        /*head_dim=*/2);
+      },
+      "incompatible geometry");
+}
+
+TEST(MiniMaxH3TPBlockHelpersTest, ShardsGateAndUpIndependentlyThenUsesUpGate) {
+  const torch::Tensor gate_up =
+      torch::arange(12, torch::kBFloat16).view({12, 1});
+  EXPECT_TRUE(torch::equal(
+      minimax_h3_tp_shard_gate_up(gate_up, /*tp_rank=*/0, /*tp_size=*/2),
+      torch::tensor({6, 7, 8, 0, 1, 2}, torch::kBFloat16).view({6, 1})));
+  EXPECT_TRUE(torch::equal(
+      minimax_h3_tp_shard_gate_up(gate_up, /*tp_rank=*/1, /*tp_size=*/2),
+      torch::tensor({9, 10, 11, 3, 4, 5}, torch::kBFloat16).view({6, 1})));
+}
+
+MiniMaxH3C4Config small_tp_block_config() {
+  MiniMaxH3C4Config config;
+  config.hidden_size = 4;
+  config.num_attention_heads = 4;
+  config.attention_head_dim = 2;
+  config.ffn_hidden_size = 6;
+  config.time_embed_dim = 2;
+  config.norm_eps = 1e-5;
+  config.qk_norm_eps = 1e-5;
+  return config;
+}
+
+StateDict small_tp_block_source() {
+  const torch::TensorOptions bf16 =
+      torch::TensorOptions().dtype(torch::kBFloat16);
+  const auto values = [&bf16](const std::vector<int64_t>& shape,
+                              int64_t start) {
+    int64_t count = 1;
+    for (const int64_t size : shape) {
+      count *= size;
+    }
+    return (torch::arange(count, torch::kFloat32) + start)
+        .to(torch::kBFloat16)
+        .view(shape);
+  };
+  return StateDict({
+      {"norm1.weight", values({4}, 10)},
+      {"norm2.weight", values({4}, 20)},
+      {"attn.q_norm.weight", values({2}, 30)},
+      {"attn.k_norm.weight", values({2}, 40)},
+      {"attn.qkv_proj.weight", values({24, 4}, 50)},
+      {"attn.out_proj.weight", values({4, 8}, 200)},
+      {"mlp.fc1.weight", values({12, 4}, 300)},
+      {"mlp.fc2.weight", values({4, 6}, 400)},
+      {"adaln_proj.linear.weight", values({72, 2}, 500)},
+      {"adaln_proj.linear.bias", values({72}, 700)},
+  });
+}
+
+TEST(MiniMaxH3TPBlockHelpersTest, LoadsEveryTP2ShardWithExactRuntimeLayout) {
+  const MiniMaxH3C4Config config = small_tp_block_config();
+  const StateDict source = small_tp_block_source();
+  const torch::Tensor grouped_qkv = source.get_tensor("attn.qkv_proj.weight");
+  const torch::Tensor gate_up = source.get_tensor("mlp.fc1.weight");
+  for (int64_t rank = 0; rank < 2; ++rank) {
+    ProcessGroup group(static_cast<int32_t>(rank),
+                       /*world_size=*/2,
+                       torch::Device(torch::kCPU));
+    MiniMaxH3TPDiTBlock block(
+        config, &group, torch::TensorOptions().dtype(torch::kBFloat16));
+    block->load_state_dict(source);
+    block->verify_loaded_weights();
+
+    EXPECT_EQ(block->attention()->local_heads(), 2);
+    EXPECT_TRUE(torch::equal(block->attention()->qkv_weight(),
+                             minimax_h3_tp_shard_grouped_qkv(grouped_qkv,
+                                                             rank,
+                                                             /*tp_size=*/2,
+                                                             /*num_heads=*/4,
+                                                             /*head_dim=*/2)));
+    EXPECT_TRUE(torch::equal(block->attention()->out_weight(),
+                             source.get_tensor("attn.out_proj.weight")
+                                 .slice(
+                                     /*dim=*/1, rank * 4, (rank + 1) * 4)));
+    EXPECT_TRUE(torch::equal(
+        block->mlp()->fc1_weight(),
+        minimax_h3_tp_shard_gate_up(gate_up, rank, /*tp_size=*/2)));
+    EXPECT_TRUE(torch::equal(block->mlp()->fc2_weight(),
+                             source.get_tensor("mlp.fc2.weight")
+                                 .slice(
+                                     /*dim=*/1, rank * 3, (rank + 1) * 3)));
+    EXPECT_TRUE(
+        torch::equal(block->adaln_projection()->weight(),
+                     source.get_tensor("adaln_proj.linear.weight")
+                         .slice(/*dim=*/0, rank * 36, (rank + 1) * 36)));
+    ASSERT_TRUE(block->adaln_projection()->bias().has_value());
+    EXPECT_TRUE(
+        torch::equal(block->adaln_projection()->bias().value(),
+                     source.get_tensor("adaln_proj.linear.bias")
+                         .slice(/*dim=*/0, rank * 36, (rank + 1) * 36)));
+    EXPECT_TRUE(
+        torch::equal(block->norm1_weight(), source.get_tensor("norm1.weight")));
+    EXPECT_TRUE(
+        torch::equal(block->norm2_weight(), source.get_tensor("norm2.weight")));
+    EXPECT_TRUE(torch::equal(block->attention()->q_norm_weight(),
+                             source.get_tensor("attn.q_norm.weight")));
+    EXPECT_TRUE(torch::equal(block->attention()->k_norm_weight(),
+                             source.get_tensor("attn.k_norm.weight")));
+  }
+  std::unordered_map<std::string, torch::Tensor> missing_bias;
+  for (const auto& [name, value] : source) {
+    if (name != "adaln_proj.linear.bias") {
+      missing_bias.emplace(name, value);
+    }
+  }
+  ProcessGroup group(/*rank=*/0,
+                     /*world_size=*/2,
+                     torch::Device(torch::kCPU));
+  MiniMaxH3TPDiTBlock incomplete(
+      config, &group, torch::TensorOptions().dtype(torch::kBFloat16));
+  StateDict incomplete_state(std::move(missing_bias));
+  expect_invalid_argument_contains(
+      [&incomplete, &incomplete_state] {
+        incomplete->load_state_dict(incomplete_state);
+      },
+      "AdaLN checkpoint weight/bias metadata mismatch");
+  std::cout << "H3_TP2_SHARD_LAYOUT=PASS" << std::endl;
+}
+
+TEST(MiniMaxH3TPBlockHelpersTest, FP32RowReductionMatchesDenseCPUOracle) {
+  const torch::Tensor input =
+      (torch::arange(24, torch::kFloat32).view({3, 8}) / 32.0)
+          .to(torch::kBFloat16);
+  const torch::Tensor weight =
+      ((torch::arange(32, torch::kFloat32).view({4, 8}) - 16.0) / 64.0)
+          .to(torch::kBFloat16);
+  const torch::Tensor dense = torch::nn::functional::linear(
+      input.to(torch::kFloat32), weight.to(torch::kFloat32));
+  torch::Tensor reduced = torch::zeros_like(dense);
+  for (int64_t rank = 0; rank < 2; ++rank) {
+    reduced += torch::nn::functional::linear(
+        input.slice(/*dim=*/1, rank * 4, (rank + 1) * 4).to(torch::kFloat32),
+        weight.slice(/*dim=*/1, rank * 4, (rank + 1) * 4).to(torch::kFloat32));
+  }
+  EXPECT_TRUE(torch::allclose(reduced, dense, 1e-6, 1e-6));
+  std::cout << "H3_TP2_U1_CPU_ORACLE=PASS" << std::endl;
+}
+
 TEST(MiniMaxH3BlockHelpersTest, RMSNormAccumulatesInFP32AndReturnsBF16) {
   const torch::Tensor input =
       torch::tensor({{1.0, 2.0, 3.0, 4.0}}, torch::kBFloat16);
@@ -2143,6 +2312,307 @@ TEST(MiniMaxH3BlockGoldenTest, MatchesOfficialUsedRowsAndIsolatesPadding) {
       torch::equal(used_rows(trace.block0.output), used_rows(changed.output)))
       << "Changing [used,aligned) padding affected a real packed row";
   std::cout << "G5_SINGLE_DIT_BLOCK=PASS" << std::endl;
+}
+
+TEST(MiniMaxH3TP2U1HcclTest, MatchesDenseC4BlockZero) {
+  const char* enabled = std::getenv("MINIMAX_H3_TP2_HCCL");
+  const char* golden_value = std::getenv("MINIMAX_H3_BLOCK_GOLDEN");
+  const char* checkpoint_value = std::getenv("MINIMAX_H3_CHECKPOINT");
+  const char* rank_value = std::getenv("RANK");
+  const char* local_rank_value = std::getenv("LOCAL_RANK");
+  const char* world_size_value = std::getenv("WORLD_SIZE");
+  const char* port_value = std::getenv("MINIMAX_H3_HCCL_PORT");
+  if (enabled == nullptr || std::string(enabled) != "1") {
+    GTEST_SKIP() << "Set MINIMAX_H3_TP2_HCCL=1 under a two-rank launcher";
+  }
+  ASSERT_NE(golden_value, nullptr);
+  ASSERT_NE(checkpoint_value, nullptr);
+  ASSERT_NE(rank_value, nullptr);
+  ASSERT_NE(local_rank_value, nullptr);
+  ASSERT_NE(world_size_value, nullptr);
+  ASSERT_NE(port_value, nullptr);
+  const int32_t rank = std::stoi(rank_value);
+  const int32_t local_rank = std::stoi(local_rank_value);
+  const int32_t world_size = std::stoi(world_size_value);
+  const int32_t port = std::stoi(port_value);
+  ASSERT_EQ(world_size, 2);
+  ASSERT_GE(rank, 0);
+  ASSERT_LT(rank, world_size);
+  ASSERT_GE(local_rank, 0);
+  ASSERT_LT(local_rank, world_size);
+
+  Device rank_device(local_rank);
+  rank_device.set_device();
+  const torch::Device device = rank_device.unwrap();
+  auto tp_group = create_process_group(rank,
+                                       world_size,
+                                       world_size,
+                                       port,
+                                       /*trans=*/false,
+                                       "127.0.0.1",
+                                       "minimax_h3_tp2_u1",
+                                       device);
+  ASSERT_NE(tp_group, nullptr);
+  torch::Tensor collective_probe =
+      torch::full({1},
+                  rank + 1,
+                  torch::TensorOptions().dtype(torch::kInt32).device(device));
+  tp_group->allreduce(collective_probe);
+  ASSERT_EQ(collective_probe.item<int32_t>(), 3);
+  const torch::Tensor gathered_probe = parallel_state::gather(
+      torch::full({1, 2},
+                  rank + 1,
+                  torch::TensorOptions().dtype(torch::kInt32).device(device)),
+      tp_group.get(),
+      /*dim=*/-1);
+  ASSERT_TRUE(torch::equal(gathered_probe.to(torch::kCPU),
+                           torch::tensor({{1, 1, 2, 2}}, torch::kInt32)));
+
+  std::filesystem::path golden_path(golden_value);
+  if (std::filesystem::is_directory(golden_path)) {
+    golden_path /= "minimax_h3_block_reference.safetensors";
+  }
+  const std::unique_ptr<StateDict> golden =
+      StateDictFromSafeTensor::load(golden_path.string());
+  ASSERT_NE(golden, nullptr);
+
+  auto dense_loader = std::make_unique<DiTModelLoader>(checkpoint_value);
+  DiTModelContext dense_context(
+      ParallelArgs(0, 1, nullptr),
+      dense_loader->get_model_args(),
+      dense_loader->get_quant_args(),
+      torch::TensorOptions().device(device).dtype(torch::kBFloat16),
+      DiTCacheConfig(),
+      dense_loader->get_model_type());
+  MiniMaxH3Pipeline dense_pipeline(dense_context);
+  dense_pipeline->load_model(std::move(dense_loader));
+  dense_pipeline->load_c4_probe();
+
+  const H3PackedLayout layout = h3_layout({h3_image()});
+  torch::NoGradGuard no_grad;
+  const MiniMaxH3C4Trace dense =
+      dense_pipeline->probe_c4(layout,
+                               golden->get_tensor("input.video_rows"),
+                               golden->get_tensor("input.audio_rows"),
+                               golden->get_tensor("input.timesteps"),
+                               golden->get_tensor("input.inverse_indices"));
+
+  auto tp_loader = std::make_unique<DiTModelLoader>(checkpoint_value);
+  ASSERT_TRUE(tp_loader->has_component("transformer"));
+  auto transformer_loader = tp_loader->take_component_loader("transformer");
+  ASSERT_NE(transformer_loader, nullptr);
+  MiniMaxH3TPDiTBlock tp_block(
+      MiniMaxH3C4Config{},
+      tp_group.get(),
+      torch::TensorOptions().device(device).dtype(torch::kBFloat16));
+  tp_block->load_source_weights(transformer_loader->get_state_dicts(),
+                                /*layer_index=*/0);
+  const torch::Tensor dense_adaln_flat =
+      dense.block0.adaln_parameters.flatten(1);
+  const int64_t local_adaln_width = dense_adaln_flat.size(1) / world_size;
+  const torch::Tensor local_adaln =
+      tp_block->adaln_projection()->forward_local(dense.time_embedding);
+  const torch::Tensor expected_local_adaln = dense_adaln_flat.slice(
+      /*dim=*/1, rank * local_adaln_width, (rank + 1) * local_adaln_width);
+  const torch::Tensor gathered_adaln =
+      tp_block->adaln_projection()->forward(dense.time_embedding);
+  const auto& transformer_shards = transformer_loader->get_state_dicts();
+  const auto source_tensor = [&transformer_shards](const std::string& name) {
+    torch::Tensor result;
+    for (const std::unique_ptr<StateDict>& shard : transformer_shards) {
+      const torch::Tensor candidate = shard->get_tensor(name);
+      if (!candidate.defined()) {
+        continue;
+      }
+      if (result.defined()) {
+        throw std::runtime_error("Duplicate TP diagnostic source tensor: " +
+                                 name);
+      }
+      result = candidate;
+    }
+    if (!result.defined()) {
+      throw std::runtime_error("Missing TP diagnostic source tensor: " + name);
+    }
+    return result;
+  };
+  const MiniMaxH3C4Config tp_config;
+  const int64_t inner =
+      tp_config.num_attention_heads * tp_config.attention_head_dim;
+  const int64_t local_heads = tp_config.num_attention_heads / world_size;
+  const int64_t local_inner = inner / world_size;
+  const torch::Tensor full_qkv_weight =
+      minimax_h3_reorder_grouped_qkv(
+          source_tensor("blocks.0.attn.qkv_proj.weight"),
+          tp_config.num_attention_heads,
+          tp_config.attention_head_dim)
+          .to(device);
+  const torch::Tensor q_norm_weight =
+      source_tensor("blocks.0.attn.q_norm.weight").to(device);
+  const torch::Tensor k_norm_weight =
+      source_tensor("blocks.0.attn.k_norm.weight").to(device);
+  minimax_h3_synchronize_weight_load(device);
+  const std::vector<torch::Tensor> full_qkv =
+      torch::nn::functional::linear(dense.block0.attention_input,
+                                    full_qkv_weight)
+          .split({inner, inner, inner}, -1);
+  torch::Tensor full_query = minimax_h3_rms_norm(
+      full_qkv[0].view({dense.block0.attention_input.size(0),
+                        tp_config.num_attention_heads,
+                        tp_config.attention_head_dim}),
+      q_norm_weight,
+      tp_config.qk_norm_eps);
+  torch::Tensor full_key = minimax_h3_rms_norm(
+      full_qkv[1].view({dense.block0.attention_input.size(0),
+                        tp_config.num_attention_heads,
+                        tp_config.attention_head_dim}),
+      k_norm_weight,
+      tp_config.qk_norm_eps);
+  torch::Tensor full_value =
+      full_qkv[2].view({dense.block0.attention_input.size(0),
+                        tp_config.num_attention_heads,
+                        tp_config.attention_head_dim});
+  full_query = minimax_h3_apply_rope(full_query, dense.rope_frequencies);
+  full_key = minimax_h3_apply_rope(full_key, dense.rope_frequencies);
+  const torch::Tensor expected_full_heads = minimax_h3_segmented_sdpa(
+      full_query, full_key, full_value, layout.cu_seqlens);
+  const torch::Tensor expected_local_heads = expected_full_heads.slice(
+      /*dim=*/1, rank * local_heads, (rank + 1) * local_heads);
+  const torch::Tensor actual_local_heads =
+      tp_block->attention()->forward_local_heads(dense.block0.attention_input,
+                                                 dense.rope_frequencies,
+                                                 layout.cu_seqlens);
+  const torch::Tensor actual_local_projection =
+      tp_block->attention()->project_local_output(actual_local_heads);
+  const torch::Tensor local_out_weight =
+      source_tensor("blocks.0.attn.out_proj.weight")
+          .slice(/*dim=*/1, rank * local_inner, (rank + 1) * local_inner)
+          .to(device);
+  minimax_h3_synchronize_weight_load(device);
+  const torch::Tensor expected_local_projection = torch::nn::functional::linear(
+      expected_local_heads.reshape({expected_local_heads.size(0), local_inner}),
+      local_out_weight);
+  const torch::Tensor fp32_local_heads =
+      actual_local_heads.reshape({actual_local_heads.size(0), local_inner})
+          .to(torch::kFloat32);
+  const torch::Tensor fp32_local_out_weight =
+      local_out_weight.to(torch::kFloat32);
+  minimax_h3_synchronize_weight_load(device);
+  torch::Tensor fp32_attention_output =
+      torch::nn::functional::linear(fp32_local_heads, fp32_local_out_weight);
+  fp32_attention_output =
+      parallel_state::reduce(fp32_attention_output, tp_group.get())
+          .to(torch::kBFloat16);
+  const torch::Tensor fp32_attention_delta =
+      dense.block0.gate_msa * fp32_attention_output;
+  const MiniMaxH3ResidualBranchTrace actual =
+      tp_block->forward(dense.packed_hidden,
+                        dense.time_embedding,
+                        dense.combined_indices,
+                        dense.rope_frequencies,
+                        layout.cu_seqlens);
+
+  bool passed = true;
+  const auto compare = [&passed, rank](const std::string& name,
+                                       const torch::Tensor& value,
+                                       const torch::Tensor& expected,
+                                       const H3ComparisonThreshold& threshold) {
+    if (!value.defined() || value.sizes() != expected.sizes() ||
+        value.scalar_type() != expected.scalar_type() ||
+        !torch::isfinite(value).all().item<bool>()) {
+      ADD_FAILURE() << "TP2 node metadata/nonfinite failure: " << name;
+      passed = false;
+      return;
+    }
+    const H3ComparisonMetrics metrics = h3_comparison_metrics(value, expected);
+    std::cout << "H3-C8B rank=" << rank << " node=" << name
+              << " relative_l2=" << metrics.relative_l2
+              << " cosine=" << metrics.cosine << " max_abs=" << metrics.max_abs
+              << std::endl;
+    if (metrics.relative_l2 > threshold.relative_l2 ||
+        metrics.cosine < threshold.minimum_cosine) {
+      ADD_FAILURE() << "TP2 node failed: " << name
+                    << " relative_l2=" << metrics.relative_l2
+                    << " cosine=" << metrics.cosine;
+      passed = false;
+    }
+  };
+  compare("adaln_local_projection",
+          local_adaln,
+          expected_local_adaln,
+          {1e-6, 0.999999999});
+  compare("adaln_gathered_projection",
+          gathered_adaln,
+          dense.block0.adaln_parameters,
+          {1e-6, 0.999999999});
+  compare("attention_local_heads",
+          actual_local_heads,
+          expected_local_heads,
+          {0.0001, 0.99999999});
+  compare("attention_local_projection",
+          actual_local_projection,
+          expected_local_projection,
+          {0.0003, 0.9999999});
+  compare("official_fp32_projection_attention_delta",
+          fp32_attention_delta.slice(0, 0, layout.used_length),
+          golden->get_tensor("block0.attention_delta"),
+          {0.002, 0.999999});
+  compare("adaln_parameters",
+          actual.adaln_parameters,
+          dense.block0.adaln_parameters,
+          {1e-6, 0.999999999});
+  compare("shift_msa",
+          actual.shift_msa,
+          dense.block0.shift_msa,
+          {1e-6, 0.999999999});
+  compare("scale_msa",
+          actual.scale_msa,
+          dense.block0.scale_msa,
+          {1e-6, 0.999999999});
+  compare("norm1_output",
+          actual.norm1_output,
+          dense.block0.norm1_output,
+          {1e-6, 0.999999999});
+  compare("attention_input",
+          actual.attention_input,
+          dense.block0.attention_input,
+          {1e-6, 0.999999999});
+  compare("attention_delta",
+          actual.attention_delta,
+          dense.block0.attention_delta,
+          {0.002, 0.999999});
+  compare("official_attention_delta",
+          actual.attention_delta.slice(0, 0, layout.used_length),
+          golden->get_tensor("block0.attention_delta"),
+          {0.002, 0.999999});
+  compare(
+      "mlp_input", actual.mlp_input, dense.block0.mlp_input, {0.002, 0.999999});
+  compare(
+      "mlp_delta", actual.mlp_delta, dense.block0.mlp_delta, {0.003, 0.999995});
+  compare("official_mlp_delta",
+          actual.mlp_delta.slice(0, 0, layout.used_length),
+          golden->get_tensor("block0.mlp_delta"),
+          {0.003, 0.999995});
+  compare("output", actual.output, dense.block0.output, {0.003, 0.999995});
+  compare("official_output",
+          actual.output.slice(0, 0, layout.used_length),
+          golden->get_tensor("block0.output"),
+          {0.003, 0.999995});
+  const torch::Tensor rank_outputs =
+      tp_group->allgather_base_sync(actual.output.contiguous());
+  if (!torch::equal(rank_outputs[0].to(torch::kCPU),
+                    rank_outputs[1].to(torch::kCPU))) {
+    ADD_FAILURE() << "TP2 replicated block outputs differ across ranks";
+    passed = false;
+  }
+  torch::Tensor failed =
+      torch::tensor({passed ? 0 : 1},
+                    torch::TensorOptions().dtype(torch::kInt32).device(device));
+  tp_group->allreduce(failed);
+  ASSERT_EQ(failed.item<int32_t>(), 0)
+      << "At least one TP2 rank failed the correctness Gate";
+  if (rank == 0) {
+    std::cout << "H3_TP2_U1_HCCL=PASS" << std::endl;
+  }
 }
 
 TEST(MiniMaxH3C5GoldenTest, MatchesOfficialFullBaseTrajectory) {

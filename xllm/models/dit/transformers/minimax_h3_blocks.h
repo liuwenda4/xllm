@@ -29,8 +29,11 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/framework/parallel_state/parallel_state.h"
 #include "core/framework/state_dict/state_dict.h"
+#include "core/layers/common/linear.h"
 #include "models/dit/utils/minimax_h3_packing.h"
+#include "platform/device.h"
 
 namespace xllm {
 
@@ -132,6 +135,76 @@ inline torch::Tensor minimax_h3_reorder_gate_up_to_up_gate(
   }
   const std::vector<torch::Tensor> gate_up = weight.chunk(2, 0);
   return torch::cat({gate_up[1], gate_up[0]}, 0).contiguous();
+}
+
+inline torch::Tensor minimax_h3_tp_shard_grouped_qkv(
+    const torch::Tensor& weight,
+    int64_t tp_rank,
+    int64_t tp_size,
+    int64_t num_heads,
+    int64_t head_dim) {
+  if (!weight.defined() || weight.dim() < 1 || tp_size <= 0 || tp_rank < 0 ||
+      tp_rank >= tp_size || num_heads <= 0 || num_heads % tp_size != 0 ||
+      head_dim <= 0 || weight.size(0) != 3 * num_heads * head_dim) {
+    throw std::invalid_argument(
+        "MiniMax-H3 TP grouped QKV shard has incompatible geometry");
+  }
+  const int64_t local_heads = num_heads / tp_size;
+  std::vector<int64_t> grouped_shape = weight.sizes().vec();
+  grouped_shape[0] = num_heads;
+  grouped_shape.insert(grouped_shape.begin() + 1, 3 * head_dim);
+  torch::Tensor local_grouped =
+      weight.reshape(grouped_shape)
+          .narrow(0, tp_rank * local_heads, local_heads)
+          .contiguous();
+  std::vector<int64_t> local_shape = weight.sizes().vec();
+  local_shape[0] = 3 * local_heads * head_dim;
+  return minimax_h3_reorder_grouped_qkv(
+      local_grouped.reshape(local_shape), local_heads, head_dim);
+}
+
+inline torch::Tensor minimax_h3_tp_shard_gate_up(const torch::Tensor& weight,
+                                                 int64_t tp_rank,
+                                                 int64_t tp_size) {
+  if (!weight.defined() || weight.dim() < 1 || weight.size(0) % 2 != 0 ||
+      tp_size <= 0 || tp_rank < 0 || tp_rank >= tp_size ||
+      (weight.size(0) / 2) % tp_size != 0) {
+    throw std::invalid_argument(
+        "MiniMax-H3 TP gate/up shard has incompatible geometry");
+  }
+  const int64_t full_ffn = weight.size(0) / 2;
+  const int64_t local_ffn = full_ffn / tp_size;
+  const torch::Tensor gate = weight.narrow(0, tp_rank * local_ffn, local_ffn);
+  const torch::Tensor up =
+      weight.narrow(0, full_ffn + tp_rank * local_ffn, local_ffn);
+  return torch::cat({up, gate}, 0).contiguous();
+}
+
+inline void minimax_h3_synchronize_weight_load(const torch::Device& device) {
+  if (device.is_cpu() || device.type() == c10::DeviceType::Meta) {
+    return;
+  }
+  const int32_t status = Device(device).synchronize_default_stream();
+  if (status != 0) {
+    throw std::runtime_error(
+        "MiniMax-H3 TP weight load stream synchronization failed");
+  }
+}
+
+inline torch::Tensor minimax_h3_tp_fp32_all_reduce(const torch::Tensor& partial,
+                                                   ProcessGroup* tp_group) {
+  if (!partial.defined() ||
+      (partial.scalar_type() != torch::kBFloat16 &&
+       partial.scalar_type() != torch::kFloat32) ||
+      tp_group == nullptr || tp_group->world_size() != 2) {
+    throw std::invalid_argument(
+        "MiniMax-H3 TP output reduction requires BF16/FP32 and TP2");
+  }
+  torch::Tensor reduced = partial.scalar_type() == torch::kFloat32
+                              ? partial
+                              : partial.to(torch::kFloat32);
+  reduced = parallel_state::reduce(reduced, tp_group);
+  return reduced.to(torch::kBFloat16);
 }
 
 inline torch::Tensor minimax_h3_rms_norm(const torch::Tensor& input,
@@ -331,9 +404,25 @@ class MiniMaxH3RMSNormImpl final : public torch::nn::Module {
     return minimax_h3_rms_norm(input, weight_, eps_);
   }
 
+  void load_state_dict(const StateDict& state_dict) {
+    const torch::Tensor value = state_dict.get_tensor("weight");
+    if (!value.defined() || value.sizes() != weight_.sizes() ||
+        value.scalar_type() != weight_.scalar_type()) {
+      throw std::invalid_argument(
+          "MiniMax-H3 RMSNorm checkpoint weight metadata mismatch");
+    }
+    torch::NoGradGuard no_grad;
+    weight_.copy_(value);
+    weight_loaded_ = true;
+  }
+
+  bool is_weight_loaded() const { return weight_loaded_; }
+  const torch::Tensor& weight() const { return weight_; }
+
  private:
   torch::Tensor weight_;
   double eps_;
+  bool weight_loaded_ = false;
 };
 TORCH_MODULE(MiniMaxH3RMSNorm);
 
@@ -685,6 +774,483 @@ class MiniMaxH3DiTBlockImpl final : public torch::nn::Module {
   MiniMaxH3AdaLNProjection adaln_proj_{nullptr};
 };
 TORCH_MODULE(MiniMaxH3DiTBlock);
+
+class MiniMaxH3TPAttentionImpl final : public torch::nn::Module {
+ public:
+  MiniMaxH3TPAttentionImpl(const MiniMaxH3C4Config& config,
+                           ProcessGroup* tp_group,
+                           const torch::TensorOptions& options)
+      : tp_group_(tp_group),
+        num_heads_(config.num_attention_heads),
+        head_dim_(config.attention_head_dim) {
+    validate_tp_group(tp_group_);
+    if (num_heads_ % tp_group_->world_size() != 0) {
+      throw std::invalid_argument(
+          "MiniMax-H3 TP Attention heads must divide TP size");
+    }
+    local_heads_ = num_heads_ / tp_group_->world_size();
+    const int64_t inner = num_heads_ * head_dim_;
+    const torch::TensorOptions bf16 = options.dtype(torch::kBFloat16);
+    out_weight_fp32_ = register_buffer(
+        "out_weight_fp32",
+        torch::empty({config.hidden_size, inner / tp_group_->world_size()},
+                     options.dtype(torch::kFloat32)));
+    q_norm_ = register_module(
+        "q_norm", MiniMaxH3RMSNorm(head_dim_, config.qk_norm_eps, bf16));
+    k_norm_ = register_module(
+        "k_norm", MiniMaxH3RMSNorm(head_dim_, config.qk_norm_eps, bf16));
+    qkv_proj_ =
+        register_module("qkv_proj",
+                        layer::ColumnParallelLinear(config.hidden_size,
+                                                    3 * inner,
+                                                    /*bias=*/false,
+                                                    /*gather_output=*/false,
+                                                    QuantArgs{},
+                                                    tp_group_,
+                                                    bf16));
+    out_proj_ = register_module(
+        "out_proj",
+        layer::RowParallelLinear(inner,
+                                 config.hidden_size,
+                                 /*bias=*/false,
+                                 /*input_is_parallelized=*/true,
+                                 /*enable_result_reduction=*/false,
+                                 QuantArgs{},
+                                 tp_group_,
+                                 bf16));
+  }
+
+  void load_state_dict(const StateDict& state_dict) {
+    q_norm_->load_state_dict(state_dict.get_dict_with_prefix("q_norm."));
+    k_norm_->load_state_dict(state_dict.get_dict_with_prefix("k_norm."));
+
+    const torch::Tensor grouped = state_dict.get_tensor("qkv_proj.weight");
+    if (!grouped.defined()) {
+      throw std::invalid_argument(
+          "MiniMax-H3 TP Attention is missing grouped QKV weight");
+    }
+    StateDict reordered_qkv(
+        {{"weight",
+          minimax_h3_reorder_grouped_qkv(grouped, num_heads_, head_dim_)}});
+    const int64_t local_inner = local_heads_ * head_dim_;
+    qkv_proj_->load_state_dict(reordered_qkv,
+                               /*shard_tensor_count=*/3,
+                               {local_inner, local_inner, local_inner});
+    out_proj_->load_state_dict(state_dict.get_dict_with_prefix("out_proj."));
+    out_weight_fp32_.copy_(out_proj_->weight());
+    minimax_h3_synchronize_weight_load(qkv_proj_->weight().device());
+  }
+
+  torch::Tensor forward(const torch::Tensor& input,
+                        const std::optional<torch::Tensor>& rope_frequencies,
+                        const torch::Tensor& cu_seqlens) {
+    torch::Tensor local_heads =
+        forward_local_heads(input, rope_frequencies, cu_seqlens);
+    torch::Tensor partial = project_local_output_fp32(local_heads);
+    return minimax_h3_tp_fp32_all_reduce(partial, tp_group_);
+  }
+
+  torch::Tensor forward_local_heads(
+      const torch::Tensor& input,
+      const std::optional<torch::Tensor>& rope_frequencies,
+      const torch::Tensor& cu_seqlens) {
+    verify_loaded_weights();
+    if (!input.defined() || input.dim() != 2 ||
+        input.scalar_type() != torch::kBFloat16) {
+      throw std::invalid_argument(
+          "MiniMax-H3 TP Attention input must be BF16 [T,H]");
+    }
+    const int64_t rows = input.size(0);
+    const int64_t local_inner = local_heads_ * head_dim_;
+    const std::vector<torch::Tensor> qkv = qkv_proj_->forward(input).split(
+        {local_inner, local_inner, local_inner}, -1);
+    torch::Tensor query =
+        q_norm_->forward(qkv[0].view({rows, local_heads_, head_dim_}));
+    torch::Tensor key =
+        k_norm_->forward(qkv[1].view({rows, local_heads_, head_dim_}));
+    torch::Tensor value = qkv[2].view({rows, local_heads_, head_dim_});
+    if (rope_frequencies.has_value()) {
+      query = minimax_h3_apply_rope(query, *rope_frequencies);
+      key = minimax_h3_apply_rope(key, *rope_frequencies);
+    }
+    return minimax_h3_segmented_sdpa(query, key, value, cu_seqlens);
+  }
+
+  torch::Tensor project_local_output(const torch::Tensor& local_heads) {
+    if (!local_heads.defined() || local_heads.dim() != 3 ||
+        local_heads.size(1) != local_heads_ ||
+        local_heads.size(2) != head_dim_) {
+      throw std::invalid_argument(
+          "MiniMax-H3 TP local Attention output shape mismatch");
+    }
+    return out_proj_->forward(
+        local_heads.reshape({local_heads.size(0), local_heads_ * head_dim_}));
+  }
+
+  torch::Tensor project_local_output_fp32(const torch::Tensor& local_heads) {
+    if (!out_weight_fp32_.defined() ||
+        out_weight_fp32_.scalar_type() != torch::kFloat32 ||
+        out_weight_fp32_.device() != local_heads.device() ||
+        out_weight_fp32_.size(0) != out_proj_->weight().size(0) ||
+        out_weight_fp32_.size(1) != out_proj_->weight().size(1)) {
+      throw std::logic_error(
+          "MiniMax-H3 TP FP32 Attention projection weight is not loaded");
+    }
+    if (!local_heads.defined() || local_heads.dim() != 3 ||
+        local_heads.size(1) != local_heads_ ||
+        local_heads.size(2) != head_dim_) {
+      throw std::invalid_argument(
+          "MiniMax-H3 TP local Attention output shape mismatch");
+    }
+    return torch::nn::functional::linear(
+        local_heads.reshape({local_heads.size(0), local_heads_ * head_dim_})
+            .to(torch::kFloat32),
+        out_weight_fp32_);
+  }
+
+  void verify_loaded_weights() const {
+    if (!q_norm_->is_weight_loaded() || !k_norm_->is_weight_loaded() ||
+        !qkv_proj_->is_weight_loaded() || !out_proj_->is_weight_loaded() ||
+        !out_weight_fp32_.defined()) {
+      throw std::logic_error(
+          "MiniMax-H3 TP Attention weights are not completely loaded");
+    }
+  }
+
+  int64_t local_heads() const { return local_heads_; }
+  const torch::Tensor& q_norm_weight() const { return q_norm_->weight(); }
+  const torch::Tensor& k_norm_weight() const { return k_norm_->weight(); }
+  torch::Tensor qkv_weight() const { return qkv_proj_->weight(); }
+  torch::Tensor out_weight() const { return out_proj_->weight(); }
+
+ private:
+  static void validate_tp_group(ProcessGroup* tp_group) {
+    if (tp_group == nullptr || tp_group->world_size() != 2 ||
+        tp_group->rank() < 0 || tp_group->rank() >= 2) {
+      throw std::invalid_argument(
+          "MiniMax-H3 C8B Attention requires an exact TP2 process group");
+    }
+  }
+
+  ProcessGroup* tp_group_;
+  int64_t num_heads_;
+  int64_t head_dim_;
+  int64_t local_heads_ = 0;
+  MiniMaxH3RMSNorm q_norm_{nullptr};
+  MiniMaxH3RMSNorm k_norm_{nullptr};
+  layer::ColumnParallelLinear qkv_proj_{nullptr};
+  layer::RowParallelLinear out_proj_{nullptr};
+  torch::Tensor out_weight_fp32_;
+};
+TORCH_MODULE(MiniMaxH3TPAttention);
+
+class MiniMaxH3TPMLPImpl final : public torch::nn::Module {
+ public:
+  MiniMaxH3TPMLPImpl(const MiniMaxH3C4Config& config,
+                     ProcessGroup* tp_group,
+                     const torch::TensorOptions& options)
+      : tp_group_(tp_group), ffn_hidden_size_(config.ffn_hidden_size) {
+    if (tp_group_ == nullptr || tp_group_->world_size() != 2 ||
+        ffn_hidden_size_ % 2 != 0) {
+      throw std::invalid_argument(
+          "MiniMax-H3 C8B MLP requires TP2-divisible FFN geometry");
+    }
+    local_ffn_ = ffn_hidden_size_ / 2;
+    const torch::TensorOptions bf16 = options.dtype(torch::kBFloat16);
+    fc1_ = register_module("fc1",
+                           layer::ColumnParallelLinear(config.hidden_size,
+                                                       2 * ffn_hidden_size_,
+                                                       /*bias=*/false,
+                                                       /*gather_output=*/false,
+                                                       QuantArgs{},
+                                                       tp_group_,
+                                                       bf16));
+    fc2_ = register_module(
+        "fc2",
+        layer::RowParallelLinear(ffn_hidden_size_,
+                                 config.hidden_size,
+                                 /*bias=*/false,
+                                 /*input_is_parallelized=*/true,
+                                 /*enable_result_reduction=*/false,
+                                 QuantArgs{},
+                                 tp_group_,
+                                 bf16));
+  }
+
+  void load_state_dict(const StateDict& state_dict) {
+    const torch::Tensor gate_up = state_dict.get_tensor("fc1.weight");
+    if (!gate_up.defined()) {
+      throw std::invalid_argument("MiniMax-H3 TP MLP is missing FC1 weight");
+    }
+    StateDict reordered_fc1(
+        {{"weight", minimax_h3_reorder_gate_up_to_up_gate(gate_up)}});
+    fc1_->load_state_dict(
+        reordered_fc1, /*shard_tensor_count=*/2, {local_ffn_, local_ffn_});
+    fc2_->load_state_dict(state_dict.get_dict_with_prefix("fc2."));
+    minimax_h3_synchronize_weight_load(fc1_->weight().device());
+  }
+
+  torch::Tensor forward(const torch::Tensor& input) {
+    verify_loaded_weights();
+    const std::vector<torch::Tensor> up_gate =
+        fc1_->forward(input).chunk(2, -1);
+    torch::Tensor partial = fc2_->forward(up_gate[0] * torch::silu(up_gate[1]));
+    return minimax_h3_tp_fp32_all_reduce(partial, tp_group_);
+  }
+
+  void verify_loaded_weights() const {
+    if (!fc1_->is_weight_loaded() || !fc2_->is_weight_loaded()) {
+      throw std::logic_error(
+          "MiniMax-H3 TP MLP weights are not completely loaded");
+    }
+  }
+
+  torch::Tensor fc1_weight() const { return fc1_->weight(); }
+  torch::Tensor fc2_weight() const { return fc2_->weight(); }
+
+ private:
+  ProcessGroup* tp_group_;
+  int64_t ffn_hidden_size_;
+  int64_t local_ffn_ = 0;
+  layer::ColumnParallelLinear fc1_{nullptr};
+  layer::RowParallelLinear fc2_{nullptr};
+};
+TORCH_MODULE(MiniMaxH3TPMLP);
+
+class MiniMaxH3TPAdaLNProjectionImpl final : public torch::nn::Module {
+ public:
+  MiniMaxH3TPAdaLNProjectionImpl(const MiniMaxH3C4Config& config,
+                                 ProcessGroup* tp_group,
+                                 const torch::TensorOptions& options)
+      : hidden_size_(config.hidden_size),
+        time_embed_dim_(config.time_embed_dim),
+        tp_group_(tp_group) {
+    if (tp_group == nullptr || tp_group->world_size() != 2 ||
+        (18 * hidden_size_) % 2 != 0) {
+      throw std::invalid_argument(
+          "MiniMax-H3 C8B AdaLN requires TP2-divisible output geometry");
+    }
+    linear_ = register_module(
+        "linear",
+        layer::ColumnParallelLinear(config.time_embed_dim,
+                                    18 * hidden_size_,
+                                    /*bias=*/true,
+                                    /*gather_output=*/false,
+                                    QuantArgs{},
+                                    tp_group,
+                                    options.dtype(torch::kBFloat16)));
+  }
+
+  void load_state_dict(const StateDict& state_dict) {
+    const torch::Tensor weight = state_dict.get_tensor("linear.weight");
+    const torch::Tensor bias = state_dict.get_tensor("linear.bias");
+    if (!weight.defined() ||
+        weight.sizes() !=
+            torch::IntArrayRef({18 * hidden_size_, time_embed_dim_}) ||
+        weight.scalar_type() != torch::kBFloat16 || !bias.defined() ||
+        bias.sizes() != torch::IntArrayRef({18 * hidden_size_}) ||
+        bias.scalar_type() != torch::kBFloat16) {
+      throw std::invalid_argument(
+          "MiniMax-H3 TP AdaLN checkpoint weight/bias metadata mismatch");
+    }
+    linear_->load_state_dict(state_dict.get_dict_with_prefix("linear."));
+    minimax_h3_synchronize_weight_load(linear_->weight().device());
+    loaded_ = true;
+  }
+
+  torch::Tensor forward_local(const torch::Tensor& time_embedding) {
+    if (!loaded_ || !linear_->is_weight_loaded()) {
+      throw std::logic_error("MiniMax-H3 TP AdaLN weights are not loaded");
+    }
+    if (!time_embedding.defined() || time_embedding.dim() != 2 ||
+        time_embedding.scalar_type() != torch::kFloat32) {
+      throw std::invalid_argument(
+          "MiniMax-H3 TP AdaLN time embedding must be FP32 [M,D]");
+    }
+    return linear_->forward(torch::silu(time_embedding).to(torch::kBFloat16));
+  }
+
+  torch::Tensor forward(const torch::Tensor& time_embedding) {
+    torch::Tensor projected =
+        parallel_state::gather(forward_local(time_embedding), tp_group_, -1);
+    return projected.view({time_embedding.size(0), 3, 6, hidden_size_});
+  }
+
+  torch::Tensor weight() const { return linear_->weight(); }
+  std::optional<torch::Tensor> bias() const { return linear_->bias(); }
+  bool is_loaded() const { return loaded_ && linear_->is_weight_loaded(); }
+
+ private:
+  int64_t hidden_size_;
+  int64_t time_embed_dim_;
+  ProcessGroup* tp_group_;
+  layer::ColumnParallelLinear linear_{nullptr};
+  bool loaded_ = false;
+};
+TORCH_MODULE(MiniMaxH3TPAdaLNProjection);
+
+// The communicator owns tp_group and must outlive this inference-only module.
+class MiniMaxH3TPDiTBlockImpl final : public torch::nn::Module {
+ public:
+  MiniMaxH3TPDiTBlockImpl(const MiniMaxH3C4Config& config,
+                          ProcessGroup* tp_group,
+                          const torch::TensorOptions& options)
+      : config_(config), tp_group_(tp_group) {
+    if (tp_group_ == nullptr || tp_group_->world_size() != 2) {
+      throw std::invalid_argument(
+          "MiniMax-H3 C8B block requires an exact TP2 process group");
+    }
+    const torch::TensorOptions bf16 = options.dtype(torch::kBFloat16);
+    norm1_ = register_module(
+        "norm1", MiniMaxH3RMSNorm(config.hidden_size, config.norm_eps, bf16));
+    norm2_ = register_module(
+        "norm2", MiniMaxH3RMSNorm(config.hidden_size, config.norm_eps, bf16));
+    attn_ = register_module("attn",
+                            MiniMaxH3TPAttention(config, tp_group_, options));
+    mlp_ = register_module("mlp", MiniMaxH3TPMLP(config, tp_group_, options));
+    adaln_proj_ = register_module(
+        "adaln_proj", MiniMaxH3TPAdaLNProjection(config, tp_group_, options));
+  }
+
+  void load_source_weights(
+      const std::vector<std::unique_ptr<StateDict>>& shards,
+      int64_t layer_index) {
+    if (loaded_) {
+      throw std::logic_error(
+          "MiniMax-H3 TP block source weights are already loaded");
+    }
+    if (layer_index < 0 || layer_index >= 50) {
+      throw std::invalid_argument(
+          "MiniMax-H3 TP block layer index must be in [0,50)");
+    }
+    const std::string prefix = "blocks." + std::to_string(layer_index) + ".";
+    std::unordered_map<std::string, torch::Tensor> block_tensors;
+    for (const std::string& suffix : source_suffixes()) {
+      const std::string name = prefix + suffix;
+      torch::Tensor value;
+      for (const std::unique_ptr<StateDict>& shard : shards) {
+        if (shard == nullptr) {
+          throw std::invalid_argument(
+              "MiniMax-H3 TP block source contains a null shard");
+        }
+        const torch::Tensor candidate = shard->get_tensor(name);
+        if (!candidate.defined()) {
+          continue;
+        }
+        if (value.defined()) {
+          throw std::invalid_argument(
+              "MiniMax-H3 TP block source tensor is duplicated: `" + name +
+              "`");
+        }
+        value = candidate;
+      }
+      if (!value.defined()) {
+        throw std::invalid_argument(
+            "MiniMax-H3 TP block source tensor is missing: `" + name + "`");
+      }
+      block_tensors.emplace(suffix, value);
+    }
+    StateDict block_state(std::move(block_tensors));
+    load_state_dict(block_state);
+    loaded_ = true;
+    verify_loaded_weights();
+  }
+
+  void load_state_dict(const StateDict& state_dict) {
+    norm1_->load_state_dict(state_dict.get_dict_with_prefix("norm1."));
+    norm2_->load_state_dict(state_dict.get_dict_with_prefix("norm2."));
+    attn_->load_state_dict(state_dict.get_dict_with_prefix("attn."));
+    mlp_->load_state_dict(state_dict.get_dict_with_prefix("mlp."));
+    adaln_proj_->load_state_dict(
+        state_dict.get_dict_with_prefix("adaln_proj."));
+    loaded_ = true;
+  }
+
+  MiniMaxH3ResidualBranchTrace forward(const torch::Tensor& input,
+                                       const torch::Tensor& time_embedding,
+                                       const torch::Tensor& combined_indices,
+                                       const torch::Tensor& rope_frequencies,
+                                       const torch::Tensor& cu_seqlens) {
+    verify_loaded_weights();
+    torch::Tensor parameters = adaln_proj_->forward(time_embedding);
+    torch::Tensor shift_msa =
+        minimax_h3_select_adaln_parameter(parameters, 0, combined_indices);
+    torch::Tensor scale_msa =
+        minimax_h3_select_adaln_parameter(parameters, 1, combined_indices);
+    torch::Tensor gate_msa =
+        minimax_h3_select_adaln_parameter(parameters, 2, combined_indices);
+    torch::Tensor shift_mlp =
+        minimax_h3_select_adaln_parameter(parameters, 3, combined_indices);
+    torch::Tensor scale_mlp =
+        minimax_h3_select_adaln_parameter(parameters, 4, combined_indices);
+    torch::Tensor gate_mlp =
+        minimax_h3_select_adaln_parameter(parameters, 5, combined_indices);
+
+    MiniMaxH3ResidualBranchTrace trace;
+    trace.adaln_parameters = parameters;
+    trace.shift_msa = shift_msa;
+    trace.scale_msa = scale_msa;
+    trace.gate_msa = gate_msa;
+    trace.shift_mlp = shift_mlp;
+    trace.scale_mlp = scale_mlp;
+    trace.gate_mlp = gate_mlp;
+    trace.norm1_output = norm1_->forward(input);
+    trace.attention_input = trace.norm1_output * (scale_msa + 1.0) + shift_msa;
+    trace.attention_output =
+        attn_->forward(trace.attention_input, rope_frequencies, cu_seqlens);
+    trace.attention_delta = gate_msa * trace.attention_output;
+    torch::Tensor after_attention = input + trace.attention_delta;
+    trace.norm2_output = norm2_->forward(after_attention);
+    trace.mlp_input = trace.norm2_output * (scale_mlp + 1.0) + shift_mlp;
+    trace.mlp_output = mlp_->forward(trace.mlp_input);
+    trace.mlp_delta = gate_mlp * trace.mlp_output;
+    trace.output = after_attention + trace.mlp_delta;
+    return trace;
+  }
+
+  void verify_loaded_weights() const {
+    if (!loaded_ || !norm1_->is_weight_loaded() ||
+        !norm2_->is_weight_loaded() || !adaln_proj_->is_loaded()) {
+      throw std::logic_error(
+          "MiniMax-H3 TP block weights are not completely loaded");
+    }
+    attn_->verify_loaded_weights();
+    mlp_->verify_loaded_weights();
+  }
+
+  MiniMaxH3TPAttention attention() const { return attn_; }
+  MiniMaxH3TPMLP mlp() const { return mlp_; }
+  MiniMaxH3TPAdaLNProjection adaln_projection() const { return adaln_proj_; }
+  const torch::Tensor& norm1_weight() const { return norm1_->weight(); }
+  const torch::Tensor& norm2_weight() const { return norm2_->weight(); }
+
+ private:
+  static const std::array<std::string, 10>& source_suffixes() {
+    static const std::array<std::string, 10> kSuffixes = {
+        "norm1.weight",
+        "norm2.weight",
+        "attn.q_norm.weight",
+        "attn.k_norm.weight",
+        "attn.qkv_proj.weight",
+        "attn.out_proj.weight",
+        "mlp.fc1.weight",
+        "mlp.fc2.weight",
+        "adaln_proj.linear.weight",
+        "adaln_proj.linear.bias",
+    };
+    return kSuffixes;
+  }
+
+  MiniMaxH3C4Config config_;
+  ProcessGroup* tp_group_;
+  MiniMaxH3RMSNorm norm1_{nullptr};
+  MiniMaxH3RMSNorm norm2_{nullptr};
+  MiniMaxH3TPAttention attn_{nullptr};
+  MiniMaxH3TPMLP mlp_{nullptr};
+  MiniMaxH3TPAdaLNProjection adaln_proj_{nullptr};
+  bool loaded_ = false;
+};
+TORCH_MODULE(MiniMaxH3TPDiTBlock);
 
 class MiniMaxH3TimeEmbedderImpl final : public torch::nn::Module {
  public:
