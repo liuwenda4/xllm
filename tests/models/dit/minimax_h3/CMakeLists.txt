@@ -13,3 +13,17 @@ cc_test(
   COPTS
     -DXLLM_MINIMAX_H3_DISABLE_REGISTRATION
 )
+
+if(USE_NPU)
+  cc_test(
+    NAME
+      minimax_h3_uaa_test
+    SRCS
+      minimax_h3_uaa_test.cpp
+    DEPS
+      :parallel_state
+      torch
+      glog::glog
+      GTest::gtest_main
+  )
+endif()
