@@ -58,4 +58,20 @@ if(USE_NPU)
     COPTS
       -DXLLM_MINIMAX_H3_DISABLE_REGISTRATION
   )
+
+  cc_test(
+    NAME
+      minimax_h3_tp_uaa_one_forward_test
+    SRCS
+      minimax_h3_tp_uaa_one_forward_test.cpp
+    DEPS
+      :model_loader
+      :parallel_state
+      state_dict
+      torch
+      glog::glog
+      GTest::gtest_main
+    COPTS
+      -DXLLM_MINIMAX_H3_DISABLE_REGISTRATION
+  )
 endif()
