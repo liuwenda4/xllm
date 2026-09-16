@@ -56,4 +56,17 @@ TEST(RequestLimiterTest, SleepBlocksAcquisition) {
   rate_limiter.decrease_one_request();
 }
 
+TEST(RequestLimiterTest, InvalidReleaseDoesNotUnderflowOrWakeSleeping) {
+  ServiceConfig::get_instance().max_concurrent_requests(1);
+  RateLimiter rate_limiter;
+
+  rate_limiter.decrease_one_request();
+  EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 0);
+  EXPECT_TRUE(rate_limiter.try_set_sleeping());
+  rate_limiter.decrease_one_request();
+  EXPECT_TRUE(rate_limiter.is_sleeping());
+  EXPECT_TRUE(rate_limiter.try_wakeup());
+  EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 0);
+}
+
 }  // namespace xllm

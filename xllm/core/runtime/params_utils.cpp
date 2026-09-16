@@ -26,6 +26,34 @@ limitations under the License.
 #include "util/utils.h"
 
 namespace xllm {
+namespace {
+
+StatusCode normalize_status_code(uint32_t code) {
+  if (code <= static_cast<uint32_t>(StatusCode::UNAVAILABLE)) {
+    return static_cast<StatusCode>(code);
+  }
+  return StatusCode::UNKNOWN;
+}
+
+}  // namespace
+
+void status_to_proto(const Status& status, proto::Status* pb_status) {
+  pb_status->set_ok(status.ok());
+  pb_status->set_code(static_cast<uint32_t>(status.code()));
+  pb_status->set_message(status.message());
+}
+
+Status proto_to_status(const proto::Status& pb_status) {
+  if (pb_status.ok()) {
+    return Status();
+  }
+  StatusCode code = normalize_status_code(pb_status.code());
+  if (code == StatusCode::OK) {
+    code = StatusCode::UNKNOWN;
+  }
+  return Status(code, pb_status.message());
+}
+
 torch::Tensor choose_lm_head_selected_token_idxes(
     const torch::Tensor& selected_token_idxes,
     const ModelInputParams& input_params,
@@ -98,6 +126,14 @@ torch::Tensor choose_lm_head_selected_token_idxes(
 void proto_to_forward_output(const proto::ForwardOutput& pb_output,
                              RawForwardOutput& raw_forward_output) {
   Timer timer;
+  raw_forward_output = RawForwardOutput();
+  if (pb_output.has_status()) {
+    raw_forward_output.status = proto_to_status(pb_output.status());
+    if (!raw_forward_output.status.ok()) {
+      COUNTER_ADD(proto_latency_seconds_proto2o, timer.elapsed_seconds());
+      return;
+    }
+  }
   size_t seq_nums = pb_output.outputs().size();
   raw_forward_output.outputs.reserve(seq_nums);
   size_t expert_load_data_size = pb_output.expert_load_data().size();
@@ -179,6 +215,7 @@ void forward_output_to_proto(
     const std::vector<JsonObjectOutputError>& json_object_errors,
     proto::ForwardOutput* pb_forward_output) {
   Timer timer;
+  status_to_proto(Status(), pb_forward_output->mutable_status());
   // LLM decode fills next_tokens; DiT text diffusion (e.g. Cola-DLM) may leave
   // it undefined and only populate dit_text_output. Guard before
   // .size()/.dim().

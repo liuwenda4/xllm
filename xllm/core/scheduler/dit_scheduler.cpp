@@ -224,7 +224,25 @@ void DiTDynamicBatchScheduler::step(const absl::Duration& timeout) {
     return;
   }
 
-  auto output = engine_->step(batches);
+  try {
+    engine_->step(batches);
+  } catch (const std::exception& error) {
+    const Status status(StatusCode::UNKNOWN,
+                        std::string("DiT execution failed: ") + error.what());
+    for (auto& request : running_requests_) {
+      response_handler_->process_failed_request(request, status);
+    }
+    running_requests_.clear();
+    return;
+  } catch (...) {
+    const Status status(StatusCode::UNKNOWN,
+                        "DiT execution failed with an unknown exception");
+    for (auto& request : running_requests_) {
+      response_handler_->process_failed_request(request, status);
+    }
+    running_requests_.clear();
+    return;
+  }
 
   // process request output in batch
   process_batch_output();

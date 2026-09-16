@@ -22,6 +22,8 @@ limitations under the License.
 #include <atomic>
 #include <cstddef>
 #include <future>
+#include <sstream>
+#include <stdexcept>
 
 #include "common/global_flags.h"
 
@@ -595,14 +597,27 @@ bool CommChannel::get_last_step_result_async(
   brpc::Controller cntl;
   stub_->GetLastStepResult(&cntl, &req, &pb_output, nullptr);
   if (cntl.Failed()) {
-    LOG(ERROR) << "Get last step model output result failed, "
-               << cntl.ErrorText();
+    std::ostringstream message_stream;
+    message_stream << "Get last step model output result failed: "
+                   << cntl.ErrorText();
+    const std::string message = message_stream.str();
+    LOG(ERROR) << message;
+    promise.setException(
+        folly::make_exception_wrapper<std::runtime_error>(message));
     return false;
   }
 
   // parse tokens
   RawForwardOutput raw_forward_output;
   proto_to_forward_output(pb_output, raw_forward_output);
+  if (!raw_forward_output.status.ok()) {
+    const std::string message = raw_forward_output.status.message().empty()
+                                    ? "worker last-step execution failed"
+                                    : raw_forward_output.status.message();
+    promise.setException(
+        folly::make_exception_wrapper<std::runtime_error>(message));
+    return false;
+  }
   promise.setValue(std::move(raw_forward_output));
 
   return true;
@@ -646,8 +661,11 @@ bool CommChannel::execute_model_with_brpc(
   proto::ForwardInput pb_forward_input;
   auto* packed_input = pb_forward_input.mutable_packed_input();
   if (!forward_input_to_packed_proto(input, packed_input)) {
-    LOG(ERROR) << "failed to pack ForwardInput for remote execution";
-    promise.setValue(std::optional<RawForwardOutput>(std::nullopt));
+    const std::string message =
+        "failed to pack ForwardInput for remote execution";
+    LOG(ERROR) << message;
+    promise.setException(
+        folly::make_exception_wrapper<std::runtime_error>(message));
     return false;
   }
 
@@ -661,12 +679,26 @@ void ExecuteModelClosure::Run() {
   std::unique_ptr<ExecuteModelClosure> self_guard(this);
 
   if (cntl.Failed()) {
-    LOG(ERROR) << "Execute_model_async failed. Error code : "
-               << cntl.ErrorCode() << ", error message : " << cntl.ErrorText();
+    std::ostringstream message_stream;
+    message_stream << "ExecuteModel RPC failed with code " << cntl.ErrorCode()
+                   << ": " << cntl.ErrorText();
+    const std::string message = message_stream.str();
+    LOG(ERROR) << message;
+    promise.setException(
+        folly::make_exception_wrapper<std::runtime_error>(message));
+    return;
   }
 
   RawForwardOutput raw_forward_output;
   proto_to_forward_output(pb_output, raw_forward_output);
+  if (!raw_forward_output.status.ok()) {
+    const std::string message = raw_forward_output.status.message().empty()
+                                    ? "worker execution failed"
+                                    : raw_forward_output.status.message();
+    promise.setException(
+        folly::make_exception_wrapper<std::runtime_error>(message));
+    return;
+  }
   promise.setValue(raw_forward_output);
 
   return;

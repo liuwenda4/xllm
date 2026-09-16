@@ -41,6 +41,17 @@ TEST(ThreadPoolTest, ScheduleTask) {
   EXPECT_TRUE(called);
 }
 
+TEST(ThreadPoolTest, ExceptionDoesNotTerminateWorker) {
+  ThreadPool threadpool(1);
+  absl::Notification after_exception;
+
+  threadpool.schedule([] { throw std::runtime_error("expected test error"); });
+  threadpool.schedule([&after_exception] { after_exception.Notify(); });
+
+  EXPECT_TRUE(
+      after_exception.WaitForNotificationWithTimeout(absl::Milliseconds(500)));
+}
+
 TEST(ThreadPoolTest, ScheduleMultipleTasks) {
   ThreadPool threadpool(1);
   std::vector<std::string> completed_tasks;

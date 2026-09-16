@@ -99,7 +99,13 @@ bool DiTEngine::init_model() {
   // wait for all futures to complete
   auto results = folly::collectAll(futures).get();
   LOG(INFO) << "All workers completed model initialization.";
-  for (const auto& result : results) {
+  for (size_t rank = 0; rank < results.size(); ++rank) {
+    const auto& result = results[rank];
+    if (result.hasException()) {
+      LOG(ERROR) << "DiT worker " << rank << " model initialization failed: "
+                 << result.exception().what();
+      return false;
+    }
     if (!result.value()) {
       return false;
     }
@@ -133,9 +139,32 @@ DiTForwardOutput DiTEngine::step(std::vector<DiTBatch>& batches) {
   // wait for the all future to complete
   auto results = folly::collectAll(futures).get();
 
+  if (results.empty()) {
+    throw std::runtime_error("DiT execution returned no worker results");
+  }
+  for (size_t rank = 0; rank < results.size(); ++rank) {
+    const auto& result = results[rank];
+    if (result.hasException()) {
+      LOG(ERROR) << "DiT worker " << rank
+                 << " failed: " << result.exception().what();
+      throw std::runtime_error("DiT worker " + std::to_string(rank) +
+                               " failed during model execution");
+    }
+    if (!result.value().has_value()) {
+      throw std::runtime_error("DiT worker " + std::to_string(rank) +
+                               " returned no output");
+    }
+    const Status& status = result.value().value().status;
+    if (!status.ok()) {
+      LOG(ERROR) << "DiT worker " << rank
+                 << " returned an execution error: " << status.message();
+      throw std::runtime_error("DiT worker " + std::to_string(rank) +
+                               " failed: " + status.message());
+    }
+  }
+
   // return the result from the driver
   auto forward_output = results.front().value();
-  DCHECK(forward_output.has_value()) << "Failed to execute model";
   batches[0].process_forward_output(forward_output.value().dit_forward_output);
   return forward_output.value().dit_forward_output;
 }

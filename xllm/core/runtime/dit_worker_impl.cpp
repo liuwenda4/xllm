@@ -153,9 +153,13 @@ folly::SemiFuture<bool> DiTWorkerImpl::init_model_async(
                         random_seed,
                         master_status,
                         promise]() mutable {
-    bool status =
-        this->init_model(model_weights_path, random_seed, master_status);
-    promise->setValue(status);
+    try {
+      bool status =
+          this->init_model(model_weights_path, random_seed, master_status);
+      promise->setValue(status);
+    } catch (...) {
+      promise->setException(folly::exception_wrapper(std::current_exception()));
+    }
   });
   return future;
 }
@@ -181,8 +185,12 @@ folly::SemiFuture<std::optional<ForwardOutput>> DiTWorkerImpl::step_async(
   threadpool_.schedule([this,
                         input = std::move(inputs),
                         promise = std::move(promise)]() mutable {
-    auto output = this->step(input);
-    promise.setValue(output);
+    try {
+      auto output = this->step(input);
+      promise.setValue(output);
+    } catch (...) {
+      promise.setException(folly::exception_wrapper(std::current_exception()));
+    }
   });
   return future;
 }
@@ -209,8 +217,12 @@ folly::SemiFuture<folly::Unit> DiTWorkerImpl::process_group_test_async() {
   folly::Promise<folly::Unit> promise;
   auto future = promise.getSemiFuture();
   threadpool_.schedule([this, promise = std::move(promise)]() mutable {
-    this->process_group_test();
-    promise.setValue();
+    try {
+      this->process_group_test();
+      promise.setValue();
+    } catch (...) {
+      promise.setException(folly::exception_wrapper(std::current_exception()));
+    }
   });
   return future;
 }

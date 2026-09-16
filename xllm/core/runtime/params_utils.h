@@ -47,6 +47,10 @@ void packed_proto_to_forward_input(
 void proto_to_forward_output(const proto::ForwardOutput& pb_output,
                              RawForwardOutput& raw_forward_output);
 
+void status_to_proto(const Status& status, proto::Status* pb_status);
+
+Status proto_to_status(const proto::Status& pb_status);
+
 void forward_output_to_proto(
     const torch::Tensor& next_tokens,
     const torch::Tensor& logprobs,

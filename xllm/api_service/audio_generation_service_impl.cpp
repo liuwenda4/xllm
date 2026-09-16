@@ -71,6 +71,13 @@ void AudioGenerationServiceImpl::process_async_impl(
     return;
   }
 
+  if (master_->get_rate_limiter()->is_limited()) {
+    call->finish_with_error(
+        StatusCode::RESOURCE_EXHAUSTED,
+        "The number of concurrent requests has reached the limit.");
+    return;
+  }
+
   DiTRequestParams request_params(
       rpc_request, call->get_x_request_id(), call->get_x_request_time());
 

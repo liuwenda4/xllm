@@ -25,10 +25,13 @@ limitations under the License.
 #include <vector>
 
 #include "core/common/metrics.h"
+#include "core/distributed_runtime/comm_channel.h"
 #include "core/framework/sampling/rejection_sampler.h"
 #include "core/framework/sampling/sampling_params.h"
+#include "core/platform/platform.h"
 #include "core/runtime/options.h"
 #include "core/runtime/speculative_worker_impl.h"
+#include "core/runtime/worker_impl.h"
 
 namespace xllm {
 
@@ -45,6 +48,142 @@ class WorkerServiceTestPeer final {
 };
 
 namespace {
+
+class ThrowingOverlapWorker final : public WorkerImpl {
+ public:
+  ThrowingOverlapWorker(const ParallelArgs& parallel_args,
+                        const torch::Device& device,
+                        const runtime::Options& options)
+      : WorkerImpl(parallel_args, device, options) {}
+
+  bool init_model(ModelContext& context) override { return true; }
+
+  void prepare_work_before_execute(const ForwardInput& input,
+                                   ForwardInput& processed_input) override {
+    processed_input = input;
+  }
+
+  std::optional<ForwardOutput> step(const ForwardInput& input) override {
+    if (fail_) {
+      throw std::runtime_error("injected overlap failure");
+    }
+    if (return_null_) {
+      return std::nullopt;
+    }
+    ForwardOutput output;
+    output.sample_output.next_tokens =
+        torch::tensor({1}, torch::TensorOptions().dtype(torch::kInt64));
+    return output;
+  }
+
+  void fail(bool fail) { fail_ = fail; }
+  void return_null(bool return_null) { return_null_ = return_null; }
+
+ private:
+  bool fail_ = true;
+  bool return_null_ = false;
+};
+
+TEST(ExecuteModelClosureTest, RpcFailureCompletesPromiseWithException) {
+  auto* closure = new ExecuteModelClosure();
+  auto future = closure->promise.getSemiFuture();
+  closure->cntl.SetFailed("injected RPC failure");
+
+  closure->Run();
+
+  try {
+    std::move(future).get();
+    FAIL() << "expected ExecuteModel RPC failure";
+  } catch (const std::exception& error) {
+    EXPECT_NE(std::string(error.what()).find("injected RPC failure"),
+              std::string::npos);
+  }
+}
+
+TEST(ExecuteModelClosureTest, WorkerStatusCompletesPromiseWithException) {
+  auto* closure = new ExecuteModelClosure();
+  auto future = closure->promise.getSemiFuture();
+  status_to_proto(Status(StatusCode::UNKNOWN, "injected worker failure"),
+                  closure->pb_output.mutable_status());
+
+  closure->Run();
+
+  try {
+    std::move(future).get();
+    FAIL() << "expected worker status failure";
+  } catch (const std::exception& error) {
+    EXPECT_NE(std::string(error.what()).find("injected worker failure"),
+              std::string::npos);
+  }
+}
+
+TEST(WorkerOverlapFailureTest, LastStepRethrowsAndNextStepCompletes) {
+  if (Platform::device_count() < 1) {
+    GTEST_SKIP() << "An accelerator device is required for WorkerImpl.";
+  }
+  const torch::Device device("npu:0");
+  const ParallelArgs parallel_args(
+      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
+  runtime::Options options;
+  options.enable_schedule_overlap(true).world_size(1).dp_size(1).cp_size(1);
+  ThrowingOverlapWorker worker(parallel_args, device, options);
+  ForwardInput input;
+
+  auto failed_step = worker.step_async(input);
+  EXPECT_THROW(std::move(failed_step).get(), std::runtime_error);
+  EXPECT_THROW(worker.get_last_step_result(), std::runtime_error);
+
+  worker.fail(false);
+  auto successful_step = worker.step_async(input);
+  EXPECT_TRUE(std::move(successful_step).get().has_value());
+  EXPECT_NO_THROW(worker.get_last_step_result());
+}
+
+TEST(WorkerOverlapFailureTest, NonDriverLastStepRethrowsAndNextStepCompletes) {
+  if (Platform::device_count() < 1) {
+    GTEST_SKIP() << "An accelerator device is required for WorkerImpl.";
+  }
+  const torch::Device device("npu:0");
+  const ParallelArgs parallel_args(
+      /*rank=*/1, /*world_size=*/2, /*process_group=*/nullptr);
+  runtime::Options options;
+  options.enable_schedule_overlap(true).world_size(2).dp_size(1).cp_size(1);
+  ThrowingOverlapWorker worker(parallel_args, device, options);
+  ForwardInput input;
+
+  auto failed_step = worker.step_async(input);
+  EXPECT_THROW(std::move(failed_step).get(), std::runtime_error);
+  EXPECT_THROW(worker.get_last_step_result(), std::runtime_error);
+
+  worker.fail(false);
+  auto successful_step = worker.step_async(input);
+  EXPECT_TRUE(std::move(successful_step).get().has_value());
+  EXPECT_NO_THROW(worker.get_last_step_result());
+}
+
+TEST(WorkerOverlapFailureTest, NullLastStepRemainsDisengaged) {
+  if (Platform::device_count() < 1) {
+    GTEST_SKIP() << "An accelerator device is required for WorkerImpl.";
+  }
+  const torch::Device device("npu:0");
+  const ParallelArgs parallel_args(
+      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
+  runtime::Options options;
+  options.enable_schedule_overlap(true).world_size(1).dp_size(1).cp_size(1);
+  ThrowingOverlapWorker worker(parallel_args, device, options);
+  worker.fail(false);
+  worker.return_null(true);
+  ForwardInput input;
+
+  auto null_step = worker.step_async(input);
+  EXPECT_FALSE(std::move(null_step).get().has_value());
+  EXPECT_FALSE(worker.get_last_step_result().has_value());
+
+  worker.return_null(false);
+  auto successful_step = worker.step_async(input);
+  EXPECT_TRUE(std::move(successful_step).get().has_value());
+  EXPECT_TRUE(worker.get_last_step_result().has_value());
+}
 
 TEST(SpeculativeTokenStatsTest, CountsTokensPerSequence) {
   // Row 0 accepts two draft tokens; row 1 accepts all five.

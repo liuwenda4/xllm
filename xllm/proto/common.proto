@@ -97,6 +97,8 @@ message StreamOptions{
 
 message Status {
   bool ok = 1;
+  uint32 code = 2;
+  string message = 3;
 }
 
 message Routing {

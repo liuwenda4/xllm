@@ -19,6 +19,7 @@ limitations under the License.
 #include <sys/mman.h>
 #include <torch/torch.h>
 
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -290,7 +291,7 @@ class WorkerImpl {
     return options_.enable_schedule_overlap_;
   }
 
-  virtual ForwardOutput get_last_step_result();
+  virtual std::optional<ForwardOutput> get_last_step_result();
 
   bool is_driver() const { return driver_ || dp_driver_; }
 
@@ -457,6 +458,7 @@ class WorkerImpl {
   std::mutex mtx_;
   std::condition_variable cv_;
   bool is_recorded_ = false;
+  std::exception_ptr last_step_exception_;
 
   InstanceRole instance_role_ = InstanceRole::DEFAULT;
 

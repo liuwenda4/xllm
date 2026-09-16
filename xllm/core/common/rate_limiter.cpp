@@ -51,9 +51,22 @@ bool RateLimiter::is_limited() {
 }
 
 void RateLimiter::decrease_one_request() {
-  num_concurrent_requests_.fetch_sub(1, std::memory_order_relaxed);
-  GAUGE_SET(num_concurrent_requests,
-            num_concurrent_requests_.load(std::memory_order_relaxed));
+  int32_t expected = num_concurrent_requests_.load(std::memory_order_relaxed);
+  while (true) {
+    if (expected <= 0 || expected == kSleeping) {
+      LOG(ERROR) << "Ignoring invalid rate limiter release at count "
+                 << expected;
+      return;
+    }
+    if (num_concurrent_requests_.compare_exchange_weak(
+            expected,
+            expected - 1,
+            std::memory_order_acq_rel,
+            std::memory_order_relaxed)) {
+      GAUGE_SET(num_concurrent_requests, expected - 1);
+      return;
+    }
+  }
 }
 
 bool RateLimiter::try_set_sleeping() {

@@ -459,11 +459,9 @@ void VLMEngine::update_last_step_result(std::vector<Batch>& last_batch) {
   std::vector<RawForwardOutput> raw_forward_outputs;
   raw_forward_outputs.reserve(dp_size_);
 
-  // NOTE: We only need to get the output from the driver worker,
-  // cause the output on other workers is the same as that on driver.
-  // Under data parallelism (DP), we need to get dp_size outputs.
-  // The `stride` means the workers num we can skip.
-  int32_t stride = dp_local_tp_size_;
+  // Consume every rank's completion so rank-local overlap failures are
+  // observable. Sampling still uses only each DP group's driver output.
+  constexpr int32_t stride = 1;
 
   for (int32_t worker_rank = 0; worker_rank < worker_clients_num_;
        worker_rank += stride) {
@@ -473,14 +471,25 @@ void VLMEngine::update_last_step_result(std::vector<Batch>& last_batch) {
   // wait for the all future to complete
   auto last_step_results = folly::collectAll(futures).get();
 
+  for (size_t worker_rank = 0; worker_rank < last_step_results.size();
+       ++worker_rank) {
+    const auto& result = last_step_results[worker_rank];
+    if (result.hasException()) {
+      LOG(ERROR) << "Worker " << worker_rank << " last-step execution failed: "
+                 << result.exception().what();
+      throw std::runtime_error("Worker " + std::to_string(worker_rank) +
+                               " last-step execution failed");
+    }
+    if (!result.value().has_value()) {
+      throw std::runtime_error("Worker " + std::to_string(worker_rank) +
+                               " returned no last-step output");
+    }
+  }
+
   for (int32_t worker_rank = 0; worker_rank < worker_clients_num_;
        worker_rank += dp_local_tp_size_) {
     auto result = last_step_results[worker_rank / stride].value();
-    if (result.has_value()) {
-      raw_forward_outputs.emplace_back(std::move(result.value()));
-    } else {
-      throw std::runtime_error("Failed to get last step results.");
-    }
+    raw_forward_outputs.emplace_back(std::move(result.value()));
   }
 
   for (size_t i = 0; i < last_batch.size(); ++i) {

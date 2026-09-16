@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "shm_channel.h"
 
+#include <stdexcept>
+
 #include "common/global_flags.h"
 #include "util/net.h"
 
@@ -68,6 +70,15 @@ void ShmChannel::execute_model_async(
     RawForwardOutput raw_output;
     bool shm_success = execute_model_with_shm(input, raw_output);
     if (shm_success) {
+      if (!raw_output.status.ok()) {
+        const std::string message =
+            raw_output.status.message().empty()
+                ? "worker shared-memory execution failed"
+                : raw_output.status.message();
+        promise.setException(
+            folly::make_exception_wrapper<std::runtime_error>(message));
+        return;
+      }
       promise.setValue(raw_output);
       return;
     }

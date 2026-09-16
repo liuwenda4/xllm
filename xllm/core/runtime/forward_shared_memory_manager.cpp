@@ -18,6 +18,7 @@ limitations under the License.
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <numeric>
 #include <optional>
@@ -60,6 +61,9 @@ namespace xllm {
 namespace {
 template <typename T>
 constexpr size_t type_size = sizeof(T);
+
+constexpr size_t kMinimumRawOutputShmSize =
+    sizeof(ControlMetadata) + type_size<uint8_t> + type_size<uint64_t>;
 
 constexpr size_t sampling_param_fixed_size() {
   return 5 * type_size<float>       // frequency_penalty, presence_penalty,
@@ -1204,9 +1208,37 @@ struct DeviceBufferSession final {
 
 struct ReadContext final {
   const char* descriptor_cursor;
+  const char* descriptor_end;
   const char* tensor_cursor;
+  const char* tensor_end;
   DeviceBufferSession* device_session = nullptr;
 };
+
+inline void ensure_read_available(const char* cursor,
+                                  const char* end,
+                                  uint64_t bytes,
+                                  const char* section) {
+  if (cursor > end || bytes > static_cast<uint64_t>(end - cursor)) {
+    throw std::invalid_argument(std::string("raw input ") + section +
+                                " overflow");
+  }
+}
+
+inline uint64_t descriptor_bytes_remaining(const ReadContext& context) {
+  return static_cast<uint64_t>(context.descriptor_end -
+                               context.descriptor_cursor);
+}
+
+inline void ensure_descriptor_count(const ReadContext& context,
+                                    uint64_t count,
+                                    uint64_t minimum_bytes_per_item,
+                                    const char* field) {
+  if (minimum_bytes_per_item == 0 ||
+      count > descriptor_bytes_remaining(context) / minimum_bytes_per_item) {
+    throw std::invalid_argument(std::string("raw input ") + field +
+                                " count overflow");
+  }
+}
 
 inline uint64_t get_tensor_payload_bytes(const torch::Tensor& tensor) {
   if (!tensor.defined()) {
@@ -1220,10 +1252,14 @@ inline bool has_device_buffer(const ReadContext& context) {
 }
 
 inline void advance_descriptor_cursor(ReadContext& context, size_t offset) {
+  ensure_read_available(
+      context.descriptor_cursor, context.descriptor_end, offset, "descriptor");
   context.descriptor_cursor += offset;
 }
 
 inline void advance_tensor_cursors(ReadContext& context, size_t offset) {
+  ensure_read_available(
+      context.tensor_cursor, context.tensor_end, offset, "tensor arena");
   context.tensor_cursor += offset;
   if (has_device_buffer(context)) {
     safe_advance_buffer(context.device_session->device_cursor, offset);
@@ -1238,7 +1274,11 @@ inline void read_data(const char*& buffer, T& data) {
 
 template <typename T>
 inline void read_data(ReadContext& context, T& data) {
-  data = *reinterpret_cast<const T*>(context.descriptor_cursor);
+  ensure_read_available(context.descriptor_cursor,
+                        context.descriptor_end,
+                        type_size<T>,
+                        "descriptor");
+  std::memcpy(&data, context.descriptor_cursor, type_size<T>);
   advance_descriptor_cursor(context, type_size<T>);
 }
 
@@ -1247,6 +1287,10 @@ inline void read_linear_state_cache_ops(
     std::vector<LinearStateCacheOp>& cache_ops) {
   uint64_t size;
   read_data(context, size);
+  ensure_descriptor_count(context,
+                          size,
+                          type_size<int32_t> * 2 + type_size<bool> * 2,
+                          "linear-state operation");
   cache_ops.resize(size);
   for (LinearStateCacheOp& cache_op : cache_ops) {
     read_data(context, cache_op.linear_state_id);
@@ -1294,6 +1338,8 @@ inline void read_string(ReadContext& context, std::string& str) {
   uint64_t len;
   read_data(context, len);
   if (len > 0) {
+    ensure_read_available(
+        context.descriptor_cursor, context.descriptor_end, len, "descriptor");
     str.assign(context.descriptor_cursor, len);
     advance_descriptor_cursor(context, len);
   } else {
@@ -1326,6 +1372,9 @@ inline void read_string_vector(ReadContext& context,
                                std::vector<std::string>& vec) {
   uint64_t size;
   read_data(context, size);
+  if (size > descriptor_bytes_remaining(context) / type_size<uint64_t>) {
+    throw std::invalid_argument("raw input string vector size overflow");
+  }
   vec.resize(size);
   for (uint64_t i = 0; i < size; ++i) {
     read_string(context, vec[i]);
@@ -1371,6 +1420,9 @@ inline TensorMeta read_tensor_meta(ReadContext& context) {
     return meta;
   }
 
+  if (ndim > descriptor_bytes_remaining(context) / type_size<int64_t>) {
+    throw std::invalid_argument("raw input tensor rank overflow");
+  }
   meta.shape.resize(ndim);
   for (size_t i = 0; i < ndim; ++i) {
     int64_t dim_size;
@@ -1382,6 +1434,19 @@ inline TensorMeta read_tensor_meta(ReadContext& context) {
   read_data(context, tensor_dtype);
   meta.dtype = static_cast<torch::ScalarType>(tensor_dtype);
   read_data(context, meta.data_bytes);
+
+  uint64_t expected_bytes = c10::elementSize(meta.dtype);
+  for (int64_t dim : meta.shape) {
+    if (dim < 0 ||
+        (dim > 0 && expected_bytes > std::numeric_limits<uint64_t>::max() /
+                                         static_cast<uint64_t>(dim))) {
+      throw std::invalid_argument("raw input tensor shape overflow");
+    }
+    expected_bytes *= static_cast<uint64_t>(dim);
+  }
+  if (expected_bytes != meta.data_bytes) {
+    throw std::invalid_argument("raw input tensor byte size mismatch");
+  }
   return meta;
 }
 
@@ -1468,6 +1533,11 @@ inline void read_tensor(ReadContext& context,
     return;
   }
 
+  ensure_read_available(context.tensor_cursor,
+                        context.tensor_end,
+                        get_aligned_tensor_arena_bytes(meta.data_bytes),
+                        "tensor arena");
+
   if (!force_host_materialize && has_device_buffer(context)) {
     tensor = materialize_tensor_from_current_cursor(
         meta, *context.device_session, stream);
@@ -1492,6 +1562,11 @@ inline void read_tensor_and_host(ReadContext& context,
   if (meta.shape.empty()) {
     return;
   }
+
+  ensure_read_available(context.tensor_cursor,
+                        context.tensor_end,
+                        get_aligned_tensor_arena_bytes(meta.data_bytes),
+                        "tensor arena");
 
   host_tensor = torch::from_blob(
       const_cast<void*>(static_cast<const void*>(context.tensor_cursor)),
@@ -1583,6 +1658,9 @@ template <typename T>
 inline void read_vector(ReadContext& context, std::vector<T>& vec) {
   uint64_t size;
   read_data(context, size);
+  if (size > descriptor_bytes_remaining(context) / type_size<T>) {
+    throw std::invalid_argument("raw input vector size overflow");
+  }
   vec.resize(size);
   if (size > 0) {
     const size_t bytes = size * type_size<T>;
@@ -1596,6 +1674,8 @@ void read_json_object_state_snapshots(
     std::vector<JsonObjectGrammarSnapshot>& snapshots) {
   uint64_t size;
   read_data(context, size);
+  ensure_descriptor_count(
+      context, size, type_size<bool> * 2 + type_size<uint64_t>, "snapshot");
   snapshots.resize(size);
   for (auto& snapshot : snapshots) {
     read_data(context, snapshot.enabled);
@@ -1613,6 +1693,17 @@ inline void read_tensor_and_vector(ReadContext& context,
   if (meta.shape.empty()) {
     return;
   }
+
+  if (meta.shape.size() != 1 || meta.shape[0] < 0 ||
+      static_cast<uint64_t>(meta.shape[0]) >
+          std::numeric_limits<size_t>::max() / type_size<T> ||
+      static_cast<uint64_t>(meta.shape[0]) * type_size<T> != meta.data_bytes) {
+    throw std::invalid_argument("raw input tensor/vector size mismatch");
+  }
+  ensure_read_available(context.tensor_cursor,
+                        context.tensor_end,
+                        get_aligned_tensor_arena_bytes(meta.data_bytes),
+                        "tensor arena");
 
   vec.resize(meta.shape[0]);
   if (has_device_buffer(context)) {
@@ -1712,6 +1803,7 @@ inline void read_instance_info(ReadContext& context, InstanceInfo& info) {
 
   uint64_t addr_count;
   read_data(context, addr_count);
+  ensure_descriptor_count(context, addr_count, type_size<uint64_t>, "address");
   info.addrs.resize(addr_count);
   for (auto& addr : info.addrs) {
     read_string(context, addr);
@@ -1722,6 +1814,10 @@ inline void read_instance_info(ReadContext& context, InstanceInfo& info) {
 
   uint64_t prof_size;
   read_data(context, prof_size);
+  ensure_descriptor_count(context,
+                          prof_size,
+                          sizeof(std::pair<int32_t, int64_t>),
+                          "profiling data");
   info.ttft_profiling_data.resize(prof_size);
   if (prof_size > 0) {
     std::memcpy(info.ttft_profiling_data.data(),
@@ -1762,6 +1858,10 @@ inline void read_kv_transfer_mappings(
     std::vector<KVTransferMapping>& mappings) {
   uint64_t mapping_count;
   read_data(context, mapping_count);
+  ensure_descriptor_count(context,
+                          mapping_count,
+                          type_size<int32_t> + type_size<uint64_t> * 2,
+                          "KV transfer mapping");
   mappings.resize(mapping_count);
   for (KVTransferMapping& mapping : mappings) {
     read_data(context, mapping.group_id);
@@ -1775,6 +1875,8 @@ inline void read_xtensor_layer_offsets(
     std::vector<XTensorLayerOffsets>& offsets) {
   uint64_t num_layers;
   read_data(context, num_layers);
+  ensure_descriptor_count(
+      context, num_layers, type_size<uint64_t> * 2, "xtensor layer");
   offsets.resize(num_layers);
   for (auto& layer : offsets) {
     read_vector(context, layer.k_offsets);
@@ -1836,6 +1938,7 @@ inline void read_swap_blocks(ReadContext& context,
                              std::vector<BlockTransferInfo>& blocks) {
   uint64_t size;
   read_data(context, size);
+  ensure_descriptor_count(context, size, type_size<int32_t> * 2, "swap block");
   blocks.reserve(size);
 
   int32_t src_block_id;
@@ -1863,6 +1966,13 @@ inline void read_vector_tensor(ReadContext& context,
                                bool force_host_materialize = false) {
   int32_t tensor_num;
   read_data(context, tensor_num);
+  if (tensor_num < 0) {
+    throw std::invalid_argument("raw input tensor vector count is negative");
+  }
+  ensure_descriptor_count(context,
+                          static_cast<uint64_t>(tensor_num),
+                          type_size<uint64_t>,
+                          "tensor vector");
   tensor_vec.resize(tensor_num);
   for (size_t i = 0; i < tensor_num; ++i) {
     read_tensor(context, tensor_vec[i], stream, force_host_materialize);
@@ -1896,11 +2006,23 @@ inline void read_mm_dict(const char*& buffer,
 inline void read_mm_dict(ReadContext& context, MMDict& mm_dict) {
   size_t size;
   read_data(context, size);
+  ensure_descriptor_count(context,
+                          size,
+                          type_size<uint64_t> + type_size<int32_t>,
+                          "multimodal dictionary");
   int32_t tensor_num;
   while (size--) {
     std::string mm_key;
     read_string(context, mm_key);
     read_data(context, tensor_num);
+    if (tensor_num < 0) {
+      throw std::invalid_argument(
+          "raw input multimodal tensor count is negative");
+    }
+    ensure_descriptor_count(context,
+                            static_cast<uint64_t>(tensor_num),
+                            type_size<uint64_t>,
+                            "multimodal tensor");
     if (tensor_num == 1) {
       torch::Tensor tensor;
       read_tensor(context, tensor);
@@ -1961,6 +2083,10 @@ inline void read_mm_item(ReadContext& context, MMDataItem& item) {
 
   read_tensor(context, state.mutable_mm_token_mask());
 
+  ensure_read_available(context.descriptor_cursor,
+                        context.descriptor_end,
+                        XXH3_128BITS_HASH_VALUE_LEN,
+                        "descriptor");
   std::memcpy(state.mutable_schedule_data().key.data,
               context.descriptor_cursor,
               XXH3_128BITS_HASH_VALUE_LEN);
@@ -2011,6 +2137,8 @@ inline void read_mm_data_items(ReadContext& context, MMData& mm_data) {
   read_data(context, mm_type);
   size_t mm_items_num;
   read_data(context, mm_items_num);
+  ensure_descriptor_count(
+      context, mm_items_num, type_size<uint32_t>, "multimodal item");
   MMItemVec mm_items;
   mm_items.reserve(mm_items_num);
   for (size_t idx = 0; idx < mm_items_num; ++idx) {
@@ -2054,6 +2182,8 @@ inline void read_mm_batch_data(ReadContext& context,
   read_data(context, mm_data_num);
   uint8_t is_mm_item;
   read_data(context, is_mm_item);
+  ensure_descriptor_count(
+      context, mm_data_num, type_size<uint32_t>, "multimodal batch");
   vec.reserve(mm_data_num);
   ReadMmDataFn read_mm_data =
       is_mm_item ? static_cast<ReadMmDataFn>(&read_mm_data_items)
@@ -2320,9 +2450,12 @@ inline void initialize_device_buffer_session(ReadContext& context,
   std::memcpy(
       forward_input.input_host_buffer.data_ptr(), payload_base, payload_size);
   const torch::Tensor& host_input_buffer = forward_input.input_host_buffer;
+  const uint64_t tensor_arena_bytes =
+      static_cast<uint64_t>(context.tensor_end - context.tensor_cursor);
   context.tensor_cursor =
       static_cast<const char*>(host_input_buffer.data_ptr()) +
       tensor_arena_offset;
+  context.tensor_end = context.tensor_cursor + tensor_arena_bytes;
 
   auto device_options =
       torch::TensorOptions().dtype(torch::kUInt8).device(device);
@@ -2388,24 +2521,34 @@ inline void deserialize_forward_input_payload(
     bool materialize_device_buffer = true,
     bool stabilize_dit_host_tensors = false) {
   const char* payload_base = buffer;
+  if (buffer_size < sizeof(RawInputLayoutHeader)) {
+    throw std::invalid_argument("raw input layout header overflow");
+  }
   RawInputLayoutHeader layout;
   read_data(buffer, layout.descriptor_bytes);
   read_data(buffer, layout.tensor_arena_offset);
   read_data(buffer, layout.tensor_arena_bytes);
-  CHECK_GE(buffer_size, sizeof(RawInputLayoutHeader))
-      << "raw input layout header overflow";
-  CHECK_GE(layout.tensor_arena_offset,
-           sizeof(RawInputLayoutHeader) + layout.descriptor_bytes)
-      << "raw input tensor arena overlaps descriptor";
-  CHECK_LE(layout.tensor_arena_offset + layout.tensor_arena_bytes, buffer_size)
-      << "raw input layout overflow";
-  CHECK_EQ(layout.tensor_arena_offset % kRawInputTensorArenaAlignment, 0)
-      << "raw input tensor arena offset is not aligned";
+  if (layout.descriptor_bytes > buffer_size - sizeof(RawInputLayoutHeader) ||
+      layout.tensor_arena_offset <
+          sizeof(RawInputLayoutHeader) + layout.descriptor_bytes) {
+    throw std::invalid_argument("raw input tensor arena overlaps descriptor");
+  }
+  if (layout.tensor_arena_offset > buffer_size ||
+      layout.tensor_arena_bytes > buffer_size - layout.tensor_arena_offset) {
+    throw std::invalid_argument("raw input layout overflow");
+  }
+  if (layout.tensor_arena_offset % kRawInputTensorArenaAlignment != 0) {
+    throw std::invalid_argument("raw input tensor arena offset is not aligned");
+  }
 
   DeviceBufferSession device_session;
   const char* descriptor_base = buffer;
   const char* tensor_arena_base = payload_base + layout.tensor_arena_offset;
-  ReadContext context{descriptor_base, tensor_arena_base, &device_session};
+  ReadContext context{descriptor_base,
+                      descriptor_base + layout.descriptor_bytes,
+                      tensor_arena_base,
+                      tensor_arena_base + layout.tensor_arena_bytes,
+                      &device_session};
   initialize_device_buffer_session(context,
                                    forward_input,
                                    device,
@@ -2438,9 +2581,11 @@ inline void deserialize_forward_input_payload(
                          input_params.attention.device.q_cu_seq_lens,
                          input_params.attention.host.q_cu_seq_lens,
                          stream);
-  CHECK_EQ(input_params.attention.host.q_seq_lens.empty(),
-           input_params.attention.host.q_cu_seq_lens.empty())
-      << "q_seq_lens and q_cu_seq_lens must be provided together";
+  if (input_params.attention.host.q_seq_lens.empty() !=
+      input_params.attention.host.q_cu_seq_lens.empty()) {
+    throw std::invalid_argument(
+        "q_seq_lens and q_cu_seq_lens must be provided together");
+  }
   read_tensor_and_vector(context,
                          input_params.attention.device.kv_seq_lens,
                          input_params.attention.host.kv_seq_lens,
@@ -2552,6 +2697,8 @@ inline void deserialize_forward_input_payload(
   // device cursor when a contiguous device buffer is active.
   uint64_t transfer_count;
   read_data(context, transfer_count);
+  ensure_descriptor_count(
+      context, transfer_count, type_size<uint64_t>, "KV transfer");
   forward_input.transfer_kv_infos.resize(transfer_count);
   for (auto& transfer : forward_input.transfer_kv_infos) {
     read_transfer_kv_info(context, transfer);
@@ -2571,7 +2718,13 @@ inline void deserialize_forward_input_payload(
                        stream);
   int32_t manager_num = 0;
   read_data(context, manager_num);
-  CHECK_GE(manager_num, 0) << "multi_block_tables manager num is invalid.";
+  if (manager_num < 0) {
+    throw std::invalid_argument("multi_block_tables manager num is invalid");
+  }
+  ensure_descriptor_count(context,
+                          static_cast<uint64_t>(manager_num),
+                          type_size<uint64_t>,
+                          "multi-block table");
   input_params.multi_block_tables.reserve(static_cast<size_t>(manager_num));
   for (int32_t i = 0; i < manager_num; ++i) {
     torch::Tensor manager_table;
@@ -2667,7 +2820,10 @@ size_t calculate_json_object_errors_size(
 }
 
 size_t calculate_raw_forward_output_size(const RawForwardOutput& output) {
-  size_t size = 0;
+  size_t size = type_size<uint8_t> + get_string_size(output.status.message());
+  if (!output.status.ok()) {
+    return size;
+  }
 
   size += type_size<uint64_t>;
   for (const auto& sample : output.outputs) {
@@ -2767,6 +2923,20 @@ void read_json_object_errors(const char*& buffer,
 
 void deserialize_raw_forward_output(const char* buffer,
                                     RawForwardOutput& output) {
+  output = RawForwardOutput();
+  uint8_t status_code;
+  std::string status_message;
+  read_data(buffer, status_code);
+  read_string(buffer, status_message);
+  if (status_code > static_cast<uint8_t>(StatusCode::UNAVAILABLE)) {
+    status_code = static_cast<uint8_t>(StatusCode::UNKNOWN);
+  }
+  output.status =
+      Status(static_cast<StatusCode>(status_code), std::move(status_message));
+  if (!output.status.ok()) {
+    return;
+  }
+
   uint64_t outputs_count;
   read_data(buffer, outputs_count);
   output.outputs.resize(outputs_count);
@@ -2792,6 +2962,12 @@ void deserialize_raw_forward_output(const char* buffer,
 
 void serialize_raw_forward_output(const RawForwardOutput& output,
                                   char*& buffer) {
+  write_data(buffer, static_cast<uint8_t>(output.status.code()));
+  write_string(buffer, output.status.message());
+  if (!output.status.ok()) {
+    return;
+  }
+
   write_data(buffer, static_cast<uint64_t>(output.outputs.size()));
   for (const auto& sample : output.outputs) {
     write_raw_sample_output(buffer, sample);
@@ -3313,6 +3489,11 @@ ForwardSharedMemoryManager::ForwardSharedMemoryManager(const std::string& name,
                                                        bool& is_creator,
                                                        ForwardType type)
     : SharedMemoryManager(name, size, is_creator), forward_type_(type) {
+  if (forward_type_ == ForwardType::RAW_OUTPUT &&
+      size < kMinimumRawOutputShmSize) {
+    throw std::invalid_argument(
+        "raw output shared memory is too small for a failure status");
+  }
   control_ptr_ = static_cast<ControlMetadata*>(base_address());
   metadata_addr_ = static_cast<char*>(base_address()) + sizeof(ControlMetadata);
   if (::xllm::ExecutionConfig::get_instance().use_contiguous_input_buffer()) {
@@ -3464,16 +3645,33 @@ bool ForwardSharedMemoryManager::raw_output_write(
     }
   }
   output.json_object_errors = json_object_errors;
+  return raw_output_write(output);
+}
+
+bool ForwardSharedMemoryManager::raw_output_write(
+    const RawForwardOutput& requested_output) {
+  const RawForwardOutput* output = &requested_output;
+  RawForwardOutput overflow_output;
   uint64_t total_size = sizeof(ControlMetadata);
-  total_size += calculate_raw_forward_output_size(output);
+  total_size += calculate_raw_forward_output_size(*output);
   if (unlikely(total_size > size())) {
     LOG(ERROR) << "raw output size overflow, total_size: " << total_size
                << ", shm size: " << size();
-    return false;
+    overflow_output.status =
+        Status(StatusCode::RESOURCE_EXHAUSTED,
+               "raw output exceeds shared memory capacity");
+    output = &overflow_output;
+    total_size =
+        sizeof(ControlMetadata) + calculate_raw_forward_output_size(*output);
+    if (unlikely(total_size > size())) {
+      overflow_output.status = Status(StatusCode::RESOURCE_EXHAUSTED);
+      total_size = sizeof(ControlMetadata) +
+                   calculate_raw_forward_output_size(overflow_output);
+    }
   }
 
   char* data_ptr = static_cast<char*>(base_address()) + sizeof(ControlMetadata);
-  serialize_raw_forward_output(output, data_ptr);
+  serialize_raw_forward_output(*output, data_ptr);
   std::atomic_thread_fence(std::memory_order_release);
   control_ptr_->version = ++last_version_;
   return true;

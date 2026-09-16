@@ -21,9 +21,11 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -1903,6 +1905,33 @@ TEST(BatchTest, ForwardOutputProtoRoundTripPreservesJsonObjectErrors) {
             "missing prior sampled output row");
 }
 
+TEST(BatchTest, ForwardOutputProtoRoundTripPreservesFailureStatus) {
+  proto::ForwardOutput proto_output;
+  status_to_proto(Status(StatusCode::UNKNOWN, "injected worker failure"),
+                  proto_output.mutable_status());
+
+  RawForwardOutput round_trip;
+  round_trip.outputs.resize(1);
+  proto_to_forward_output(proto_output, round_trip);
+
+  EXPECT_FALSE(round_trip.status.ok());
+  EXPECT_EQ(round_trip.status.code(), StatusCode::UNKNOWN);
+  EXPECT_EQ(round_trip.status.message(), "injected worker failure");
+  EXPECT_TRUE(round_trip.outputs.empty());
+}
+
+TEST(BatchTest, ForwardOutputProtoNormalizesFalseOkCode) {
+  proto::ForwardOutput proto_output;
+  proto_output.mutable_status()->set_ok(false);
+  proto_output.mutable_status()->set_message("legacy failure");
+
+  RawForwardOutput round_trip;
+  proto_to_forward_output(proto_output, round_trip);
+
+  EXPECT_EQ(round_trip.status.code(), StatusCode::UNKNOWN);
+  EXPECT_EQ(round_trip.status.message(), "legacy failure");
+}
+
 TEST(BatchTest, ForwardOutputShmRoundTripPreservesJsonObjectErrors) {
   bool is_creator = false;
   const std::string shm_name = ForwardSharedMemoryManager::create_unique_name(
@@ -1952,6 +1981,114 @@ TEST(BatchTest, ForwardOutputShmRoundTripPreservesJsonObjectErrors) {
   EXPECT_EQ(round_trip.json_object_errors[0].sample_sequence_id, "req-error#0");
   EXPECT_EQ(round_trip.json_object_errors[0].message,
             "prior token violates json_object grammar");
+}
+
+TEST(BatchTest, ForwardOutputShmOverflowPublishesFailureStatus) {
+  bool is_creator = false;
+  const std::string shm_name = ForwardSharedMemoryManager::create_unique_name(
+      "batch_test_forward_output_overflow",
+      /*dp_group=*/0,
+      ForwardType::RAW_OUTPUT,
+      /*rank=*/0);
+  ForwardSharedMemoryManager writer_manager(
+      shm_name, 256, is_creator, ForwardType::RAW_OUTPUT);
+  bool is_reader_creator = false;
+  ForwardSharedMemoryManager reader_manager(
+      shm_name, 256, is_reader_creator, ForwardType::RAW_OUTPUT);
+  const torch::Tensor undefined;
+  const torch::Tensor next_tokens =
+      torch::arange(1024, torch::TensorOptions().dtype(torch::kInt64))
+          .reshape({1, 1024});
+
+  ASSERT_TRUE(writer_manager.raw_output_write(next_tokens,
+                                              undefined,
+                                              undefined,
+                                              undefined,
+                                              undefined,
+                                              /*mm_embeddings=*/{},
+                                              /*speculative_token_stats=*/{},
+                                              /*dit_images=*/{},
+                                              /*dit_text_output=*/{},
+                                              undefined,
+                                              /*prepared_token=*/-1,
+                                              undefined,
+                                              undefined,
+                                              undefined,
+                                              /*json_object_errors=*/{}));
+
+  RawForwardOutput round_trip;
+  round_trip.outputs.resize(1);
+  reader_manager.raw_output_read(round_trip);
+
+  EXPECT_FALSE(round_trip.status.ok());
+  EXPECT_EQ(round_trip.status.code(), StatusCode::RESOURCE_EXHAUSTED);
+  EXPECT_EQ(round_trip.status.message(),
+            "raw output exceeds shared memory capacity");
+  EXPECT_TRUE(round_trip.outputs.empty());
+}
+
+TEST(BatchTest, ForwardOutputShmMinimumCapacityPublishesFailureStatus) {
+  constexpr size_t shm_size =
+      sizeof(ControlMetadata) + sizeof(uint8_t) + sizeof(uint64_t);
+  bool is_creator = false;
+  const std::string shm_name = ForwardSharedMemoryManager::create_unique_name(
+      "batch_test_forward_output_minimum",
+      /*dp_group=*/0,
+      ForwardType::RAW_OUTPUT,
+      /*rank=*/0);
+  ForwardSharedMemoryManager writer_manager(
+      shm_name, shm_size, is_creator, ForwardType::RAW_OUTPUT);
+  bool is_reader_creator = false;
+  ForwardSharedMemoryManager reader_manager(
+      shm_name, shm_size, is_reader_creator, ForwardType::RAW_OUTPUT);
+  RawForwardOutput oversized;
+  oversized.status = Status(StatusCode::UNKNOWN, "message does not fit");
+
+  ASSERT_TRUE(writer_manager.raw_output_write(oversized));
+
+  RawForwardOutput round_trip;
+  reader_manager.raw_output_read(round_trip);
+  EXPECT_EQ(round_trip.status.code(), StatusCode::RESOURCE_EXHAUSTED);
+  EXPECT_TRUE(round_trip.status.message().empty());
+}
+
+TEST(BatchTest, ForwardOutputShmRejectsLessThanMinimumCapacity) {
+  constexpr size_t shm_size =
+      sizeof(ControlMetadata) + sizeof(uint8_t) + sizeof(uint64_t) - 1;
+  bool is_creator = false;
+  const std::string shm_name = ForwardSharedMemoryManager::create_unique_name(
+      "batch_test_forward_output_too_small",
+      /*dp_group=*/0,
+      ForwardType::RAW_OUTPUT,
+      /*rank=*/0);
+
+  EXPECT_THROW(ForwardSharedMemoryManager(
+                   shm_name, shm_size, is_creator, ForwardType::RAW_OUTPUT),
+               std::invalid_argument);
+}
+
+TEST(BatchTest, MalformedPackedInputThrowsInsteadOfTerminating) {
+  ForwardInput malformed;
+  malformed.input_host_buffer =
+      torch::zeros({8}, torch::TensorOptions().dtype(torch::kUInt8));
+  ForwardInput output;
+
+  EXPECT_THROW(detail::unpack_from_input_host_buffer(
+                   malformed, torch::Device(torch::kCPU), output),
+               std::invalid_argument);
+}
+
+TEST(BatchTest, TruncatedPackedInputDescriptorThrows) {
+  ForwardInput malformed;
+  malformed.input_host_buffer =
+      torch::zeros({32}, torch::TensorOptions().dtype(torch::kUInt8));
+  const uint64_t layout[] = {8, 32, 0};
+  std::memcpy(malformed.input_host_buffer.data_ptr(), layout, sizeof(layout));
+  ForwardInput output;
+
+  EXPECT_THROW(detail::unpack_from_input_host_buffer(
+                   malformed, torch::Device(torch::kCPU), output),
+               std::invalid_argument);
 }
 
 TEST(BatchTest, ForwardInputBlockCopyKernelFieldsMatchExpectedLayout) {

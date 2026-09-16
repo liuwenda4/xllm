@@ -213,7 +213,11 @@ Worker::get_last_step_result_async() {
   folly::Promise<std::optional<ForwardOutput>> promise;
   auto future = promise.getSemiFuture();
   threadpool_.schedule([this, promise = std::move(promise)]() mutable {
-    promise.setValue(impl_->get_last_step_result());
+    try {
+      promise.setValue(impl_->get_last_step_result());
+    } catch (...) {
+      promise.setException(folly::exception_wrapper(std::current_exception()));
+    }
   });
   return future;
 }

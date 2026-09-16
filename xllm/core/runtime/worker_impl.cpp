@@ -1527,100 +1527,111 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
   threadpool_.schedule([this,
                         input = std::move(input_on_device),
                         promise = std::move(promise)]() mutable {
-    if (hierarchy_kv_cache_transfer_ != nullptr) {
-      hierarchy_kv_cache_transfer_->set_layer_synchronizer(input.input_params);
-    }
-
-    // run the model on the given input in working thread
-    if (!enable_schedule_overlap()) {
-      auto output = this->step(input);
-      if (output.has_value()) {
-        output->is_graph_warmup = input.input_params.meta.is_graph_warmup;
-      }
-      promise.setValue(std::move(output));
-    } else {
-      if (input.token_ids.numel() > 0 &&
-          input.input_params.meta.batch_forward_type.has_decode()) {
-        if (can_use_last_step_output_for_schedule_overlap(input)) {
-          // replace step i model input with true output of step i-1
-          input = update_input_by_last_step_output_for_schedule_overlap(input);
-        } else {
-          update_json_object_states_by_last_step_output(input);
-          sanitize_json_object_error_inputs(input);
-        }
+    try {
+      if (hierarchy_kv_cache_transfer_ != nullptr) {
+        hierarchy_kv_cache_transfer_->set_layer_synchronizer(
+            input.input_params);
       }
 
-      auto output = this->step_for_schedule_overlap(input);
-#if defined(USE_NPU)
-      if (output.has_value() && !output->sample_output.next_tokens.defined() &&
-          output->ready_event != nullptr && !output->retained_inputs.empty()) {
-        CHECK(output->ready_event->synchronize())
-            << "failed to retire asynchronous output without tokens";
-      }
-#endif
-      if (output.has_value()) {
-        output->is_graph_warmup = input.input_params.meta.is_graph_warmup;
-        output->json_object_errors.insert(output->json_object_errors.end(),
-                                          input.json_object_errors.begin(),
-                                          input.json_object_errors.end());
-        if (is_driver() || ::xllm::EPLBConfig::get_instance().enable_eplb()) {
-          std::unique_lock<std::mutex> lock(mtx_);
-          cv_.wait(lock, [this] { return !is_recorded_; });
-          update_last_step_output(output,
-                                  input.input_params.embedding.request_ids,
-                                  input.sample_sequence_ids);
-          is_recorded_ = true;
-          cv_.notify_one();
-        } else {
-#if defined(USE_NPU)
-          // Driver outputs are copied by GetLastStepResult, which waits for the
-          // ready event before the retained no-sync inputs can be released.
-          // Non-driver ranks are not queried by LLMEngine. In eager DP MTP,
-          // overwriting their previous output can therefore release temporary
-          // DP/EP padding tensors while ATB still holds their device addresses.
-          // Keep one-step scheduler overlap, but retire the previous eager
-          // output only after its compute event has completed.
-          const bool wait_for_eager_dp_spec_input_lifetime =
-              last_step_output_valid_ && options_.enable_speculative_decode() &&
-              parallel_args_.dp_size() > 1 &&
-              !::xllm::ExecutionConfig::get_instance().enable_graph() &&
-              last_step_output_.ready_event != nullptr;
-          if (wait_for_eager_dp_spec_input_lifetime) {
-            CHECK(last_step_output_.ready_event->synchronize())
-                << "failed to retire previous eager DP speculative input";
-          }
-#endif
-          update_last_step_output(output,
-                                  input.input_params.embedding.request_ids,
-                                  input.sample_sequence_ids);
+      // run the model on the given input in working thread
+      if (!enable_schedule_overlap()) {
+        auto output = this->step(input);
+        if (output.has_value()) {
+          output->is_graph_warmup = input.input_params.meta.is_graph_warmup;
         }
+        promise.setValue(std::move(output));
       } else {
-        if (is_driver() || ::xllm::EPLBConfig::get_instance().enable_eplb()) {
+        if (input.token_ids.numel() > 0 &&
+            input.input_params.meta.batch_forward_type.has_decode()) {
+          if (can_use_last_step_output_for_schedule_overlap(input)) {
+            // replace step i model input with true output of step i-1
+            input =
+                update_input_by_last_step_output_for_schedule_overlap(input);
+          } else {
+            update_json_object_states_by_last_step_output(input);
+            sanitize_json_object_error_inputs(input);
+          }
+        }
+
+        auto output = this->step_for_schedule_overlap(input);
+#if defined(USE_NPU)
+        if (output.has_value() &&
+            !output->sample_output.next_tokens.defined() &&
+            output->ready_event != nullptr &&
+            !output->retained_inputs.empty()) {
+          CHECK(output->ready_event->synchronize())
+              << "failed to retire asynchronous output without tokens";
+        }
+#endif
+        if (output.has_value()) {
+          output->is_graph_warmup = input.input_params.meta.is_graph_warmup;
+          output->json_object_errors.insert(output->json_object_errors.end(),
+                                            input.json_object_errors.begin(),
+                                            input.json_object_errors.end());
+          if (!is_driver() &&
+              !::xllm::EPLBConfig::get_instance().enable_eplb()) {
+#if defined(USE_NPU)
+            // Retire the previous eager output only after its compute event has
+            // completed so replacing the non-driver completion record cannot
+            // release temporary DP/EP padding tensors still held by ATB.
+            const bool wait_for_eager_dp_spec_input_lifetime =
+                last_step_output_valid_ &&
+                options_.enable_speculative_decode() &&
+                parallel_args_.dp_size() > 1 &&
+                !::xllm::ExecutionConfig::get_instance().enable_graph() &&
+                last_step_output_.ready_event != nullptr;
+            if (wait_for_eager_dp_spec_input_lifetime) {
+              CHECK(last_step_output_.ready_event->synchronize())
+                  << "failed to retire previous eager DP speculative input";
+            }
+#endif
+          }
           std::unique_lock<std::mutex> lock(mtx_);
           cv_.wait(lock, [this] { return !is_recorded_; });
+          last_step_exception_ = nullptr;
+          update_last_step_output(output,
+                                  input.input_params.embedding.request_ids,
+                                  input.sample_sequence_ids);
+          is_recorded_ = true;
+          cv_.notify_one();
+        } else {
+          std::unique_lock<std::mutex> lock(mtx_);
+          cv_.wait(lock, [this] { return !is_recorded_; });
+          last_step_exception_ = nullptr;
           last_step_output_valid_ = false;
           last_step_output_ = ForwardOutput();
           last_step_request_ids_.clear();
           last_step_sample_sequence_ids_.clear();
           is_recorded_ = true;
           cv_.notify_one();
-        } else {
-          last_step_output_valid_ = false;
-          last_step_output_ = ForwardOutput();
-          last_step_request_ids_.clear();
-          last_step_sample_sequence_ids_.clear();
         }
+        promise.setValue(output);
       }
-      promise.setValue(output);
+    } catch (...) {
+      std::exception_ptr exception = std::current_exception();
+      if (enable_schedule_overlap()) {
+        std::unique_lock<std::mutex> lock(mtx_);
+        cv_.wait(lock, [this] { return !is_recorded_; });
+        last_step_output_valid_ = false;
+        last_step_output_ = ForwardOutput();
+        last_step_request_ids_.clear();
+        last_step_sample_sequence_ids_.clear();
+        last_step_exception_ = exception;
+        is_recorded_ = true;
+        cv_.notify_one();
+      }
+      promise.setException(folly::exception_wrapper(exception));
     }
   });
   return future;
 }
 
-ForwardOutput WorkerImpl::get_last_step_result() {
-  ForwardOutput output;
+std::optional<ForwardOutput> WorkerImpl::get_last_step_result() {
+  std::optional<ForwardOutput> output;
+  std::exception_ptr exception;
   std::unique_lock<std::mutex> lock(mtx_);
   cv_.wait(lock, [this] { return is_recorded_; });
+  exception = std::exchange(last_step_exception_, nullptr);
   if (last_step_output_valid_ ||
       ::xllm::EPLBConfig::get_instance().enable_eplb() ||
       !last_step_output_.json_object_errors.empty()) {
@@ -1628,6 +1639,10 @@ ForwardOutput WorkerImpl::get_last_step_result() {
   }
   is_recorded_ = false;
   cv_.notify_one();
+  lock.unlock();
+  if (exception != nullptr) {
+    std::rethrow_exception(exception);
+  }
   return output;
 }
 

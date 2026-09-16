@@ -129,6 +129,7 @@ class ForwardSharedMemoryManager : public SharedMemoryManager {
       const torch::Tensor& out_tokens,
       const torch::Tensor& out_logprobs,
       const std::vector<JsonObjectOutputError>& json_object_errors);
+  bool raw_output_write(const RawForwardOutput& output);
   void raw_output_read(RawForwardOutput& outputs);
 
   void clear();

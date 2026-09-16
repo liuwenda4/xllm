@@ -719,6 +719,7 @@ struct RawSampleOutput {
 };
 
 struct RawForwardOutput {
+  Status status;
   std::vector<RawSampleOutput> outputs;  // num seqs
   std::vector<JsonObjectOutputError> json_object_errors;
   std::vector<int64_t> expert_load_data;

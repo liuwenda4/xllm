@@ -162,7 +162,15 @@ void ThreadPool::internal_loop(size_t index,
       // nullptr is a signal to exit
       break;
     }
-    runnable();
+    try {
+      runnable();
+    } catch (const std::exception& error) {
+      LOG(ERROR) << "Unhandled exception in ThreadPool " << pool_name_
+                 << " worker " << index << ": " << error.what();
+    } catch (...) {
+      LOG(ERROR) << "Unhandled non-standard exception in ThreadPool "
+                 << pool_name_ << " worker " << index;
+    }
   }
 }
 

@@ -1205,23 +1205,9 @@ void LLMEngine::update_last_step_result(std::vector<Batch>& last_batch) {
   std::vector<RawForwardOutput> raw_forward_outputs;
   raw_forward_outputs.reserve(dp_size_);
 
-  // NOTE: We only need to get the output from the driver worker,
-  // cause the output on other workers is the same as that on driver.
-  // Under data parallelism (DP), we need to get dp_size outputs.
-  // The `stride` means the workers num we can skip.
-  // One retrievable result per DP group lives on its driver worker
-  // (dp_driver_: rank % (tp_size*cp_size) == 0), spaced dp_local_size_
-  // (= tp_size*cp_size) apart. dp_local_tp_size_ divides by cp_size, so
-  // under cp_size>1 it lands on cp_rank=1 non-driver workers whose
-  // get_last_step_result() blocks forever on cv_.wait(is_recorded_).
-  uint32_t stride = dp_local_size_;
-  // If EPLB is enabled, we need to get results from all workers,
-  // because the experts on each worker are different,
-  // and the tokens load of all experts needs to be returned to engine.
-  // so we can not skip any worker.
-  if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
-    stride = 1;
-  }
+  // Consume every rank's completion so rank-local overlap failures are
+  // observable. Sampling still uses only each DP group's driver output.
+  constexpr uint32_t stride = 1;
 
   for (auto worker_rank = 0; worker_rank < worker_clients_num_;
        worker_rank += stride) {
@@ -1231,6 +1217,21 @@ void LLMEngine::update_last_step_result(std::vector<Batch>& last_batch) {
   // wait for the all future to complete
   auto last_step_results = folly::collectAll(futures).get();
 
+  for (size_t worker_rank = 0; worker_rank < last_step_results.size();
+       ++worker_rank) {
+    const auto& result = last_step_results[worker_rank];
+    if (result.hasException()) {
+      LOG(ERROR) << "Worker " << worker_rank << " last-step execution failed: "
+                 << result.exception().what();
+      throw std::runtime_error("Worker " + std::to_string(worker_rank) +
+                               " last-step execution failed");
+    }
+    if (!result.value().has_value()) {
+      throw std::runtime_error("Worker " + std::to_string(worker_rank) +
+                               " returned no last-step output");
+    }
+  }
+
   if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
     process_eplb_data(last_step_results, completed_activation_token);
   }
@@ -1238,11 +1239,7 @@ void LLMEngine::update_last_step_result(std::vector<Batch>& last_batch) {
   for (auto worker_rank = 0; worker_rank < worker_clients_num_;
        worker_rank += dp_local_size_) {
     auto result = last_step_results[worker_rank / stride].value();
-    if (result.has_value()) {
-      raw_forward_outputs.emplace_back(std::move(result.value()));
-    } else {
-      LOG(FATAL) << "Failed to get last step results, result has no value";
-    }
+    raw_forward_outputs.emplace_back(std::move(result.value()));
   }
 
   for (auto i = 0; i < last_batch.size(); i++) {

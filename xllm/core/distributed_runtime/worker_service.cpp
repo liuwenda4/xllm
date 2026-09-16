@@ -21,6 +21,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <boost/algorithm/string.hpp>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -91,6 +92,17 @@ std::vector<std::string> build_speculative_position_labels(
     labels.emplace_back(std::to_string(position));
   }
   return labels;
+}
+
+bool uses_schedule_overlap(const runtime::Options& options) {
+  return options.enable_schedule_overlap() && options.backend() != "dit";
+}
+
+void set_forward_error(proto::ForwardOutput* output,
+                       const std::string& message) {
+  output->Clear();
+  status_to_proto(Status(StatusCode::UNKNOWN, message),
+                  output->mutable_status());
 }
 
 }  // namespace
@@ -250,18 +262,21 @@ void WorkerService::step(
     torch::Tensor& out_logprobs,
     std::vector<JsonObjectOutputError>& json_object_errors) {
   speculative_token_stats.clear();
+  const bool schedule_overlap = uses_schedule_overlap(options_);
   const bool use_default_stream =
-      !options_.enable_schedule_overlap() && options_.backend() == "llm";
-  if (options_.enable_schedule_overlap()) {
+      !schedule_overlap && options_.backend() == "llm";
+  if (schedule_overlap) {
     stabilize_schedule_overlap_host_views(fwd_input);
   }
   // execute model
   auto future = worker_->step_async(fwd_input);
-  if (!options_.enable_schedule_overlap()) {
+  if (!schedule_overlap) {
     auto forward_outputs = std::move(future).get();
+    if (!forward_outputs.has_value()) {
+      throw std::runtime_error("worker returned no forward output");
+    }
     // convert ForwardOutput to proto::ForwardOutput which contain Tokens.
-    if (forward_outputs) {
-      DCHECK(forward_outputs.has_value()) << "Failed to execute model";
+    {
       const auto& sample_output = forward_outputs.value().sample_output;
       const auto& beam_search_output =
           forward_outputs.value().beam_search_output;
@@ -385,71 +400,94 @@ void WorkerService::create_polling_shm_thread(
         device_.set_device();
         Timer timer;
         while (true) {
-          ForwardInput fwd_input;
-          // NPU graph task updates cannot safely overlap an H2D enqueue from
-          // the SHM polling thread. Keep scheduler overlap, but defer device
-          // materialization to WorkerImpl's ordered prepare stream.
-          const InputDeviceMaterializationPolicy materialization_policy =
-              options_.enable_schedule_overlap() && options_.enable_graph()
-                  ? InputDeviceMaterializationPolicy::DEFER_TO_WORKER_PREPARE
-                  : InputDeviceMaterializationPolicy::MATERIALIZE_ON_READ;
-          input_shm_manager->input_read(
-              fwd_input, device_, materialization_policy);
-          timer.reset();
-          // model output variables
-          torch::Tensor next_tokens;
-          torch::Tensor logprobs;
-          torch::Tensor top_tokens;
-          torch::Tensor top_logprobs;
-          torch::Tensor embeddings;
-          std::vector<std::vector<torch::Tensor>> mm_embeddings;
-          std::vector<SpeculativeTokenStats> speculative_token_stats;
-          std::vector<torch::Tensor> dit_images;
-          std::vector<std::string> dit_text_output;
-          torch::Tensor expert_load_data;
-          int64_t prepared_token = -1;
+          try {
+            ForwardInput fwd_input;
+            // NPU graph task updates cannot safely overlap an H2D enqueue from
+            // the SHM polling thread. Keep scheduler overlap, but defer device
+            // materialization to WorkerImpl's ordered prepare stream.
+            const InputDeviceMaterializationPolicy materialization_policy =
+                uses_schedule_overlap(options_) && options_.enable_graph()
+                    ? InputDeviceMaterializationPolicy::DEFER_TO_WORKER_PREPARE
+                    : InputDeviceMaterializationPolicy::MATERIALIZE_ON_READ;
+            input_shm_manager->input_read(
+                fwd_input, device_, materialization_policy);
+            timer.reset();
+            // model output variables
+            torch::Tensor next_tokens;
+            torch::Tensor logprobs;
+            torch::Tensor top_tokens;
+            torch::Tensor top_logprobs;
+            torch::Tensor embeddings;
+            std::vector<std::vector<torch::Tensor>> mm_embeddings;
+            std::vector<SpeculativeTokenStats> speculative_token_stats;
+            std::vector<torch::Tensor> dit_images;
+            std::vector<std::string> dit_text_output;
+            torch::Tensor expert_load_data;
+            int64_t prepared_token = -1;
 
-          // beam search kernel output
-          torch::Tensor src_seq_idxes;
-          torch::Tensor out_tokens;
-          torch::Tensor out_logprobs;
-          std::vector<JsonObjectOutputError> json_object_errors;
+            // beam search kernel output
+            torch::Tensor src_seq_idxes;
+            torch::Tensor out_tokens;
+            torch::Tensor out_logprobs;
+            std::vector<JsonObjectOutputError> json_object_errors;
 
-          step(fwd_input,
-               next_tokens,
-               logprobs,
-               top_tokens,
-               top_logprobs,
-               embeddings,
-               mm_embeddings,
-               speculative_token_stats,
-               dit_images,
-               dit_text_output,
-               expert_load_data,
-               prepared_token,
-               src_seq_idxes,
-               out_tokens,
-               out_logprobs,
-               json_object_errors);
+            step(fwd_input,
+                 next_tokens,
+                 logprobs,
+                 top_tokens,
+                 top_logprobs,
+                 embeddings,
+                 mm_embeddings,
+                 speculative_token_stats,
+                 dit_images,
+                 dit_text_output,
+                 expert_load_data,
+                 prepared_token,
+                 src_seq_idxes,
+                 out_tokens,
+                 out_logprobs,
+                 json_object_errors);
 
-          const bool shm_write_ok =
-              output_shm_manager->raw_output_write(next_tokens,
-                                                   logprobs,
-                                                   top_tokens,
-                                                   top_logprobs,
-                                                   embeddings,
-                                                   mm_embeddings,
-                                                   speculative_token_stats,
-                                                   dit_images,
-                                                   dit_text_output,
-                                                   expert_load_data,
-                                                   prepared_token,
-                                                   src_seq_idxes,
-                                                   out_tokens,
-                                                   out_logprobs,
-                                                   json_object_errors);
-          CHECK(shm_write_ok) << "Worker output shared memory write failed.";
-          COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
+            const bool shm_write_ok =
+                output_shm_manager->raw_output_write(next_tokens,
+                                                     logprobs,
+                                                     top_tokens,
+                                                     top_logprobs,
+                                                     embeddings,
+                                                     mm_embeddings,
+                                                     speculative_token_stats,
+                                                     dit_images,
+                                                     dit_text_output,
+                                                     expert_load_data,
+                                                     prepared_token,
+                                                     src_seq_idxes,
+                                                     out_tokens,
+                                                     out_logprobs,
+                                                     json_object_errors);
+            if (!shm_write_ok) {
+              throw std::runtime_error(
+                  "worker output shared memory write failed");
+            }
+            COUNTER_ADD(worker_service_latency_seconds,
+                        timer.elapsed_seconds());
+          } catch (const std::exception& error) {
+            LOG(ERROR) << "Worker shared-memory execution failed: "
+                       << error.what();
+            RawForwardOutput failure;
+            failure.status = Status(StatusCode::UNKNOWN, error.what());
+            if (!output_shm_manager->raw_output_write(failure)) {
+              LOG(ERROR) << "Failed to publish worker shared-memory error";
+            }
+          } catch (...) {
+            LOG(ERROR) << "Worker shared-memory execution failed with an "
+                          "unknown exception";
+            RawForwardOutput failure;
+            failure.status =
+                Status(StatusCode::UNKNOWN, "unknown worker execution failure");
+            if (!output_shm_manager->raw_output_write(failure)) {
+              LOG(ERROR) << "Failed to publish worker shared-memory error";
+            }
+          }
         }
       });
   return;
@@ -827,69 +865,80 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
   threadpool_->schedule(
       [this, controller, pb_forward_input, pb_forward_output, done]() mutable {
         brpc::ClosureGuard done_guard(done);
-        // convert proto::ForwardInput to ForwardInput
+        try {
+          // convert proto::ForwardInput to ForwardInput
 
-        Timer timer;
-        ForwardInput forward_input;
-        CHECK(pb_forward_input->has_packed_input())
-            << "ForwardInput must be sent via packed_input";
-        packed_proto_to_forward_input(pb_forward_input->packed_input(),
-                                      forward_input,
-                                      device_,
-                                      stream_.get());
+          Timer timer;
+          ForwardInput forward_input;
+          if (!pb_forward_input->has_packed_input()) {
+            throw std::invalid_argument(
+                "ForwardInput must be sent via packed_input");
+          }
+          packed_proto_to_forward_input(pb_forward_input->packed_input(),
+                                        forward_input,
+                                        device_,
+                                        stream_.get());
 
-        // model output
-        torch::Tensor next_tokens;
-        torch::Tensor logprobs;
-        torch::Tensor top_tokens;
-        torch::Tensor top_logprobs;
-        torch::Tensor embeddings;
-        std::vector<std::vector<torch::Tensor>> mm_embeddings;
-        std::vector<SpeculativeTokenStats> speculative_token_stats;
-        std::vector<torch::Tensor> dit_images;
-        std::vector<std::string> dit_text_output;
-        torch::Tensor expert_load_data;
-        int64_t prepared_token = -1;
-        // beam search kernel output
-        torch::Tensor src_seq_idxes;
-        torch::Tensor out_tokens;
-        torch::Tensor out_logprobs;
-        std::vector<JsonObjectOutputError> json_object_errors;
+          // model output
+          torch::Tensor next_tokens;
+          torch::Tensor logprobs;
+          torch::Tensor top_tokens;
+          torch::Tensor top_logprobs;
+          torch::Tensor embeddings;
+          std::vector<std::vector<torch::Tensor>> mm_embeddings;
+          std::vector<SpeculativeTokenStats> speculative_token_stats;
+          std::vector<torch::Tensor> dit_images;
+          std::vector<std::string> dit_text_output;
+          torch::Tensor expert_load_data;
+          int64_t prepared_token = -1;
+          // beam search kernel output
+          torch::Tensor src_seq_idxes;
+          torch::Tensor out_tokens;
+          torch::Tensor out_logprobs;
+          std::vector<JsonObjectOutputError> json_object_errors;
 
-        step(forward_input,
-             next_tokens,
-             logprobs,
-             top_tokens,
-             top_logprobs,
-             embeddings,
-             mm_embeddings,
-             speculative_token_stats,
-             dit_images,
-             dit_text_output,
-             expert_load_data,
-             prepared_token,
-             src_seq_idxes,
-             out_tokens,
-             out_logprobs,
-             json_object_errors);
-        // convert to proto output
-        forward_output_to_proto(next_tokens,
-                                logprobs,
-                                top_tokens,
-                                top_logprobs,
-                                embeddings,
-                                mm_embeddings,
-                                speculative_token_stats,
-                                expert_load_data,
-                                prepared_token,
-                                src_seq_idxes,
-                                out_tokens,
-                                out_logprobs,
-                                dit_images,
-                                dit_text_output,
-                                json_object_errors,
-                                pb_forward_output);
-        COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
+          step(forward_input,
+               next_tokens,
+               logprobs,
+               top_tokens,
+               top_logprobs,
+               embeddings,
+               mm_embeddings,
+               speculative_token_stats,
+               dit_images,
+               dit_text_output,
+               expert_load_data,
+               prepared_token,
+               src_seq_idxes,
+               out_tokens,
+               out_logprobs,
+               json_object_errors);
+          // convert to proto output
+          forward_output_to_proto(next_tokens,
+                                  logprobs,
+                                  top_tokens,
+                                  top_logprobs,
+                                  embeddings,
+                                  mm_embeddings,
+                                  speculative_token_stats,
+                                  expert_load_data,
+                                  prepared_token,
+                                  src_seq_idxes,
+                                  out_tokens,
+                                  out_logprobs,
+                                  dit_images,
+                                  dit_text_output,
+                                  json_object_errors,
+                                  pb_forward_output);
+          COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
+        } catch (const std::exception& error) {
+          LOG(ERROR) << "ExecuteModel failed: " << error.what();
+          set_forward_error(pb_forward_output, error.what());
+        } catch (...) {
+          LOG(ERROR) << "ExecuteModel failed with an unknown exception";
+          set_forward_error(pb_forward_output,
+                            "unknown worker execution failure");
+        }
       });
 }
 
@@ -901,133 +950,144 @@ void WorkerService::GetLastStepResult(
   threadpool_->schedule(
       [this, controller, req, pb_forward_output, done]() mutable {
         brpc::ClosureGuard done_guard(done);
-        const bool use_default_stream =
-            !options_.enable_schedule_overlap() && options_.backend() == "llm";
+        try {
+          const bool use_default_stream = !options_.enable_schedule_overlap() &&
+                                          options_.backend() == "llm";
 
-        auto future = worker_->get_last_step_result_async();
-        auto forward_outputs = std::move(future).get();
-        if (forward_outputs) {
-          const ForwardOutput& forward_output = forward_outputs.value();
-          const auto& sample_output = forward_output.sample_output;
-          int64_t prepared_token = forward_output.prepared_token;
-          const auto& beam_search_output = forward_output.beam_search_output;
-          torch::Tensor expert_load_data;
-          torch::Tensor embeddings;
-          torch::Tensor next_tokens;
-          torch::Tensor logprobs;
-          torch::Tensor top_tokens;
-          torch::Tensor top_logprobs;
-          torch::Tensor src_seq_idxes;
-          torch::Tensor out_tokens;
-          torch::Tensor out_logprobs;
-          std::vector<SpeculativeTokenStats> speculative_token_stats;
-          std::vector<torch::Tensor> dit_images;
-          std::vector<std::string> dit_text_output;
-          auto copy_output_to_host = [&]() {
-            if (options_.enable_schedule_overlap()) {
-              CHECK(stream_->wait_event(forward_output.ready_event))
-                  << "failed to wait forward output ready event";
-            }
-            expert_load_data = safe_to(forward_output.expert_load_data,
-                                       torch::kCPU,
-                                       /*non_blocking=*/true);
+          auto future = worker_->get_last_step_result_async();
+          auto forward_outputs = std::move(future).get();
+          if (forward_outputs) {
+            const ForwardOutput& forward_output = forward_outputs.value();
+            const auto& sample_output = forward_output.sample_output;
+            int64_t prepared_token = forward_output.prepared_token;
+            const auto& beam_search_output = forward_output.beam_search_output;
+            torch::Tensor expert_load_data;
+            torch::Tensor embeddings;
+            torch::Tensor next_tokens;
+            torch::Tensor logprobs;
+            torch::Tensor top_tokens;
+            torch::Tensor top_logprobs;
+            torch::Tensor src_seq_idxes;
+            torch::Tensor out_tokens;
+            torch::Tensor out_logprobs;
+            std::vector<SpeculativeTokenStats> speculative_token_stats;
+            std::vector<torch::Tensor> dit_images;
+            std::vector<std::string> dit_text_output;
+            auto copy_output_to_host = [&]() {
+              if (options_.enable_schedule_overlap()) {
+                CHECK(stream_->wait_event(forward_output.ready_event))
+                    << "failed to wait forward output ready event";
+              }
+              expert_load_data = safe_to(forward_output.expert_load_data,
+                                         torch::kCPU,
+                                         /*non_blocking=*/true);
 
-            // [num_seq, ..., embed_dim]
-            embeddings = safe_to(sample_output.embeddings,
-                                 torch::kCPU,
-                                 /*non_blocking=*/true);
-            embeddings = safe_to(embeddings,
-                                 torch::kFloat32,
-                                 /*non_blocking=*/true);
-
-            dit_images.reserve(
-                forward_output.dit_forward_output.tensors.size());
-            for (auto image : forward_output.dit_forward_output.tensors) {
-              dit_images.emplace_back(image);
-            }
-            dit_text_output =
-                forward_outputs.value().dit_forward_output.text_output;
-
-            // [num_seq]
-            next_tokens = safe_to(sample_output.next_tokens,
-                                  torch::kCPU,
-                                  /*non_blocking=*/true);
-            if (next_tokens.defined() ||
-                ::xllm::EPLBConfig::get_instance().enable_eplb()) {
-              // [num_seq] FloatTensor
-              logprobs = safe_to(sample_output.logprobs,
-                                 torch::kCPU,
-                                 /*non_blocking=*/true);
-              // [num_seq, topk]
-              top_tokens = safe_to(sample_output.top_tokens,
+              // [num_seq, ..., embed_dim]
+              embeddings = safe_to(sample_output.embeddings,
                                    torch::kCPU,
                                    /*non_blocking=*/true);
-              // [num_seq, topk]
-              top_logprobs = safe_to(sample_output.top_logprobs,
+              embeddings = safe_to(embeddings,
+                                   torch::kFloat32,
+                                   /*non_blocking=*/true);
+
+              dit_images.reserve(
+                  forward_output.dit_forward_output.tensors.size());
+              for (auto image : forward_output.dit_forward_output.tensors) {
+                dit_images.emplace_back(image);
+              }
+              dit_text_output =
+                  forward_outputs.value().dit_forward_output.text_output;
+
+              // [num_seq]
+              next_tokens = safe_to(sample_output.next_tokens,
+                                    torch::kCPU,
+                                    /*non_blocking=*/true);
+              if (next_tokens.defined() ||
+                  ::xllm::EPLBConfig::get_instance().enable_eplb()) {
+                // [num_seq] FloatTensor
+                logprobs = safe_to(sample_output.logprobs,
+                                   torch::kCPU,
+                                   /*non_blocking=*/true);
+                // [num_seq, topk]
+                top_tokens = safe_to(sample_output.top_tokens,
                                      torch::kCPU,
                                      /*non_blocking=*/true);
-              // [num_seq]
-              src_seq_idxes = safe_to(beam_search_output.src_seq_idxes,
-                                      torch::kCPU,
-                                      /*non_blocking=*/true);
-              // [num_seq]
-              out_tokens = safe_to(beam_search_output.out_tokens,
-                                   torch::kCPU,
-                                   /*non_blocking=*/true);
-              // [num_seq]
-              out_logprobs =
-                  safe_to(beam_search_output.out_logprobs,
-                          torch::dtype(torch::kFloat32).device(torch::kCPU),
-                          /*non_blocking=*/true);
-            }
-          };
+                // [num_seq, topk]
+                top_logprobs = safe_to(sample_output.top_logprobs,
+                                       torch::kCPU,
+                                       /*non_blocking=*/true);
+                // [num_seq]
+                src_seq_idxes = safe_to(beam_search_output.src_seq_idxes,
+                                        torch::kCPU,
+                                        /*non_blocking=*/true);
+                // [num_seq]
+                out_tokens = safe_to(beam_search_output.out_tokens,
+                                     torch::kCPU,
+                                     /*non_blocking=*/true);
+                // [num_seq]
+                out_logprobs =
+                    safe_to(beam_search_output.out_logprobs,
+                            torch::dtype(torch::kFloat32).device(torch::kCPU),
+                            /*non_blocking=*/true);
+              }
+            };
 
-          if (use_default_stream) {
-            copy_output_to_host();
-          } else {
-            c10::StreamGuard stream_guard = stream_->set_stream_guard();
-            if (forward_outputs.value().ready_event != nullptr) {
-              CHECK(stream_->wait_event(forward_outputs.value().ready_event))
-                  << "wait forward output ready event failed.";
+            if (use_default_stream) {
+              copy_output_to_host();
+            } else {
+              c10::StreamGuard stream_guard = stream_->set_stream_guard();
+              if (forward_outputs.value().ready_event != nullptr) {
+                CHECK(stream_->wait_event(forward_outputs.value().ready_event))
+                    << "wait forward output ready event failed.";
+              }
+              copy_output_to_host();
             }
-            copy_output_to_host();
-          }
-          if (use_default_stream) {
-            device_.synchronize_default_stream();
-          } else {
-            stream_->synchronize();
+            if (use_default_stream) {
+              device_.synchronize_default_stream();
+            } else {
+              stream_->synchronize();
 #if defined(USE_NPU)
-            DeviceMonitor::get_instance().update_active_activation_memory(
-                device_.index());
+              DeviceMonitor::get_instance().update_active_activation_memory(
+                  device_.index());
 #endif
-          }
-          speculative_token_stats = record_speculative_metrics_from_output(
-              next_tokens,
-              sample_output.speculative_token_stats,
-              forward_output.is_graph_warmup);
+            }
+            speculative_token_stats = record_speculative_metrics_from_output(
+                next_tokens,
+                sample_output.speculative_token_stats,
+                forward_output.is_graph_warmup);
 
-          if (next_tokens.defined() || !dit_images.empty() ||
-              !dit_text_output.empty() ||
-              ::xllm::EPLBConfig::get_instance().enable_eplb() ||
-              !forward_output.json_object_errors.empty()) {
-            const std::vector<std::vector<torch::Tensor>> mm_embeddings;
-            forward_output_to_proto(next_tokens,
-                                    logprobs,
-                                    top_tokens,
-                                    top_logprobs,
-                                    embeddings,
-                                    mm_embeddings,
-                                    speculative_token_stats,
-                                    expert_load_data,
-                                    prepared_token,
-                                    src_seq_idxes,
-                                    out_tokens,
-                                    out_logprobs,
-                                    dit_images,
-                                    dit_text_output,
-                                    forward_output.json_object_errors,
-                                    pb_forward_output);
+            if (next_tokens.defined() || !dit_images.empty() ||
+                !dit_text_output.empty() ||
+                ::xllm::EPLBConfig::get_instance().enable_eplb() ||
+                !forward_output.json_object_errors.empty()) {
+              const std::vector<std::vector<torch::Tensor>> mm_embeddings;
+              forward_output_to_proto(next_tokens,
+                                      logprobs,
+                                      top_tokens,
+                                      top_logprobs,
+                                      embeddings,
+                                      mm_embeddings,
+                                      speculative_token_stats,
+                                      expert_load_data,
+                                      prepared_token,
+                                      src_seq_idxes,
+                                      out_tokens,
+                                      out_logprobs,
+                                      dit_images,
+                                      dit_text_output,
+                                      forward_output.json_object_errors,
+                                      pb_forward_output);
+            }
+          } else {
+            throw std::runtime_error("worker returned no last-step output");
           }
+        } catch (const std::exception& error) {
+          LOG(ERROR) << "GetLastStepResult failed: " << error.what();
+          set_forward_error(pb_forward_output, error.what());
+        } catch (...) {
+          LOG(ERROR) << "GetLastStepResult failed with an unknown exception";
+          set_forward_error(pb_forward_output,
+                            "unknown worker last-step failure");
         }
       });
   return;
