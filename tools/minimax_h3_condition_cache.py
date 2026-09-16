@@ -31,7 +31,7 @@ from typing import Any
 import torch
 from safetensors.torch import load_file, save_file
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 RUNTIME_CONDITION_SCHEMA = "xllm.minimax_h3.text_conditioning/v1"
 CONDITION_ABI = {
     "name": "minimax_h3_qwen_layer50_condition",
@@ -77,6 +77,35 @@ def file_sha256(path: Path) -> str:
 def tensor_sha256(tensor: torch.Tensor) -> str:
     value = tensor.detach().to("cpu").contiguous()
     return hashlib.sha256(value.view(torch.uint8).numpy().tobytes()).hexdigest()
+
+
+def image_pixels_sha256(path: Path) -> str:
+    import cv2
+    import numpy as np
+
+    encoded = np.frombuffer(path.read_bytes(), dtype=np.uint8)
+    image = cv2.imdecode(encoded, cv2.IMREAD_UNCHANGED)
+    if image is None or image.dtype != np.uint8:
+        raise ValueError(f"Image reference must decode to 8-bit pixels: {path}")
+    if image.ndim == 2:
+        rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    elif image.ndim == 3 and image.shape[2] == 3:
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    elif image.ndim == 3 and image.shape[2] == 4:
+        alpha = image[:, :, 3].astype(np.float32) / np.float32(255.0)
+        inverse_alpha = np.float32(1.0) - alpha
+        rgb = np.stack(
+            [
+                image[:, :, channel].astype(np.float32) * alpha + np.float32(255.0) * inverse_alpha
+                for channel in (2, 1, 0)
+            ],
+            axis=2,
+        )
+        rgb = np.floor(rgb + np.float32(0.5)).astype(np.uint8)
+    else:
+        raise ValueError(f"Image reference has an unsupported channel layout: {path}")
+    pixels = torch.from_numpy(np.array(rgb, dtype=np.uint8, copy=True)).permute(2, 0, 1).contiguous()
+    return tensor_sha256(pixels.unsqueeze(0))
 
 
 def _validate_backend(backend: str) -> None:
@@ -134,7 +163,12 @@ def build_cache_key_inputs(
         if not isinstance(reference_type, str) or not reference_type:
             raise ValueError(f"ordered_references[{index}].type must be non-empty")
         _validate_sha256(digest, f"ordered_references[{index}].sha256")
-        normalized_references.append({"type": reference_type, "sha256": digest})
+        normalized_reference = {"type": reference_type, "sha256": digest}
+        if reference_type == "image":
+            pixels_digest = reference.get("pixels_sha256")
+            _validate_sha256(pixels_digest, f"ordered_references[{index}].pixels_sha256")
+            normalized_reference["pixels_sha256"] = pixels_digest
+        normalized_references.append(normalized_reference)
 
     inputs = {
         "backend": backend,
@@ -296,7 +330,10 @@ def _reference_identities(references: Sequence[tuple[str, Path]]) -> list[dict[s
         if not reference_type:
             raise ValueError(f"Reference {index} has an empty type")
         path = _resolved_file(reference_path, f"reference {index}")
-        identities.append({"type": reference_type, "path": str(path), "sha256": file_sha256(path)})
+        identity = {"type": reference_type, "path": str(path), "sha256": file_sha256(path)}
+        if reference_type == "image":
+            identity["pixels_sha256"] = image_pixels_sha256(path)
+        identities.append(identity)
     return identities
 
 
@@ -431,7 +468,16 @@ def validate_cache_entry(cache_dir: Path, expected_key: str | None = None) -> di
         references = manifest.get("ordered_references")
         if not isinstance(references, list):
             raise CacheValidationError("manifest ordered_references must be a list")
-        reference_identity = [{"type": item.get("type"), "sha256": item.get("sha256")} for item in references]
+        for index, reference in enumerate(references):
+            if reference.get("type") == "image":
+                _validate_sha256(reference.get("pixels_sha256"), f"reference {index} pixels sha256")
+        reference_identity = [
+            {
+                **{"type": item.get("type"), "sha256": item.get("sha256")},
+                **({"pixels_sha256": item.get("pixels_sha256")} if item.get("type") == "image" else {}),
+            }
+            for item in references
+        ]
         if reference_identity != cache_key_inputs.get("ordered_references"):
             raise CacheValidationError("reference provenance does not match cache key inputs")
 
@@ -477,6 +523,9 @@ def validate_cache_entry(cache_dir: Path, expected_key: str | None = None) -> di
             "hidden_digest": actual_tensors["prompt_embeds"]["sha256"],
             "token_tags_digest": actual_tensors["text_token_tags"]["sha256"],
             "condition_cache_key": actual_key,
+            "reference_pixels_digest": references[0].get("pixels_sha256")
+            if len(references) == 1 and references[0].get("type") == "image"
+            else None,
         }
         if manifest.get("runtime_bundle_manifest") != expected_runtime_manifest:
             raise CacheValidationError("runtime condition bundle manifest mismatch")
@@ -544,7 +593,7 @@ def create_condition_cache(
         backend=backend,
         checkpoint_identity=checkpoint_key_identity,
         prompt_bytes_sha256=prompt["sha256"],
-        ordered_references=[{"type": item["type"], "sha256": item["sha256"]} for item in reference_identities],
+        ordered_references=reference_identities,
         **normalization,
     )
     cache_key = compute_cache_key(cache_key_inputs)
@@ -595,6 +644,9 @@ def create_condition_cache(
             "hidden_digest": tensor_metadata["prompt_embeds"]["sha256"],
             "token_tags_digest": tensor_metadata["text_token_tags"]["sha256"],
             "condition_cache_key": cache_key,
+            "reference_pixels_digest": reference_identities[0].get("pixels_sha256")
+            if len(reference_identities) == 1 and reference_identities[0].get("type") == "image"
+            else None,
         }
         manifest = {
             "schema_version": SCHEMA_VERSION,

@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 import torch
+from PIL import Image
 from safetensors.torch import load_file
 
 import tools.minimax_h3_condition_cache as condition_cache
@@ -54,8 +55,8 @@ def _official_cache_args(tmp_path: Path) -> dict[str, Any]:
     _save_archive(source_archive, hidden, torch.tensor([0, 1, 0], dtype=torch.int64))
     prompt_path = tmp_path / "prompt.txt"
     prompt_path.write_bytes(b"local prompt\n")
-    reference_path = tmp_path / "reference.bin"
-    reference_path.write_bytes(b"local reference")
+    reference_path = tmp_path / "reference.png"
+    Image.new("RGB", (2, 2), color=(17, 31, 47)).save(reference_path)
     checkpoint_manifest = tmp_path / "checkpoint.json"
     checkpoint_manifest.write_text('{"checkpoint_digest":"abc"}\n', encoding="utf-8")
     official_summary = tmp_path / "summary.json"
@@ -65,7 +66,7 @@ def _official_cache_args(tmp_path: Path) -> dict[str, Any]:
                 "status": "H3_QWEN_LAYER50_REFERENCE_PASS",
                 "tensor_archive_sha256": condition_cache.file_sha256(source_archive),
                 "prompt_sha256": hashlib.sha256(b"local prompt\n").hexdigest(),
-                "image_sha256": hashlib.sha256(b"local reference").hexdigest(),
+                "image_sha256": condition_cache.file_sha256(reference_path),
                 "lm_head_executed": False,
                 "layer_49_output_pre_final_norm": {"shape": list(hidden.shape)},
             }
@@ -93,7 +94,7 @@ def test_cache_key_is_canonical_and_preserves_reference_order() -> None:
         "backend": "official_hf",
         "prompt_bytes_sha256": "b" * 64,
         "ordered_references": [
-            {"type": "image", "sha256": "c" * 64},
+            {"type": "image", "sha256": "c" * 64, "pixels_sha256": "f" * 64},
             {"type": "video", "sha256": "d" * 64},
         ],
         "fps": 24.0,
@@ -110,6 +111,14 @@ def test_cache_key_is_canonical_and_preserves_reference_order() -> None:
     reversed_references = dict(common)
     reversed_references["ordered_references"] = list(reversed(common["ordered_references"]))
     assert build_cache_key(checkpoint_identity={"revision": "r1", "digest": "e" * 64}, **reversed_references) != first
+
+
+def test_image_digest_matches_request_ingress_alpha_compositing(tmp_path: Path) -> None:
+    reference_path = tmp_path / "transparent.png"
+    Image.new("RGBA", (1, 1), color=(10, 20, 30, 128)).save(reference_path)
+    expected = torch.tensor([[[[132]], [[137]], [[142]]]], dtype=torch.uint8)
+
+    assert condition_cache.image_pixels_sha256(reference_path) == condition_cache.tensor_sha256(expected)
 
 
 def test_official_extraction_squeezes_batch_and_makes_bfloat16_contiguous() -> None:
@@ -190,6 +199,10 @@ def test_official_cache_manifest_and_condition_provenance(tmp_path: Path) -> Non
     assert manifest["checkpoint_identity_inputs"]["values"] == {"revision": "local-revision"}
     assert manifest["prompt"]["sha256"] == hashlib.sha256(b"local prompt\n").hexdigest()
     assert manifest["ordered_references"][0]["type"] == "image"
+    expected_pixels = torch.tensor(
+        [[[[17, 17], [17, 17]], [[31, 31], [31, 31]], [[47, 47], [47, 47]]]], dtype=torch.uint8
+    )
+    assert manifest["ordered_references"][0]["pixels_sha256"] == condition_cache.tensor_sha256(expected_pixels)
     assert manifest["normalization_parameters"] == {
         "fps": 24.0,
         "video_sample_fps": 2.0,
@@ -208,6 +221,7 @@ def test_official_cache_manifest_and_condition_provenance(tmp_path: Path) -> Non
         "hidden_digest": manifest["tensors"]["prompt_embeds"]["sha256"],
         "token_tags_digest": manifest["tensors"]["text_token_tags"]["sha256"],
         "condition_cache_key": manifest["cache_key"],
+        "reference_pixels_digest": manifest["ordered_references"][0]["pixels_sha256"],
     }
 
 
@@ -318,7 +332,7 @@ def test_cli_defaults_to_official_and_prints_cache_directory(
     prompt_path = tmp_path / "prompt.txt"
     prompt_path.write_text("prompt", encoding="utf-8")
     reference_path = tmp_path / "reference.png"
-    reference_path.write_bytes(b"image")
+    Image.new("RGB", (2, 2), color=(17, 31, 47)).save(reference_path)
     checkpoint_manifest = tmp_path / "checkpoint.json"
     checkpoint_manifest.write_text("{}\n", encoding="utf-8")
     summary_path = tmp_path / "summary.json"

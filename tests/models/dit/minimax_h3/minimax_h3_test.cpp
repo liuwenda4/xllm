@@ -3668,14 +3668,79 @@ TEST(MiniMaxH3C7ProductionTest, MatchesOfficialFullResolutionRef2VA) {
   std::cout << "G8_REF2VA_E2E=PASS" << std::endl;
 }
 
-TEST(MiniMaxH3PipelineTest, ForwardFailsInsteadOfReturningFakeMedia) {
-  try {
-    MiniMaxH3PipelineImpl::throw_forward_unavailable();
-    FAIL() << "Expected H3-C7 public forward failure";
-  } catch (const std::logic_error& error) {
-    EXPECT_NE(std::string(error.what()).find("no production Ref2VA"),
-              std::string::npos);
+TEST(MiniMaxH3PublicRuntimeTest, UsesPinnedReferenceResizeGeometry) {
+  EXPECT_EQ(minimax_h3_reference_resize_geometry(/*height=*/1336,
+                                                 /*width=*/3616),
+            (std::pair<int64_t, int64_t>{2048, 5536}));
+  EXPECT_EQ(minimax_h3_reference_resize_geometry(/*height=*/128,
+                                                 /*width=*/345),
+            (std::pair<int64_t, int64_t>{2048, 5504}));
+  EXPECT_THROW(minimax_h3_reference_resize_geometry(/*height=*/100,
+                                                    /*width=*/500),
+               std::invalid_argument);
+}
+
+TEST(MiniMaxH3PublicRuntimeTest, UsesOneSequentialCpuNoiseGenerator) {
+  const std::vector<std::vector<int64_t>> shapes = {{2, 3}, {1, 4}, {3, 2}};
+  const std::vector<torch::Tensor> actual =
+      minimax_h3_draw_sequential_cpu_noise(/*seed=*/42, shapes);
+
+  torch::Generator generator = torch::make_generator<torch::CPUGeneratorImpl>();
+  generator.set_current_seed(42);
+  std::vector<torch::Tensor> expected;
+  for (const auto& shape : shapes) {
+    expected.emplace_back(torch::randn(
+        shape,
+        generator,
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32)));
   }
+
+  ASSERT_EQ(actual.size(), expected.size());
+  for (size_t index = 0; index < actual.size(); ++index) {
+    EXPECT_TRUE(torch::equal(actual[index], expected[index]));
+  }
+  EXPECT_FALSE(torch::equal(actual[0].flatten().slice(0, 0, 4), actual[1]));
+}
+
+TEST(MiniMaxH3PublicRuntimeTest, ValidatesConditionAndReferenceDigests) {
+  DiTForwardInput input;
+  input.batch_size = 1;
+  input.prompt_embeds = torch::zeros({1, 11350, 5120}, torch::kBFloat16);
+  input.text_token_tags = torch::zeros({1, 11350}, torch::kInt64);
+  input.images = torch::zeros({1, 3, 1336, 3616}, torch::kUInt8);
+  input.condition_schemas = {std::string(kMiniMaxH3ConditionSchemaV1)};
+  input.condition_source_backends = {"official_hf"};
+  input.generation_params.width = 1344;
+  input.generation_params.height = 768;
+  input.generation_params.num_frames = 124;
+  input.generation_params.video_fps = 24.0;
+  input.generation_params.num_inference_steps = 50;
+  input.generation_params.num_images_per_prompt = 1;
+  input.generation_params.num_videos_per_prompt = 1;
+  input.generation_params.force_video_output = true;
+  input.generation_params.seed = 42;
+  input.generation_params.seed_is_set = true;
+  nlohmann::json manifest = {
+      {"schema", kMiniMaxH3ConditionSchemaV1},
+      {"source_backend", "official_hf"},
+      {"decoder_layer_index", 49},
+      {"hidden_state_slot", 50},
+      {"token_count", 11350},
+      {"condition_cache_key", std::string(64, '0')},
+      {"hidden_digest",
+       minimax_h3_tensor_sha256(input.prompt_embeds.squeeze(0))},
+      {"token_tags_digest",
+       minimax_h3_tensor_sha256(input.text_token_tags.squeeze(0))},
+      {"reference_pixels_digest", minimax_h3_tensor_sha256(input.images)}};
+  input.condition_manifest_jsons = {manifest.dump()};
+
+  EXPECT_NO_THROW(
+      MiniMaxH3PipelineImpl::validate_public_request_contract(input));
+
+  manifest["hidden_digest"] = std::string(64, '1');
+  input.condition_manifest_jsons = {manifest.dump()};
+  EXPECT_THROW(MiniMaxH3PipelineImpl::validate_public_request_contract(input),
+               std::invalid_argument);
 }
 
 }  // namespace
