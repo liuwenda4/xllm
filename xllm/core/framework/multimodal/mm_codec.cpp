@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -650,6 +651,10 @@ struct MemWriteCtx {
 struct Writer {
   static int32_t write(void* opaque, uint8_t* buf, int32_t buf_size) {
     auto* mc = static_cast<MemWriteCtx*>(opaque);
+    if (buf_size < 0 ||
+        mc->pos > std::numeric_limits<int64_t>::max() - buf_size) {
+      return AVERROR(EOVERFLOW);
+    }
     int64_t end_pos = mc->pos + buf_size;
     if (end_pos > static_cast<int64_t>(mc->buf->size())) {
       mc->buf->resize(static_cast<size_t>(end_pos), 0);
@@ -664,16 +669,33 @@ struct Writer {
     if (whence == AVSEEK_SIZE) {
       return static_cast<int64_t>(mc->buf->size());
     }
+    whence &= ~AVSEEK_FORCE;
     int64_t pos = 0;
     switch (whence) {
       case SEEK_SET:
         pos = offset;
         break;
       case SEEK_CUR:
+        if ((offset > 0 &&
+             mc->pos > std::numeric_limits<int64_t>::max() - offset) ||
+            (offset < 0 &&
+             mc->pos < std::numeric_limits<int64_t>::min() - offset)) {
+          return AVERROR(EOVERFLOW);
+        }
         pos = mc->pos + offset;
         break;
       case SEEK_END:
-        pos = static_cast<int64_t>(mc->buf->size()) + offset;
+        if (mc->buf->size() > static_cast<size_t>(INT64_MAX)) {
+          return AVERROR(EOVERFLOW);
+        }
+        pos = static_cast<int64_t>(mc->buf->size());
+        if ((offset > 0 &&
+             pos > std::numeric_limits<int64_t>::max() - offset) ||
+            (offset < 0 &&
+             pos < std::numeric_limits<int64_t>::min() - offset)) {
+          return AVERROR(EOVERFLOW);
+        }
+        pos += offset;
         break;
       default:
         return AVERROR(EINVAL);
@@ -1008,12 +1030,458 @@ class MemoryVideoWriter final : public MemoryMediaWriter {
   AVFrame* yuv_frame_ = nullptr;
 };
 
+class MemoryVideoAudioWriter final {
+ public:
+  MemoryVideoAudioWriter() = default;
+
+  ~MemoryVideoAudioWriter() {
+    if (sws_ctx_) {
+      sws_freeContext(sws_ctx_);
+    }
+    if (video_frame_) {
+      av_frame_free(&video_frame_);
+    }
+    if (audio_frame_) {
+      av_frame_free(&audio_frame_);
+    }
+    if (pkt_) {
+      av_packet_free(&pkt_);
+    }
+    if (video_ctx_) {
+      avcodec_free_context(&video_ctx_);
+    }
+    if (audio_ctx_) {
+      avcodec_free_context(&audio_ctx_);
+    }
+    if (fmt_ctx_) {
+      if (header_written_ && !trailer_attempted_) {
+        trailer_attempted_ = true;
+        av_write_trailer(fmt_ctx_);
+      }
+      avformat_free_context(fmt_ctx_);
+    }
+    if (avio_ctx_) {
+      av_freep(&avio_ctx_->buffer);
+      avio_context_free(&avio_ctx_);
+    }
+  }
+
+  bool write(const torch::Tensor& video,
+             const torch::Tensor& audio,
+             double fps,
+             int32_t audio_sample_rate,
+             std::string& raw_data) {
+    if (!validate_inputs(video, audio, fps, audio_sample_rate)) {
+      return false;
+    }
+
+    const int32_t frames = static_cast<int32_t>(video.size(0));
+    const int32_t height = static_cast<int32_t>(video.size(2));
+    const int32_t width = static_cast<int32_t>(video.size(3));
+    const int32_t channels = static_cast<int32_t>(audio.size(0));
+    const int64_t samples = audio.size(1);
+
+    if (!init_output() || !init_video(width, height, fps) ||
+        !init_audio(channels, audio_sample_rate) ||
+        avformat_write_header(fmt_ctx_, nullptr) < 0) {
+      LOG(ERROR) << "MemoryVideoAudioWriter: failed to initialize MP4 streams";
+      return false;
+    }
+    header_written_ = true;
+
+    if (!init_frames(width, height, channels, audio_sample_rate)) {
+      return false;
+    }
+
+    auto audio_acc = audio.accessor<float, 2>();
+    int32_t video_idx = 0;
+    int64_t audio_offset = 0;
+    int64_t audio_pts = 0;
+
+    while (video_idx < frames || audio_offset < samples) {
+      const bool write_video =
+          video_idx < frames && (audio_offset >= samples ||
+                                 av_compare_ts(video_idx,
+                                               video_ctx_->time_base,
+                                               audio_offset,
+                                               audio_ctx_->time_base) <= 0);
+      if (write_video) {
+        if (!write_video_frame(video, video_idx, height, width)) {
+          return false;
+        }
+        ++video_idx;
+      } else {
+        if (!write_audio_frame(
+                audio_acc, audio_offset, samples, channels, audio_pts)) {
+          return false;
+        }
+      }
+    }
+
+    if (!flush_encoder(video_ctx_, video_stream_) ||
+        !flush_encoder(audio_ctx_, audio_stream_)) {
+      return false;
+    }
+    trailer_attempted_ = true;
+    if (av_write_trailer(fmt_ctx_) < 0) {
+      return false;
+    }
+    avio_flush(avio_ctx_);
+    finished_ = true;
+    raw_data.assign(out_buf_.begin(), out_buf_.end());
+    LOG(INFO) << "MemoryVideoAudioWriter: encoded " << frames << " frames and "
+              << samples << " samples into " << raw_data.size() << " MP4 bytes";
+    return !raw_data.empty();
+  }
+
+ private:
+  bool validate_inputs(const torch::Tensor& video,
+                       const torch::Tensor& audio,
+                       double fps,
+                       int32_t audio_sample_rate) const {
+    if (!video.defined() || video.dim() != 4 || video.size(1) != 3 ||
+        !video.device().is_cpu() || video.scalar_type() != torch::kFloat32 ||
+        !video.is_contiguous()) {
+      LOG(ERROR) << "MemoryVideoAudioWriter: video must be contiguous CPU "
+                    "float32 [T,3,H,W]";
+      return false;
+    }
+    if (!audio.defined() || audio.dim() != 2 ||
+        (audio.size(0) != 1 && audio.size(0) != 2) ||
+        !audio.device().is_cpu() || audio.scalar_type() != torch::kFloat32 ||
+        !audio.is_contiguous()) {
+      LOG(ERROR) << "MemoryVideoAudioWriter: audio must be contiguous CPU "
+                    "float32 [C,N] with one or two channels";
+      return false;
+    }
+    if (video.size(0) <= 0 || video.size(2) <= 0 || video.size(3) <= 0 ||
+        video.size(2) % 2 != 0 || video.size(3) % 2 != 0 ||
+        audio.size(1) <= 0 || !std::isfinite(fps) || fps <= 0.0 ||
+        fps > 1000.0 || audio_sample_rate < 8000 ||
+        audio_sample_rate > 192000 ||
+        video.size(0) > std::numeric_limits<int32_t>::max() ||
+        video.size(2) > std::numeric_limits<int32_t>::max() ||
+        video.size(3) > std::numeric_limits<int32_t>::max() / 3 ||
+        static_cast<uint64_t>(video.size(2)) *
+                static_cast<uint64_t>(video.size(3)) * 3 >
+            std::numeric_limits<size_t>::max()) {
+      LOG(ERROR) << "MemoryVideoAudioWriter: invalid media dimensions";
+      return false;
+    }
+    return true;
+  }
+
+  bool init_output() {
+    constexpr int32_t avio_buf_size = 1 << 16;
+    uint8_t* avio_buf =
+        static_cast<uint8_t*>(av_malloc(static_cast<size_t>(avio_buf_size)));
+    if (!avio_buf) {
+      return false;
+    }
+    avio_ctx_ = avio_alloc_context(avio_buf,
+                                   avio_buf_size,
+                                   1,
+                                   &write_ctx_,
+                                   nullptr,
+                                   &Writer::write,
+                                   &Writer::seek);
+    if (!avio_ctx_) {
+      av_free(avio_buf);
+      return false;
+    }
+    avio_ctx_->seekable = AVIO_SEEKABLE_NORMAL;
+
+    const AVOutputFormat* format = av_guess_format("mp4", nullptr, nullptr);
+    if (!format ||
+        avformat_alloc_output_context2(&fmt_ctx_, format, nullptr, nullptr) <
+            0 ||
+        !fmt_ctx_) {
+      return false;
+    }
+    fmt_ctx_->pb = avio_ctx_;
+    fmt_ctx_->flags |= AVFMT_FLAG_CUSTOM_IO;
+    pkt_ = av_packet_alloc();
+    return pkt_ != nullptr;
+  }
+
+  bool init_video(int32_t width, int32_t height, double fps) {
+    const AVCodec* codec = avcodec_find_encoder_by_name("libx264");
+    if (!codec || codec->id != AV_CODEC_ID_H264) {
+      LOG(ERROR) << "MemoryVideoAudioWriter: libx264 encoder is required";
+      return false;
+    }
+    video_ctx_ = avcodec_alloc_context3(codec);
+    if (!video_ctx_) {
+      return false;
+    }
+    const AVRational framerate = av_d2q(fps, 1000000);
+    if (framerate.num <= 0 || framerate.den <= 0) {
+      return false;
+    }
+    video_ctx_->width = width;
+    video_ctx_->height = height;
+    video_ctx_->time_base = av_inv_q(framerate);
+    video_ctx_->framerate = framerate;
+    video_ctx_->pix_fmt = AV_PIX_FMT_YUV420P;
+    video_ctx_->max_b_frames = 0;
+    if (fmt_ctx_->oformat->flags & AVFMT_GLOBALHEADER) {
+      video_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+    AVDictionary* opts = nullptr;
+    av_dict_set(&opts, "crf", "18", 0);
+    av_dict_set(&opts, "preset", "medium", 0);
+    av_dict_set(&opts, "profile", "high", 0);
+    av_dict_set(&opts, "tune", "zerolatency", 0);
+    const int32_t open_result = avcodec_open2(video_ctx_, codec, &opts);
+    av_dict_free(&opts);
+    if (open_result < 0) {
+      return false;
+    }
+    video_stream_ = avformat_new_stream(fmt_ctx_, nullptr);
+    if (!video_stream_) {
+      return false;
+    }
+    video_stream_->time_base = video_ctx_->time_base;
+    video_stream_->avg_frame_rate = video_ctx_->framerate;
+    return avcodec_parameters_from_context(video_stream_->codecpar,
+                                           video_ctx_) >= 0;
+  }
+
+  bool init_audio(int32_t channels, int32_t sample_rate) {
+    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
+    if (!codec) {
+      LOG(ERROR) << "MemoryVideoAudioWriter: AAC encoder is required";
+      return false;
+    }
+    if (codec->sample_fmts) {
+      bool supports_fltp = false;
+      for (const AVSampleFormat* fmt = codec->sample_fmts;
+           *fmt != AV_SAMPLE_FMT_NONE;
+           ++fmt) {
+        supports_fltp |= *fmt == AV_SAMPLE_FMT_FLTP;
+      }
+      if (!supports_fltp) {
+        LOG(ERROR) << "MemoryVideoAudioWriter: AAC encoder lacks FLTP support";
+        return false;
+      }
+    }
+    if (codec->supported_samplerates) {
+      bool supports_rate = false;
+      for (const int32_t* rate = codec->supported_samplerates; *rate != 0;
+           ++rate) {
+        supports_rate |= *rate == sample_rate;
+      }
+      if (!supports_rate) {
+        LOG(ERROR) << "MemoryVideoAudioWriter: AAC encoder does not support "
+                   << sample_rate << " Hz";
+        return false;
+      }
+    }
+    if ((codec->capabilities & AV_CODEC_CAP_SMALL_LAST_FRAME) == 0) {
+      LOG(ERROR) << "MemoryVideoAudioWriter: AAC encoder must support a small "
+                    "final frame";
+      return false;
+    }
+
+    audio_ctx_ = avcodec_alloc_context3(codec);
+    if (!audio_ctx_) {
+      return false;
+    }
+    audio_ctx_->sample_fmt = AV_SAMPLE_FMT_FLTP;
+    audio_ctx_->sample_rate = sample_rate;
+    audio_ctx_->time_base = {1, sample_rate};
+    audio_ctx_->bit_rate = channels == 2 ? 192000 : 128000;
+    audio_ctx_->profile = FF_PROFILE_AAC_LOW;
+    av_channel_layout_default(&audio_ctx_->ch_layout, channels);
+    if (fmt_ctx_->oformat->flags & AVFMT_GLOBALHEADER) {
+      audio_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+    if (avcodec_open2(audio_ctx_, codec, nullptr) < 0) {
+      return false;
+    }
+    audio_stream_ = avformat_new_stream(fmt_ctx_, nullptr);
+    if (!audio_stream_) {
+      return false;
+    }
+    audio_stream_->time_base = audio_ctx_->time_base;
+    return avcodec_parameters_from_context(audio_stream_->codecpar,
+                                           audio_ctx_) >= 0;
+  }
+
+  bool init_frames(int32_t width,
+                   int32_t height,
+                   int32_t channels,
+                   int32_t sample_rate) {
+    sws_ctx_ = sws_getContext(width,
+                              height,
+                              AV_PIX_FMT_RGB24,
+                              width,
+                              height,
+                              AV_PIX_FMT_YUV420P,
+                              SWS_BILINEAR,
+                              nullptr,
+                              nullptr,
+                              nullptr);
+    video_frame_ = av_frame_alloc();
+    audio_frame_ = av_frame_alloc();
+    if (!sws_ctx_ || !video_frame_ || !audio_frame_) {
+      return false;
+    }
+    video_frame_->format = AV_PIX_FMT_YUV420P;
+    video_frame_->width = width;
+    video_frame_->height = height;
+    if (av_frame_get_buffer(video_frame_, 0) < 0) {
+      return false;
+    }
+
+    audio_frame_capacity_ =
+        audio_ctx_->frame_size > 0 ? audio_ctx_->frame_size : 1024;
+    audio_frame_->format = AV_SAMPLE_FMT_FLTP;
+    audio_frame_->sample_rate = sample_rate;
+    audio_frame_->nb_samples = audio_frame_capacity_;
+    if (av_channel_layout_copy(&audio_frame_->ch_layout,
+                               &audio_ctx_->ch_layout) < 0 ||
+        av_frame_get_buffer(audio_frame_, 0) < 0) {
+      return false;
+    }
+    rgb_buf_.resize(static_cast<size_t>(height) * width * 3);
+    return channels == audio_ctx_->ch_layout.nb_channels;
+  }
+
+  bool write_video_frame(const torch::Tensor& video,
+                         int32_t frame_idx,
+                         int32_t height,
+                         int32_t width) {
+    const int32_t stride = width * 3;
+    torch::Tensor rgb = torch::nan_to_num(video[frame_idx], 0.0, 1.0, 0.0)
+                            .clamp(0.0, 1.0)
+                            .mul(255.0)
+                            .to(torch::kUInt8)
+                            .permute({1, 2, 0})
+                            .contiguous();
+    std::memcpy(rgb_buf_.data(),
+                rgb.data_ptr<uint8_t>(),
+                static_cast<size_t>(height) * stride);
+    if (av_frame_make_writable(video_frame_) < 0) {
+      return false;
+    }
+    const uint8_t* src_data[1] = {rgb_buf_.data()};
+    int32_t src_linesize[1] = {stride};
+    if (sws_scale(sws_ctx_,
+                  src_data,
+                  src_linesize,
+                  0,
+                  height,
+                  video_frame_->data,
+                  video_frame_->linesize) != height) {
+      return false;
+    }
+    video_frame_->pts = frame_idx;
+    return send_frame(video_ctx_, video_stream_, video_frame_);
+  }
+
+  bool write_audio_frame(torch::TensorAccessor<float, 2> audio,
+                         int64_t& offset,
+                         int64_t total_samples,
+                         int32_t channels,
+                         int64_t& pts) {
+    const int32_t input_samples = static_cast<int32_t>(
+        std::min<int64_t>(audio_frame_capacity_, total_samples - offset));
+    const int32_t output_samples = input_samples;
+    audio_frame_->nb_samples = audio_frame_capacity_;
+    if (av_frame_make_writable(audio_frame_) < 0) {
+      return false;
+    }
+    for (int32_t channel = 0; channel < channels; ++channel) {
+      float* dst = reinterpret_cast<float*>(audio_frame_->data[channel]);
+      std::fill(dst, dst + audio_frame_capacity_, 0.0f);
+      for (int32_t sample = 0; sample < input_samples; ++sample) {
+        const float value = audio[channel][offset + sample];
+        dst[sample] =
+            std::isfinite(value) ? std::clamp(value, -1.0f, 1.0f) : 0.0f;
+      }
+    }
+    audio_frame_->nb_samples = output_samples;
+    audio_frame_->pts = pts;
+    if (!send_frame(audio_ctx_, audio_stream_, audio_frame_)) {
+      return false;
+    }
+    offset += input_samples;
+    pts += output_samples;
+    return true;
+  }
+
+  bool send_frame(AVCodecContext* codec_ctx, AVStream* stream, AVFrame* frame) {
+    if (avcodec_send_frame(codec_ctx, frame) < 0) {
+      return false;
+    }
+    return drain_packets(codec_ctx, stream);
+  }
+
+  bool flush_encoder(AVCodecContext* codec_ctx, AVStream* stream) {
+    const int32_t result = avcodec_send_frame(codec_ctx, nullptr);
+    if (result < 0 && result != AVERROR_EOF) {
+      return false;
+    }
+    return drain_packets(codec_ctx, stream);
+  }
+
+  bool drain_packets(AVCodecContext* codec_ctx, AVStream* stream) {
+    while (true) {
+      const int32_t result = avcodec_receive_packet(codec_ctx, pkt_);
+      if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) {
+        return true;
+      }
+      if (result < 0) {
+        return false;
+      }
+      if (codec_ctx->codec_type == AVMEDIA_TYPE_VIDEO && pkt_->duration <= 0) {
+        pkt_->duration = 1;
+      }
+      av_packet_rescale_ts(pkt_, codec_ctx->time_base, stream->time_base);
+      pkt_->stream_index = stream->index;
+      const int32_t write_result = av_interleaved_write_frame(fmt_ctx_, pkt_);
+      av_packet_unref(pkt_);
+      if (write_result < 0) {
+        return false;
+      }
+    }
+  }
+
+  AVFormatContext* fmt_ctx_ = nullptr;
+  AVIOContext* avio_ctx_ = nullptr;
+  AVCodecContext* video_ctx_ = nullptr;
+  AVCodecContext* audio_ctx_ = nullptr;
+  AVStream* video_stream_ = nullptr;
+  AVStream* audio_stream_ = nullptr;
+  AVPacket* pkt_ = nullptr;
+  AVFrame* video_frame_ = nullptr;
+  AVFrame* audio_frame_ = nullptr;
+  SwsContext* sws_ctx_ = nullptr;
+  int32_t audio_frame_capacity_ = 0;
+  std::vector<uint8_t> rgb_buf_;
+  MemWriteCtx write_ctx_{&out_buf_, 0};
+  std::vector<uint8_t> out_buf_;
+  bool header_written_ = false;
+  bool trailer_attempted_ = false;
+  bool finished_ = false;
+};
+
 bool FFmpegVideoEncoder::encode(const torch::Tensor& video,
                                 double fps,
                                 const std::string& format,
                                 std::string& raw_data) {
   MemoryVideoWriter writer;
   return writer.write(video, fps, format, raw_data);
+}
+
+bool FFmpegVideoAudioEncoder::encode(const torch::Tensor& video,
+                                     const torch::Tensor& audio,
+                                     double fps,
+                                     int32_t audio_sample_rate,
+                                     std::string& raw_data) {
+  MemoryVideoAudioWriter writer;
+  return writer.write(video, audio, fps, audio_sample_rate, raw_data);
 }
 
 }  // namespace xllm

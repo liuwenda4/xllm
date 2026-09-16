@@ -76,4 +76,18 @@ class FFmpegVideoEncoder final {
               const std::string& format,
               std::string& raw_data);
 };
+
+class FFmpegVideoAudioEncoder final {
+ public:
+  FFmpegVideoAudioEncoder() = default;
+  ~FFmpegVideoAudioEncoder() = default;
+
+  // Encode RGB video [T,C,H,W] and planar audio [C,N] into an H.264/AAC MP4.
+  // Inputs must be contiguous CPU float32 tensors.
+  bool encode(const torch::Tensor& video,
+              const torch::Tensor& audio,
+              double fps,
+              int32_t audio_sample_rate,
+              std::string& raw_data);
+};
 }  // namespace xllm
