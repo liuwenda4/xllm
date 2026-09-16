@@ -58,6 +58,11 @@ struct DiTGenerationOutput {
 
   // video fps
   double video_fps = 0.0;
+
+  std::string mime_type;
+  std::string container;
+  int32_t audio_sample_rate = 0;
+  int32_t audio_channels = 0;
 };
 
 struct DiTRequestOutput {

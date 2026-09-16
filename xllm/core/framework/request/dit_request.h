@@ -48,6 +48,8 @@ class DiTRequest : public RequestBase {
 
   void handle_forward_text_output(const std::string& text);
 
+  void handle_forward_encoded_media(const DiTEncodedMedia& media);
+
   const DiTRequestOutput generate_output();
 
   void log_statistic(double total_latency);

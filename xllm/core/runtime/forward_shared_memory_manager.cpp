@@ -406,8 +406,15 @@ inline size_t get_dit_forward_input_size(const DiTForwardInput& input) {
 }
 
 inline size_t get_dit_forward_output_size(const DiTForwardOutput& output) {
-  return get_vector_tensor_size(output.tensors) +
-         get_string_vector_size(output.text_output);
+  size_t size = get_vector_tensor_size(output.tensors) +
+                get_string_vector_size(output.text_output) +
+                type_size<uint64_t>;
+  for (const DiTEncodedMedia& media : output.encoded_media) {
+    size += get_string_size(media.data) + get_string_size(media.mime_type) +
+            get_string_size(media.container) + type_size<int32_t> * 5 +
+            type_size<double>;
+  }
+  return size;
 }
 
 template <typename T>
@@ -1180,6 +1187,18 @@ inline void write_dit_forward_output(char*& buffer,
                                      const DiTForwardOutput& output) {
   write_vector_tensor(buffer, output.tensors);
   write_string_vector(buffer, output.text_output);
+  write_data(buffer, static_cast<uint64_t>(output.encoded_media.size()));
+  for (const DiTEncodedMedia& media : output.encoded_media) {
+    write_string(buffer, media.data);
+    write_string(buffer, media.mime_type);
+    write_string(buffer, media.container);
+    write_data(buffer, media.width);
+    write_data(buffer, media.height);
+    write_data(buffer, media.num_frames);
+    write_data(buffer, media.fps);
+    write_data(buffer, media.audio_sample_rate);
+    write_data(buffer, media.audio_channels);
+  }
 }
 
 inline void safe_advance_buffer(const char*& buffer, size_t offset) {
@@ -2402,6 +2421,20 @@ inline void read_dit_forward_output(const char*& buffer,
     }
   }
   read_string_vector(buffer, output.text_output);
+  uint64_t media_count;
+  read_data(buffer, media_count);
+  output.encoded_media.resize(media_count);
+  for (DiTEncodedMedia& media : output.encoded_media) {
+    read_string(buffer, media.data);
+    read_string(buffer, media.mime_type);
+    read_string(buffer, media.container);
+    read_data(buffer, media.width);
+    read_data(buffer, media.height);
+    read_data(buffer, media.num_frames);
+    read_data(buffer, media.fps);
+    read_data(buffer, media.audio_sample_rate);
+    read_data(buffer, media.audio_channels);
+  }
 }
 
 inline void initialize_device_buffer_session(ReadContext& context,
@@ -2838,7 +2871,9 @@ size_t calculate_raw_forward_output_size(const RawForwardOutput& output) {
   size += get_vector_size(output.out_logprobs);
   size += type_size<int64_t>;  // prepared_token
   const bool has_dit_forward_output =
-      !output.dit_forward_output.tensors.empty();
+      !output.dit_forward_output.tensors.empty() ||
+      !output.dit_forward_output.text_output.empty() ||
+      !output.dit_forward_output.encoded_media.empty();
   size += type_size<bool>;
   if (has_dit_forward_output) {
     size += get_dit_forward_output_size(output.dit_forward_output);
@@ -2983,7 +3018,9 @@ void serialize_raw_forward_output(const RawForwardOutput& output,
   write_data(buffer, output.prepared_token);
 
   const bool has_dit_forward_output =
-      !output.dit_forward_output.tensors.empty();
+      !output.dit_forward_output.tensors.empty() ||
+      !output.dit_forward_output.text_output.empty() ||
+      !output.dit_forward_output.encoded_media.empty();
   write_data(buffer, has_dit_forward_output);
   if (has_dit_forward_output) {
     write_dit_forward_output(buffer, output.dit_forward_output);
@@ -3258,6 +3295,7 @@ void convert_tensor_to_raw_output(
     const std::vector<std::vector<torch::Tensor>>& mm_embeddings,
     const std::vector<torch::Tensor>& dit_images,
     const std::vector<std::string>& dit_text_output,
+    std::vector<DiTEncodedMedia> dit_encoded_media,
     const torch::Tensor& expert_load_data,
     int64_t prepared_token,
     const torch::Tensor& src_seq_idxes,
@@ -3306,6 +3344,7 @@ void convert_tensor_to_raw_output(
   raw_output.outputs.reserve(num_seqs);
   raw_output.dit_forward_output.tensors = dit_images;
   raw_output.dit_forward_output.text_output = dit_text_output;
+  raw_output.dit_forward_output.encoded_media = std::move(dit_encoded_media);
   for (int32_t output_idx = 0; output_idx < num_seqs; ++output_idx) {
     RawSampleOutput raw_sample_output;
 
@@ -3616,6 +3655,7 @@ bool ForwardSharedMemoryManager::raw_output_write(
     const std::vector<SpeculativeTokenStats>& speculative_token_stats,
     const std::vector<torch::Tensor>& dit_images,
     const std::vector<std::string>& dit_text_output,
+    std::vector<DiTEncodedMedia> dit_encoded_media,
     const torch::Tensor& expert_load_data,
     int64_t prepared_token,
     const torch::Tensor& src_seq_idxes,
@@ -3631,6 +3671,7 @@ bool ForwardSharedMemoryManager::raw_output_write(
                                mm_embeddings,
                                dit_images,
                                dit_text_output,
+                               std::move(dit_encoded_media),
                                expert_load_data,
                                prepared_token,
                                src_seq_idxes,

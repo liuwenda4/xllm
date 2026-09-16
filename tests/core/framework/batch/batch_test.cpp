@@ -1503,6 +1503,7 @@ TEST(BatchTest, ReorderedMtpAcceptedRowsCommitToOwningSequences) {
                           undefined,
                           /*dit_images=*/{},
                           /*dit_text_output=*/{},
+                          /*dit_encoded_media=*/{},
                           /*json_object_errors=*/{},
                           &proto_output);
   RawForwardOutput raw_output;
@@ -1887,6 +1888,7 @@ TEST(BatchTest, ForwardOutputProtoRoundTripPreservesJsonObjectErrors) {
                           undefined,
                           /*dit_images=*/{},
                           /*dit_text_output=*/{},
+                          /*dit_encoded_media=*/{},
                           errors,
                           &proto_output);
 
@@ -1932,6 +1934,59 @@ TEST(BatchTest, ForwardOutputProtoNormalizesFalseOkCode) {
   EXPECT_EQ(round_trip.status.message(), "legacy failure");
 }
 
+TEST(BatchTest, ForwardOutputProtoRoundTripPreservesEncodedMedia) {
+  const torch::Tensor undefined;
+  DiTEncodedMedia media;
+  media.data = std::string("\0mp4\xff", 5);
+  media.mime_type = "video/mp4";
+  media.container = "mp4";
+  media.width = 1344;
+  media.height = 768;
+  media.num_frames = 124;
+  media.fps = 24.0;
+  media.audio_sample_rate = 32000;
+  media.audio_channels = 2;
+  proto::ForwardOutput proto_output;
+
+  forward_output_to_proto(undefined,
+                          undefined,
+                          undefined,
+                          undefined,
+                          undefined,
+                          /*mm_embeddings=*/{},
+                          /*speculative_token_stats=*/{},
+                          undefined,
+                          /*prepared_token=*/-1,
+                          undefined,
+                          undefined,
+                          undefined,
+                          /*dit_images=*/{},
+                          /*dit_text_output=*/{},
+                          /*dit_encoded_media=*/{media},
+                          /*json_object_errors=*/{},
+                          &proto_output);
+
+  std::string wire_data;
+  ASSERT_TRUE(proto_output.SerializeToString(&wire_data));
+  proto::ForwardOutput parsed_output;
+  ASSERT_TRUE(parsed_output.ParseFromString(wire_data));
+  RawForwardOutput round_trip;
+  proto_to_forward_output(parsed_output, round_trip);
+
+  ASSERT_EQ(round_trip.dit_forward_output.encoded_media.size(), 1u);
+  const DiTEncodedMedia& actual =
+      round_trip.dit_forward_output.encoded_media.front();
+  EXPECT_EQ(actual.data, media.data);
+  EXPECT_EQ(actual.mime_type, media.mime_type);
+  EXPECT_EQ(actual.container, media.container);
+  EXPECT_EQ(actual.width, media.width);
+  EXPECT_EQ(actual.height, media.height);
+  EXPECT_EQ(actual.num_frames, media.num_frames);
+  EXPECT_DOUBLE_EQ(actual.fps, media.fps);
+  EXPECT_EQ(actual.audio_sample_rate, media.audio_sample_rate);
+  EXPECT_EQ(actual.audio_channels, media.audio_channels);
+}
+
 TEST(BatchTest, ForwardOutputShmRoundTripPreservesJsonObjectErrors) {
   bool is_creator = false;
   const std::string shm_name = ForwardSharedMemoryManager::create_unique_name(
@@ -1961,6 +2016,7 @@ TEST(BatchTest, ForwardOutputShmRoundTripPreservesJsonObjectErrors) {
                                               speculative_token_stats,
                                               /*dit_images=*/{},
                                               /*dit_text_output=*/{},
+                                              /*dit_encoded_media=*/{},
                                               undefined,
                                               /*prepared_layer_id=*/-1,
                                               undefined,
@@ -1981,6 +2037,164 @@ TEST(BatchTest, ForwardOutputShmRoundTripPreservesJsonObjectErrors) {
   EXPECT_EQ(round_trip.json_object_errors[0].sample_sequence_id, "req-error#0");
   EXPECT_EQ(round_trip.json_object_errors[0].message,
             "prior token violates json_object grammar");
+}
+
+TEST(BatchTest, ForwardOutputShmRoundTripPreservesEncodedMedia) {
+  bool is_creator = false;
+  const std::string shm_name = ForwardSharedMemoryManager::create_unique_name(
+      "batch_test_encoded_media_output",
+      /*dp_group=*/0,
+      ForwardType::RAW_OUTPUT,
+      /*rank=*/0);
+  ForwardSharedMemoryManager writer_manager(
+      shm_name, 1 << 20, is_creator, ForwardType::RAW_OUTPUT);
+  bool is_reader_creator = false;
+  ForwardSharedMemoryManager reader_manager(
+      shm_name, 1 << 20, is_reader_creator, ForwardType::RAW_OUTPUT);
+  const torch::Tensor undefined;
+  DiTEncodedMedia media;
+  media.data = std::string("ftyp\0mdat", 9);
+  media.mime_type = "video/mp4";
+  media.container = "mp4";
+  media.width = 1344;
+  media.height = 768;
+  media.num_frames = 124;
+  media.fps = 24.0;
+  media.audio_sample_rate = 32000;
+  media.audio_channels = 2;
+
+  ASSERT_TRUE(writer_manager.raw_output_write(undefined,
+                                              undefined,
+                                              undefined,
+                                              undefined,
+                                              undefined,
+                                              /*mm_embeddings=*/{},
+                                              /*speculative_token_stats=*/{},
+                                              /*dit_images=*/{},
+                                              /*dit_text_output=*/{},
+                                              /*dit_encoded_media=*/{media},
+                                              undefined,
+                                              /*prepared_token=*/-1,
+                                              undefined,
+                                              undefined,
+                                              undefined,
+                                              /*json_object_errors=*/{}));
+
+  RawForwardOutput round_trip;
+  reader_manager.raw_output_read(round_trip);
+
+  ASSERT_EQ(round_trip.dit_forward_output.encoded_media.size(), 1u);
+  const DiTEncodedMedia& actual =
+      round_trip.dit_forward_output.encoded_media.front();
+  EXPECT_EQ(actual.data, media.data);
+  EXPECT_EQ(actual.mime_type, media.mime_type);
+  EXPECT_EQ(actual.container, media.container);
+  EXPECT_EQ(actual.width, media.width);
+  EXPECT_EQ(actual.height, media.height);
+  EXPECT_EQ(actual.num_frames, media.num_frames);
+  EXPECT_DOUBLE_EQ(actual.fps, media.fps);
+  EXPECT_EQ(actual.audio_sample_rate, media.audio_sample_rate);
+  EXPECT_EQ(actual.audio_channels, media.audio_channels);
+}
+
+TEST(BatchTest, ForwardOutputShmRejectsEncodedMediaOverflow) {
+  bool is_creator = false;
+  const std::string shm_name = ForwardSharedMemoryManager::create_unique_name(
+      "batch_test_encoded_media_overflow",
+      /*dp_group=*/0,
+      ForwardType::RAW_OUTPUT,
+      /*rank=*/0);
+  ForwardSharedMemoryManager writer_manager(
+      shm_name, 128, is_creator, ForwardType::RAW_OUTPUT);
+  bool is_reader_creator = false;
+  ForwardSharedMemoryManager reader_manager(
+      shm_name, 128, is_reader_creator, ForwardType::RAW_OUTPUT);
+  const torch::Tensor undefined;
+  DiTEncodedMedia media;
+  media.data.assign(512, 'x');
+  media.mime_type = "video/mp4";
+  media.container = "mp4";
+
+  ASSERT_TRUE(writer_manager.raw_output_write(undefined,
+                                              undefined,
+                                              undefined,
+                                              undefined,
+                                              undefined,
+                                              /*mm_embeddings=*/{},
+                                              /*speculative_token_stats=*/{},
+                                              /*dit_images=*/{},
+                                              /*dit_text_output=*/{},
+                                              /*dit_encoded_media=*/{media},
+                                              undefined,
+                                              /*prepared_token=*/-1,
+                                              undefined,
+                                              undefined,
+                                              undefined,
+                                              /*json_object_errors=*/{}));
+
+  RawForwardOutput round_trip;
+  reader_manager.raw_output_read(round_trip);
+  EXPECT_EQ(round_trip.status.code(), StatusCode::RESOURCE_EXHAUSTED);
+  EXPECT_TRUE(round_trip.dit_forward_output.encoded_media.empty());
+}
+
+TEST(BatchTest, ForwardOutputShmPreservesTextAndTensorVariants) {
+  bool is_creator = false;
+  const std::string shm_name = ForwardSharedMemoryManager::create_unique_name(
+      "batch_test_dit_output_variants",
+      /*dp_group=*/0,
+      ForwardType::RAW_OUTPUT,
+      /*rank=*/0);
+  ForwardSharedMemoryManager writer_manager(
+      shm_name, 1 << 20, is_creator, ForwardType::RAW_OUTPUT);
+  bool is_reader_creator = false;
+  ForwardSharedMemoryManager reader_manager(
+      shm_name, 1 << 20, is_reader_creator, ForwardType::RAW_OUTPUT);
+  const torch::Tensor undefined;
+
+  ASSERT_TRUE(writer_manager.raw_output_write(undefined,
+                                              undefined,
+                                              undefined,
+                                              undefined,
+                                              undefined,
+                                              /*mm_embeddings=*/{},
+                                              /*speculative_token_stats=*/{},
+                                              /*dit_images=*/{},
+                                              /*dit_text_output=*/{"hello"},
+                                              /*dit_encoded_media=*/{},
+                                              undefined,
+                                              /*prepared_token=*/-1,
+                                              undefined,
+                                              undefined,
+                                              undefined,
+                                              /*json_object_errors=*/{}));
+  RawForwardOutput text_round_trip;
+  reader_manager.raw_output_read(text_round_trip);
+  EXPECT_EQ(text_round_trip.dit_forward_output.text_output,
+            std::vector<std::string>{"hello"});
+
+  const torch::Tensor image = torch::tensor({{1.0f, 2.0f}});
+  ASSERT_TRUE(writer_manager.raw_output_write(undefined,
+                                              undefined,
+                                              undefined,
+                                              undefined,
+                                              undefined,
+                                              /*mm_embeddings=*/{},
+                                              /*speculative_token_stats=*/{},
+                                              /*dit_images=*/{image},
+                                              /*dit_text_output=*/{},
+                                              /*dit_encoded_media=*/{},
+                                              undefined,
+                                              /*prepared_token=*/-1,
+                                              undefined,
+                                              undefined,
+                                              undefined,
+                                              /*json_object_errors=*/{}));
+  RawForwardOutput tensor_round_trip;
+  reader_manager.raw_output_read(tensor_round_trip);
+  ASSERT_EQ(tensor_round_trip.dit_forward_output.tensors.size(), 1u);
+  EXPECT_TRUE(
+      torch::equal(tensor_round_trip.dit_forward_output.tensors[0], image));
 }
 
 TEST(BatchTest, ForwardOutputShmOverflowPublishesFailureStatus) {
@@ -2009,6 +2223,7 @@ TEST(BatchTest, ForwardOutputShmOverflowPublishesFailureStatus) {
                                               /*speculative_token_stats=*/{},
                                               /*dit_images=*/{},
                                               /*dit_text_output=*/{},
+                                              /*dit_encoded_media=*/{},
                                               undefined,
                                               /*prepared_token=*/-1,
                                               undefined,

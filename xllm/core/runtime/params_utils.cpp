@@ -212,6 +212,7 @@ void forward_output_to_proto(
     const torch::Tensor& out_logprobs,
     const std::vector<torch::Tensor>& dit_images,
     const std::vector<std::string>& dit_text_output,
+    const std::vector<DiTEncodedMedia>& dit_encoded_media,
     const std::vector<JsonObjectOutputError>& json_object_errors,
     proto::ForwardOutput* pb_forward_output) {
   Timer timer;
@@ -398,6 +399,21 @@ void forward_output_to_proto(
     auto* pb_dit_output = pb_forward_output->mutable_dit_forward_output();
     for (const auto& text : dit_text_output) {
       pb_dit_output->add_text_output(text);
+    }
+  }
+  if (!dit_encoded_media.empty()) {
+    auto* pb_dit_output = pb_forward_output->mutable_dit_forward_output();
+    for (const DiTEncodedMedia& media : dit_encoded_media) {
+      proto::DiTEncodedMedia* pb_media = pb_dit_output->add_encoded_media();
+      pb_media->set_data(media.data);
+      pb_media->set_mime_type(media.mime_type);
+      pb_media->set_container(media.container);
+      pb_media->set_width(media.width);
+      pb_media->set_height(media.height);
+      pb_media->set_num_frames(media.num_frames);
+      pb_media->set_fps(media.fps);
+      pb_media->set_audio_sample_rate(media.audio_sample_rate);
+      pb_media->set_audio_channels(media.audio_channels);
     }
   }
   for (const JsonObjectOutputError& error : json_object_errors) {
@@ -812,6 +828,22 @@ bool proto_to_dit_forward_output(const proto::DiTForwardOutput& pb_dit_outputs,
   // Deserialize text_output for text diffusion models
   dit_outputs.text_output.assign(pb_dit_outputs.text_output().begin(),
                                  pb_dit_outputs.text_output().end());
+
+  dit_outputs.encoded_media.reserve(pb_dit_outputs.encoded_media_size());
+  for (const proto::DiTEncodedMedia& pb_media :
+       pb_dit_outputs.encoded_media()) {
+    DiTEncodedMedia media;
+    media.data = pb_media.data();
+    media.mime_type = pb_media.mime_type();
+    media.container = pb_media.container();
+    media.width = pb_media.width();
+    media.height = pb_media.height();
+    media.num_frames = pb_media.num_frames();
+    media.fps = pb_media.fps();
+    media.audio_sample_rate = pb_media.audio_sample_rate();
+    media.audio_channels = pb_media.audio_channels();
+    dit_outputs.encoded_media.emplace_back(std::move(media));
+  }
 
   return true;
 }

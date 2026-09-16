@@ -255,6 +255,7 @@ void WorkerService::step(
     std::vector<SpeculativeTokenStats>& speculative_token_stats,
     std::vector<torch::Tensor>& dit_images,
     std::vector<std::string>& dit_text_output,
+    std::vector<DiTEncodedMedia>& dit_encoded_media,
     torch::Tensor& expert_load_data,
     int64_t& prepared_token,
     torch::Tensor& src_seq_idxes,
@@ -280,8 +281,7 @@ void WorkerService::step(
       const auto& sample_output = forward_outputs.value().sample_output;
       const auto& beam_search_output =
           forward_outputs.value().beam_search_output;
-      const auto& dit_forward_output =
-          forward_outputs.value().dit_forward_output;
+      auto& dit_forward_output = forward_outputs.value().dit_forward_output;
       expert_load_data = safe_to(forward_outputs.value().expert_load_data,
                                  torch::kCPU,
                                  /*non_blocking=*/true);
@@ -316,6 +316,7 @@ void WorkerService::step(
                 safe_to(dit_image, torch::kCPU, /*non_blocking=*/true));
           }
           dit_text_output = dit_forward_output.text_output;
+          dit_encoded_media = std::move(dit_forward_output.encoded_media);
 
           // [num_seq]
           next_tokens = safe_to(sample_output.next_tokens,
@@ -422,6 +423,7 @@ void WorkerService::create_polling_shm_thread(
             std::vector<SpeculativeTokenStats> speculative_token_stats;
             std::vector<torch::Tensor> dit_images;
             std::vector<std::string> dit_text_output;
+            std::vector<DiTEncodedMedia> dit_encoded_media;
             torch::Tensor expert_load_data;
             int64_t prepared_token = -1;
 
@@ -441,6 +443,7 @@ void WorkerService::create_polling_shm_thread(
                  speculative_token_stats,
                  dit_images,
                  dit_text_output,
+                 dit_encoded_media,
                  expert_load_data,
                  prepared_token,
                  src_seq_idxes,
@@ -448,22 +451,23 @@ void WorkerService::create_polling_shm_thread(
                  out_logprobs,
                  json_object_errors);
 
-            const bool shm_write_ok =
-                output_shm_manager->raw_output_write(next_tokens,
-                                                     logprobs,
-                                                     top_tokens,
-                                                     top_logprobs,
-                                                     embeddings,
-                                                     mm_embeddings,
-                                                     speculative_token_stats,
-                                                     dit_images,
-                                                     dit_text_output,
-                                                     expert_load_data,
-                                                     prepared_token,
-                                                     src_seq_idxes,
-                                                     out_tokens,
-                                                     out_logprobs,
-                                                     json_object_errors);
+            const bool shm_write_ok = output_shm_manager->raw_output_write(
+                next_tokens,
+                logprobs,
+                top_tokens,
+                top_logprobs,
+                embeddings,
+                mm_embeddings,
+                speculative_token_stats,
+                dit_images,
+                dit_text_output,
+                std::move(dit_encoded_media),
+                expert_load_data,
+                prepared_token,
+                src_seq_idxes,
+                out_tokens,
+                out_logprobs,
+                json_object_errors);
             if (!shm_write_ok) {
               throw std::runtime_error(
                   "worker output shared memory write failed");
@@ -889,6 +893,7 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
           std::vector<SpeculativeTokenStats> speculative_token_stats;
           std::vector<torch::Tensor> dit_images;
           std::vector<std::string> dit_text_output;
+          std::vector<DiTEncodedMedia> dit_encoded_media;
           torch::Tensor expert_load_data;
           int64_t prepared_token = -1;
           // beam search kernel output
@@ -907,6 +912,7 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
                speculative_token_stats,
                dit_images,
                dit_text_output,
+               dit_encoded_media,
                expert_load_data,
                prepared_token,
                src_seq_idxes,
@@ -928,6 +934,7 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
                                   out_logprobs,
                                   dit_images,
                                   dit_text_output,
+                                  dit_encoded_media,
                                   json_object_errors,
                                   pb_forward_output);
           COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
@@ -957,7 +964,7 @@ void WorkerService::GetLastStepResult(
           auto future = worker_->get_last_step_result_async();
           auto forward_outputs = std::move(future).get();
           if (forward_outputs) {
-            const ForwardOutput& forward_output = forward_outputs.value();
+            ForwardOutput& forward_output = forward_outputs.value();
             const auto& sample_output = forward_output.sample_output;
             int64_t prepared_token = forward_output.prepared_token;
             const auto& beam_search_output = forward_output.beam_search_output;
@@ -973,6 +980,7 @@ void WorkerService::GetLastStepResult(
             std::vector<SpeculativeTokenStats> speculative_token_stats;
             std::vector<torch::Tensor> dit_images;
             std::vector<std::string> dit_text_output;
+            std::vector<DiTEncodedMedia> dit_encoded_media;
             auto copy_output_to_host = [&]() {
               if (options_.enable_schedule_overlap()) {
                 CHECK(stream_->wait_event(forward_output.ready_event))
@@ -997,6 +1005,8 @@ void WorkerService::GetLastStepResult(
               }
               dit_text_output =
                   forward_outputs.value().dit_forward_output.text_output;
+              dit_encoded_media = std::move(
+                  forward_outputs.value().dit_forward_output.encoded_media);
 
               // [num_seq]
               next_tokens = safe_to(sample_output.next_tokens,
@@ -1057,7 +1067,7 @@ void WorkerService::GetLastStepResult(
                 forward_output.is_graph_warmup);
 
             if (next_tokens.defined() || !dit_images.empty() ||
-                !dit_text_output.empty() ||
+                !dit_text_output.empty() || !dit_encoded_media.empty() ||
                 ::xllm::EPLBConfig::get_instance().enable_eplb() ||
                 !forward_output.json_object_errors.empty()) {
               const std::vector<std::vector<torch::Tensor>> mm_embeddings;
@@ -1075,6 +1085,7 @@ void WorkerService::GetLastStepResult(
                                       out_logprobs,
                                       dit_images,
                                       dit_text_output,
+                                      dit_encoded_media,
                                       forward_output.json_object_errors,
                                       pb_forward_output);
             }

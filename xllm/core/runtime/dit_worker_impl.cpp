@@ -174,7 +174,7 @@ std::optional<ForwardOutput> DiTWorkerImpl::step(const ForwardInput& inputs) {
   auto ret = device_.synchronize_default_stream();
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
   ForwardOutput forward_output;
-  forward_output.dit_forward_output = output;
+  forward_output.dit_forward_output = std::move(output);
   return forward_output;
 }
 
@@ -187,7 +187,7 @@ folly::SemiFuture<std::optional<ForwardOutput>> DiTWorkerImpl::step_async(
                         promise = std::move(promise)]() mutable {
     try {
       auto output = this->step(input);
-      promise.setValue(output);
+      promise.setValue(std::move(output));
     } catch (...) {
       promise.setException(folly::exception_wrapper(std::current_exception()));
     }

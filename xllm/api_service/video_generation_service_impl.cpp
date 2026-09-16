@@ -54,6 +54,18 @@ bool send_result_to_client_brpc(std::shared_ptr<VideoGenerationCall> call,
     proto_result->set_seed(output.seed);
     proto_result->set_num_frames(output.num_frames);
     proto_result->set_fps(output.video_fps);
+    if (!output.mime_type.empty()) {
+      proto_result->set_mime_type(output.mime_type);
+    }
+    if (!output.container.empty()) {
+      proto_result->set_container(output.container);
+    }
+    if (output.audio_sample_rate > 0) {
+      proto_result->set_audio_sample_rate(output.audio_sample_rate);
+    }
+    if (output.audio_channels > 0) {
+      proto_result->set_audio_channels(output.audio_channels);
+    }
   }
   return call->write_and_finish(response);
 }

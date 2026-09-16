@@ -142,6 +142,10 @@ void DiTRequest::handle_forward_text_output(const std::string& text) {
   output_.text_output.push_back(text);
 }
 
+void DiTRequest::handle_forward_encoded_media(const DiTEncodedMedia& media) {
+  output_.encoded_media.push_back(media);
+}
+
 const DiTRequestOutput DiTRequest::generate_output() {
   DiTRequestOutput output;
   output.request_id = request_id_;
@@ -149,6 +153,33 @@ const DiTRequestOutput DiTRequest::generate_output() {
   output.status = Status(StatusCode::OK);
   output.finished = finished();
   output.cancelled = cancelled();
+
+  if (!output_.encoded_media.empty()) {
+    for (size_t idx = 0; idx < output_.encoded_media.size(); ++idx) {
+      const DiTEncodedMedia& media = output_.encoded_media[idx];
+      DiTGenerationOutput result;
+      result.index = idx;
+      if (state_.request_kind() == DiTRequestKind::kAudio) {
+        result.audio = media.data;
+      } else {
+        result.image = media.data;
+      }
+      result.mime_type = media.mime_type;
+      result.container = media.container;
+      result.width = media.width;
+      result.height = media.height;
+      result.num_frames = media.num_frames;
+      result.video_fps = media.fps;
+      result.audio_sample_rate = media.audio_sample_rate;
+      result.audio_channels = media.audio_channels;
+      result.seed_is_set = state_.generation_params().seed_is_set;
+      if (result.seed_is_set) {
+        result.seed = state_.generation_params().seed;
+      }
+      output.outputs.emplace_back(std::move(result));
+    }
+    return output;
+  }
 
   // Text diffusion models (e.g., Cola-DLM) produce text output directly.
   if (!output_.text_output.empty()) {

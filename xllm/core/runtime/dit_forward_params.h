@@ -314,6 +314,18 @@ struct DiTForwardInput {
   DiTGenerationParams generation_params;
 };
 
+struct DiTEncodedMedia {
+  std::string data;
+  std::string mime_type;
+  std::string container;
+  int32_t width = 0;
+  int32_t height = 0;
+  int32_t num_frames = 0;
+  double fps = 0.0;
+  int32_t audio_sample_rate = 0;
+  int32_t audio_channels = 0;
+};
+
 // dit related forward output params
 struct DiTForwardOutput {
   void save_with_prefix(std::string prefix) const {
@@ -325,6 +337,8 @@ struct DiTForwardOutput {
   std::vector<torch::Tensor> tensors;
   // generated text (for text diffusion models like Cola-DLM)
   std::vector<std::string> text_output;
+  // encoded image/video/audio containers, one record per generated output.
+  std::vector<DiTEncodedMedia> encoded_media;
 };
 
 }  // namespace xllm

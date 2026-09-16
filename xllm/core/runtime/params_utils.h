@@ -66,6 +66,7 @@ void forward_output_to_proto(
     const torch::Tensor& out_logprobs,
     const std::vector<torch::Tensor>& dit_images,
     const std::vector<std::string>& dit_text_output,
+    const std::vector<DiTEncodedMedia>& dit_encoded_media,
     const std::vector<JsonObjectOutputError>& json_object_errors,
     proto::ForwardOutput* pb_forward_output);
 

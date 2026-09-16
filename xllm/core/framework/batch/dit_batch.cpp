@@ -269,6 +269,28 @@ DiTForwardInput DiTBatch::prepare_forward_input() {
 }
 
 void DiTBatch::process_forward_output(const DiTForwardOutput& output) {
+  if (!output.encoded_media.empty()) {
+    const size_t outputs_per_request =
+        static_cast<size_t>(request_vec_[0]
+                                ->state()
+                                .generation_params()
+                                .num_images_per_prompt) *
+        static_cast<size_t>(
+            request_vec_[0]->state().generation_params().num_videos_per_prompt);
+    CHECK_GT(outputs_per_request, 0u);
+    CHECK_EQ(request_vec_.size() * outputs_per_request,
+             output.encoded_media.size());
+    size_t media_idx = 0;
+    for (const auto& request : request_vec_) {
+      for (size_t output_idx = 0; output_idx < outputs_per_request;
+           ++output_idx) {
+        request->handle_forward_encoded_media(output.encoded_media[media_idx]);
+        ++media_idx;
+      }
+    }
+    return;
+  }
+
   // Text diffusion models produce text output directly.
   if (!output.text_output.empty()) {
     CHECK(request_vec_.size() == output.text_output.size());

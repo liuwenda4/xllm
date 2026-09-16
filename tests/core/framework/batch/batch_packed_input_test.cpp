@@ -77,7 +77,8 @@ std::shared_ptr<DiTRequest> make_conditioned_dit_request(
     const std::string& request_id,
     const std::vector<int64_t>& tags,
     const std::string& source_backend,
-    const std::string& manifest) {
+    const std::string& manifest,
+    DiTRequestKind request_kind = DiTRequestKind::kVideo) {
   DiTInputParams input_params;
   input_params.prompt_embed = torch::zeros({3, 5120}, torch::kBFloat16);
   input_params.text_token_tags = torch::tensor(tags, torch::kInt64);
@@ -91,11 +92,8 @@ std::shared_ptr<DiTRequest> make_conditioned_dit_request(
   DiTOutputsFunc outputs_func = [](const std::vector<DiTRequestOutput>&) {
     return std::vector<bool>{};
   };
-  DiTRequestState state(input_params,
-                        generation_params,
-                        output_func,
-                        outputs_func,
-                        DiTRequestKind::kVideo);
+  DiTRequestState state(
+      input_params, generation_params, output_func, outputs_func, request_kind);
   return std::make_shared<DiTRequest>(request_id, "rid", "rtime", state);
 }
 
@@ -373,6 +371,130 @@ TEST(BatchPackedInputTest, SharedMemoryPreservesMiniMaxH3ConditionBundle) {
 
   expect_condition_forward_input_eq(round_trip.input_params.dit_forward_input,
                                     expected);
+}
+
+TEST(BatchPackedInputTest, EncodedMediaFlowsThroughRequestOutput) {
+  std::shared_ptr<DiTRequest> request = make_conditioned_dit_request(
+      "encoded-media", {0, 1, 0}, "official_hf", "{\"request\":1}");
+  request->state().generation_params().seed = 1234;
+  request->state().generation_params().seed_is_set = true;
+  DiTBatch batch;
+  batch.add(request);
+
+  DiTEncodedMedia media;
+  media.data = std::string("ftyp\0mdat", 9);
+  media.mime_type = "video/mp4";
+  media.container = "mp4";
+  media.width = 1344;
+  media.height = 768;
+  media.num_frames = 124;
+  media.fps = 24.0;
+  media.audio_sample_rate = 32000;
+  media.audio_channels = 2;
+  DiTForwardOutput forward_output;
+  forward_output.encoded_media.push_back(media);
+
+  batch.process_forward_output(forward_output);
+  const DiTRequestOutput output = request->generate_output();
+
+  ASSERT_EQ(output.outputs.size(), 1u);
+  const DiTGenerationOutput& actual = output.outputs.front();
+  EXPECT_EQ(actual.image, media.data);
+  EXPECT_EQ(actual.mime_type, media.mime_type);
+  EXPECT_EQ(actual.container, media.container);
+  EXPECT_EQ(actual.width, media.width);
+  EXPECT_EQ(actual.height, media.height);
+  EXPECT_EQ(actual.num_frames, media.num_frames);
+  EXPECT_DOUBLE_EQ(actual.video_fps, media.fps);
+  EXPECT_EQ(actual.audio_sample_rate, media.audio_sample_rate);
+  EXPECT_EQ(actual.audio_channels, media.audio_channels);
+  EXPECT_TRUE(actual.seed_is_set);
+  EXPECT_EQ(actual.seed, 1234);
+}
+
+TEST(BatchPackedInputTest, MultipleEncodedMediaMapToOneRequest) {
+  std::shared_ptr<DiTRequest> request = make_conditioned_dit_request(
+      "encoded-media-multi", {0, 1, 0}, "official_hf", "{}");
+  request->state().generation_params().num_videos_per_prompt = 2;
+  DiTBatch batch;
+  batch.add(request);
+
+  DiTEncodedMedia first;
+  first.data = "first";
+  first.mime_type = "video/mp4";
+  first.container = "mp4";
+  DiTEncodedMedia second = first;
+  second.data = "second";
+  DiTForwardOutput forward_output;
+  forward_output.encoded_media = {first, second};
+
+  batch.process_forward_output(forward_output);
+  const DiTRequestOutput output = request->generate_output();
+
+  ASSERT_EQ(output.outputs.size(), 2u);
+  EXPECT_EQ(output.outputs[0].image, "first");
+  EXPECT_EQ(output.outputs[0].index, 0u);
+  EXPECT_EQ(output.outputs[1].image, "second");
+  EXPECT_EQ(output.outputs[1].index, 1u);
+}
+
+TEST(BatchPackedInputTest, EncodedMediaUsesRequestMajorOrdering) {
+  std::shared_ptr<DiTRequest> first_request = make_conditioned_dit_request(
+      "encoded-media-first", {0, 1, 0}, "official_hf", "{}");
+  std::shared_ptr<DiTRequest> second_request = make_conditioned_dit_request(
+      "encoded-media-second", {1, 0, 1}, "official_hf", "{}");
+  first_request->state().generation_params().num_videos_per_prompt = 2;
+  second_request->state().generation_params().num_videos_per_prompt = 2;
+  DiTBatch batch;
+  batch.add(first_request);
+  batch.add(second_request);
+
+  DiTForwardOutput forward_output;
+  for (const std::string& data :
+       {"first-0", "first-1", "second-0", "second-1"}) {
+    DiTEncodedMedia media;
+    media.data = data;
+    media.mime_type = "video/mp4";
+    media.container = "mp4";
+    forward_output.encoded_media.emplace_back(std::move(media));
+  }
+
+  batch.process_forward_output(forward_output);
+  const DiTRequestOutput first_output = first_request->generate_output();
+  const DiTRequestOutput second_output = second_request->generate_output();
+
+  ASSERT_EQ(first_output.outputs.size(), 2u);
+  EXPECT_EQ(first_output.outputs[0].image, "first-0");
+  EXPECT_EQ(first_output.outputs[1].image, "first-1");
+  ASSERT_EQ(second_output.outputs.size(), 2u);
+  EXPECT_EQ(second_output.outputs[0].image, "second-0");
+  EXPECT_EQ(second_output.outputs[1].image, "second-1");
+}
+
+TEST(BatchPackedInputTest, EncodedAudioUsesAudioOutputField) {
+  std::shared_ptr<DiTRequest> request = make_conditioned_dit_request(
+      "encoded-audio", {0, 1, 0}, "official_hf", "{}", DiTRequestKind::kAudio);
+  DiTBatch batch;
+  batch.add(request);
+
+  DiTEncodedMedia media;
+  media.data = std::string("RIFF\0WAVE", 9);
+  media.mime_type = "audio/wav";
+  media.container = "wav";
+  media.audio_sample_rate = 32000;
+  media.audio_channels = 2;
+  DiTForwardOutput forward_output;
+  forward_output.encoded_media.push_back(media);
+
+  batch.process_forward_output(forward_output);
+  const DiTRequestOutput output = request->generate_output();
+
+  ASSERT_EQ(output.outputs.size(), 1u);
+  EXPECT_EQ(output.outputs[0].audio, media.data);
+  EXPECT_TRUE(output.outputs[0].image.empty());
+  EXPECT_EQ(output.outputs[0].mime_type, "audio/wav");
+  EXPECT_EQ(output.outputs[0].audio_sample_rate, 32000);
+  EXPECT_EQ(output.outputs[0].audio_channels, 2);
 }
 
 TEST(BatchPackedInputTest, DiTBatchStacksMiniMaxH3TokenTags) {

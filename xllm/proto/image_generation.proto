@@ -135,6 +135,9 @@ message ImageGenData {
 
   // Seed used for generating this image
   int64 seed = 5;
+
+  optional string mime_type = 6;
+  optional string container = 7;
 }
 
 // Output container for image generation task results

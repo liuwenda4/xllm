@@ -164,7 +164,7 @@ DiTForwardOutput DiTEngine::step(std::vector<DiTBatch>& batches) {
   }
 
   // return the result from the driver
-  auto forward_output = results.front().value();
+  auto forward_output = std::move(results.front().value());
   batches[0].process_forward_output(forward_output.value().dit_forward_output);
   return forward_output.value().dit_forward_output;
 }
