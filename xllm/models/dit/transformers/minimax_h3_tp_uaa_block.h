@@ -102,7 +102,7 @@ class MiniMaxH3TPUAADiTBlockImpl final : public torch::nn::Module {
     tp_block_->load_source_weights(shards, layer_index);
     fc2_weight_fp32_.copy_(tp_block_->mlp()->fc2_weight());
     minimax_h3_synchronize_weight_load(fc2_weight_fp32_.device());
-    fc2_weight_loaded_ = true;
+    row_weights_loaded_ = true;
   }
 
   MiniMaxH3ResidualBranchTrace forward(
@@ -154,10 +154,54 @@ class MiniMaxH3TPUAADiTBlockImpl final : public torch::nn::Module {
     trace.norm2_output = minimax_h3_rms_norm(
         after_attention, tp_block_->norm2_weight(), config_.norm_eps);
     trace.mlp_input = trace.norm2_output * (scale_mlp + 1.0) + shift_mlp;
-    trace.mlp_output = forward_mlp(trace.mlp_input);
+    trace.mlp_output = forward_mlp(trace.mlp_input, global_cu_seqlens);
     trace.mlp_delta = gate_mlp * trace.mlp_output;
     trace.output = after_attention + trace.mlp_delta;
     return trace;
+  }
+
+  torch::Tensor forward_output_only(const torch::Tensor& input,
+                                    const torch::Tensor& time_embedding,
+                                    const torch::Tensor& combined_indices,
+                                    const torch::Tensor& rope_frequencies,
+                                    const torch::Tensor& global_cu_seqlens) {
+    tp_block_->verify_loaded_weights();
+    validate_inputs(input,
+                    time_embedding,
+                    combined_indices,
+                    rope_frequencies,
+                    global_cu_seqlens);
+    const torch::Tensor parameters =
+        tp_block_->adaln_projection()->forward(time_embedding);
+    const torch::Tensor shift_msa =
+        minimax_h3_select_adaln_parameter(parameters, 0, combined_indices);
+    const torch::Tensor scale_msa =
+        minimax_h3_select_adaln_parameter(parameters, 1, combined_indices);
+    const torch::Tensor gate_msa =
+        minimax_h3_select_adaln_parameter(parameters, 2, combined_indices);
+    const torch::Tensor shift_mlp =
+        minimax_h3_select_adaln_parameter(parameters, 3, combined_indices);
+    const torch::Tensor scale_mlp =
+        minimax_h3_select_adaln_parameter(parameters, 4, combined_indices);
+    const torch::Tensor gate_mlp =
+        minimax_h3_select_adaln_parameter(parameters, 5, combined_indices);
+    const torch::Tensor attention_input =
+        minimax_h3_rms_norm(
+            input, tp_block_->norm1_weight(), config_.norm_eps) *
+            (scale_msa + 1.0) +
+        shift_msa;
+    const torch::Tensor after_attention =
+        input + gate_msa * forward_attention(attention_input,
+                                             rope_frequencies,
+                                             global_cu_seqlens,
+                                             /*diagnostics=*/nullptr);
+    const torch::Tensor mlp_input =
+        minimax_h3_rms_norm(
+            after_attention, tp_block_->norm2_weight(), config_.norm_eps) *
+            (scale_mlp + 1.0) +
+        shift_mlp;
+    return after_attention +
+           gate_mlp * forward_mlp(mlp_input, global_cu_seqlens);
   }
 
   MiniMaxH3TPDiTBlock tp_block() const { return tp_block_; }
@@ -190,7 +234,8 @@ class MiniMaxH3TPUAADiTBlockImpl final : public torch::nn::Module {
         minimax_h3_uaa_launch_inverse(attention_u.unsqueeze(0), u_group_)
             .finish()
             .squeeze(0);
-    torch::Tensor partial = attention->project_local_output_fp32(local_heads);
+    const torch::Tensor partial =
+        attention->project_local_output_fp32(local_heads);
     torch::Tensor output = minimax_h3_tp_fp32_all_reduce(partial, tp_group_);
 
     if (diagnostics != nullptr) {
@@ -202,14 +247,14 @@ class MiniMaxH3TPUAADiTBlockImpl final : public torch::nn::Module {
     return output;
   }
 
-  torch::Tensor forward_mlp(const torch::Tensor& input) {
-    if (!fc2_weight_loaded_ || !fc2_weight_fp32_.defined() ||
-        fc2_weight_fp32_.scalar_type() != torch::kFloat32 ||
-        fc2_weight_fp32_.device() != input.device()) {
+  torch::Tensor forward_mlp(const torch::Tensor& input,
+                            const torch::Tensor& global_cu_seqlens) {
+    if (!row_weights_loaded_) {
       throw std::logic_error(
-          "MiniMax-H3 combined block FP32 FC2 weight is not loaded");
+          "MiniMax-H3 combined block row weights are not loaded");
     }
     MiniMaxH3TPMLP mlp = tp_block_->mlp();
+    (void)global_cu_seqlens;
     const std::vector<torch::Tensor> up_gate =
         torch::nn::functional::linear(input, mlp->fc1_weight()).chunk(2, -1);
     const torch::Tensor activation = up_gate[0] * torch::silu(up_gate[1]);
@@ -285,7 +330,7 @@ class MiniMaxH3TPUAADiTBlockImpl final : public torch::nn::Module {
   ProcessGroup* u_group_;
   MiniMaxH3TPDiTBlock tp_block_{nullptr};
   torch::Tensor fc2_weight_fp32_;
-  bool fc2_weight_loaded_ = false;
+  bool row_weights_loaded_ = false;
 };
 TORCH_MODULE(MiniMaxH3TPUAADiTBlock);
 
