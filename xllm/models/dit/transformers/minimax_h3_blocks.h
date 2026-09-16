@@ -785,10 +785,12 @@ class MiniMaxH3TPAttentionImpl final : public torch::nn::Module {
  public:
   MiniMaxH3TPAttentionImpl(const MiniMaxH3C4Config& config,
                            ProcessGroup* tp_group,
-                           const torch::TensorOptions& options)
+                           const torch::TensorOptions& options,
+                           bool dense_output_projection = false)
       : tp_group_(tp_group),
         num_heads_(config.num_attention_heads),
-        head_dim_(config.attention_head_dim) {
+        head_dim_(config.attention_head_dim),
+        dense_output_projection_(dense_output_projection) {
     validate_tp_group(tp_group_);
     if (num_heads_ % tp_group_->world_size() != 0) {
       throw std::invalid_argument(
@@ -797,10 +799,15 @@ class MiniMaxH3TPAttentionImpl final : public torch::nn::Module {
     local_heads_ = num_heads_ / tp_group_->world_size();
     const int64_t inner = num_heads_ * head_dim_;
     const torch::TensorOptions bf16 = options.dtype(torch::kBFloat16);
-    out_weight_fp32_ = register_buffer(
-        "out_weight_fp32",
-        torch::empty({config.hidden_size, inner / tp_group_->world_size()},
-                     options.dtype(torch::kFloat32)));
+    if (dense_output_projection_) {
+      out_projection_weight_ = register_buffer(
+          "out_weight_dense", torch::empty({config.hidden_size, inner}, bf16));
+    } else {
+      out_projection_weight_ = register_buffer(
+          "out_weight_fp32",
+          torch::empty({config.hidden_size, inner / tp_group_->world_size()},
+                       options.dtype(torch::kFloat32)));
+    }
     q_norm_ = register_module(
         "q_norm", MiniMaxH3RMSNorm(head_dim_, config.qk_norm_eps, bf16));
     k_norm_ = register_module(
@@ -843,7 +850,19 @@ class MiniMaxH3TPAttentionImpl final : public torch::nn::Module {
                                /*shard_tensor_count=*/3,
                                {local_inner, local_inner, local_inner});
     out_proj_->load_state_dict(state_dict.get_dict_with_prefix("out_proj."));
-    out_weight_fp32_.copy_(out_proj_->weight());
+    const torch::Tensor out_weight = state_dict.get_tensor("out_proj.weight");
+    if (!out_weight.defined() ||
+        out_weight.sizes() != torch::IntArrayRef({out_proj_->weight().size(0),
+                                                  num_heads_ * head_dim_}) ||
+        out_weight.scalar_type() != torch::kBFloat16) {
+      throw std::invalid_argument(
+          "MiniMax-H3 TP Attention dense output weight mismatch");
+    }
+    if (dense_output_projection_) {
+      out_projection_weight_.copy_(out_weight);
+    } else {
+      out_projection_weight_.copy_(out_proj_->weight());
+    }
     minimax_h3_synchronize_weight_load(qkv_proj_->weight().device());
   }
 
@@ -852,6 +871,11 @@ class MiniMaxH3TPAttentionImpl final : public torch::nn::Module {
                         const torch::Tensor& cu_seqlens) {
     torch::Tensor local_heads =
         forward_local_heads(input, rope_frequencies, cu_seqlens);
+    if (dense_output_projection_) {
+      const torch::Tensor full_heads =
+          parallel_state::gather(local_heads, tp_group_, /*dim=*/1);
+      return project_dense_output(full_heads);
+    }
     torch::Tensor partial = project_local_output_fp32(local_heads);
     return minimax_h3_tp_fp32_all_reduce(partial, tp_group_);
   }
@@ -904,11 +928,10 @@ class MiniMaxH3TPAttentionImpl final : public torch::nn::Module {
   }
 
   torch::Tensor project_local_output_fp32(const torch::Tensor& local_heads) {
-    if (!out_weight_fp32_.defined() ||
-        out_weight_fp32_.scalar_type() != torch::kFloat32 ||
-        out_weight_fp32_.device() != local_heads.device() ||
-        out_weight_fp32_.size(0) != out_proj_->weight().size(0) ||
-        out_weight_fp32_.size(1) != out_proj_->weight().size(1)) {
+    if (dense_output_projection_ || !out_projection_weight_.defined() ||
+        out_projection_weight_.scalar_type() != torch::kFloat32 ||
+        out_projection_weight_.device() != local_heads.device() ||
+        out_projection_weight_.sizes() != out_proj_->weight().sizes()) {
       throw std::logic_error(
           "MiniMax-H3 TP FP32 Attention projection weight is not loaded");
     }
@@ -921,13 +944,28 @@ class MiniMaxH3TPAttentionImpl final : public torch::nn::Module {
     return torch::nn::functional::linear(
         local_heads.reshape({local_heads.size(0), local_heads_ * head_dim_})
             .to(torch::kFloat32),
-        out_weight_fp32_);
+        out_projection_weight_);
+  }
+
+  torch::Tensor project_dense_output(const torch::Tensor& full_heads) {
+    if (!dense_output_projection_ || !full_heads.defined() ||
+        full_heads.dim() != 3 || full_heads.size(1) != num_heads_ ||
+        full_heads.size(2) != head_dim_ ||
+        full_heads.scalar_type() != torch::kBFloat16 ||
+        full_heads.device() != out_projection_weight_.device() ||
+        out_projection_weight_.scalar_type() != torch::kBFloat16) {
+      throw std::invalid_argument(
+          "MiniMax-H3 dense Attention output shape mismatch");
+    }
+    return torch::nn::functional::linear(
+        full_heads.reshape({full_heads.size(0), num_heads_ * head_dim_}),
+        out_projection_weight_);
   }
 
   void verify_loaded_weights() const {
     if (!q_norm_->is_weight_loaded() || !k_norm_->is_weight_loaded() ||
         !qkv_proj_->is_weight_loaded() || !out_proj_->is_weight_loaded() ||
-        !out_weight_fp32_.defined()) {
+        !out_projection_weight_.defined()) {
       throw std::logic_error(
           "MiniMax-H3 TP Attention weights are not completely loaded");
     }
@@ -952,11 +990,12 @@ class MiniMaxH3TPAttentionImpl final : public torch::nn::Module {
   int64_t num_heads_;
   int64_t head_dim_;
   int64_t local_heads_ = 0;
+  bool dense_output_projection_ = false;
   MiniMaxH3RMSNorm q_norm_{nullptr};
   MiniMaxH3RMSNorm k_norm_{nullptr};
   layer::ColumnParallelLinear qkv_proj_{nullptr};
   layer::RowParallelLinear out_proj_{nullptr};
-  torch::Tensor out_weight_fp32_;
+  torch::Tensor out_projection_weight_;
 };
 TORCH_MODULE(MiniMaxH3TPAttention);
 
@@ -1110,7 +1149,8 @@ class MiniMaxH3TPDiTBlockImpl final : public torch::nn::Module {
  public:
   MiniMaxH3TPDiTBlockImpl(const MiniMaxH3C4Config& config,
                           ProcessGroup* tp_group,
-                          const torch::TensorOptions& options)
+                          const torch::TensorOptions& options,
+                          bool dense_output_projection = false)
       : config_(config), tp_group_(tp_group) {
     if (tp_group_ == nullptr || tp_group_->world_size() != 2) {
       throw std::invalid_argument(
@@ -1121,8 +1161,10 @@ class MiniMaxH3TPDiTBlockImpl final : public torch::nn::Module {
         "norm1", MiniMaxH3RMSNorm(config.hidden_size, config.norm_eps, bf16));
     norm2_ = register_module(
         "norm2", MiniMaxH3RMSNorm(config.hidden_size, config.norm_eps, bf16));
-    attn_ = register_module("attn",
-                            MiniMaxH3TPAttention(config, tp_group_, options));
+    attn_ = register_module(
+        "attn",
+        MiniMaxH3TPAttention(
+            config, tp_group_, options, dense_output_projection));
     mlp_ = register_module("mlp", MiniMaxH3TPMLP(config, tp_group_, options));
     adaln_proj_ = register_module(
         "adaln_proj", MiniMaxH3TPAdaLNProjection(config, tp_group_, options));
@@ -1340,6 +1382,10 @@ class MiniMaxH3FinalLayerImpl final : public torch::nn::Module {
                                const torch::Tensor& time_embedding,
                                const torch::Tensor& inverse_indices,
                                const H3PackedLayout& layout) const {
+    if (layout.used_length <= 0 || layout.used_length > input.size(0)) {
+      throw std::invalid_argument(
+          "MiniMax-H3 final layer used-row geometry mismatch");
+    }
     torch::Tensor parameters = adaln_proj_->forward(time_embedding);
     torch::Tensor shift =
         parameters.select(1, 0).select(1, 0).index_select(0, inverse_indices);
@@ -1347,9 +1393,22 @@ class MiniMaxH3FinalLayerImpl final : public torch::nn::Module {
         parameters.select(1, 0).select(1, 1).index_select(0, inverse_indices);
     MiniMaxH3FinalOutput output;
     output.activation = norm_->forward(input) * (scale + 1.0) + shift;
-    torch::Tensor fp32_activation = output.activation.to(torch::kFloat32);
-    output.all_video_logits = video_out_->forward(fp32_activation);
-    output.all_audio_logits = audio_out_->forward(fp32_activation);
+    const torch::Tensor fp32_activation =
+        output.activation.narrow(0, 0, layout.used_length).to(torch::kFloat32);
+    const torch::Tensor used_video_logits =
+        video_out_->forward(fp32_activation);
+    const torch::Tensor used_audio_logits =
+        audio_out_->forward(fp32_activation);
+    output.all_video_logits =
+        torch::zeros({input.size(0), used_video_logits.size(1)},
+                     used_video_logits.options());
+    output.all_audio_logits =
+        torch::zeros({input.size(0), used_audio_logits.size(1)},
+                     used_audio_logits.options());
+    output.all_video_logits.narrow(0, 0, layout.used_length)
+        .copy_(used_video_logits);
+    output.all_audio_logits.narrow(0, 0, layout.used_length)
+        .copy_(used_audio_logits);
 
     torch::Tensor image_positions = layout.img_pos.to(input.device());
     torch::Tensor audio_positions = layout.audio_pos.to(input.device());

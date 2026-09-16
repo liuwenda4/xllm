@@ -88,20 +88,28 @@ class MiniMaxH3TPUAADiTBlockImpl final : public torch::nn::Module {
           "MiniMax-H3 combined block requires locked 56-head geometry");
     }
     tp_block_ = register_module(
-        "tp_block", MiniMaxH3TPDiTBlock(config_, tp_group_, options));
-    fc2_weight_fp32_ = register_buffer(
-        "fc2_weight_fp32",
-        torch::empty(
-            {config_.hidden_size, config_.ffn_hidden_size / kMiniMaxH3TPSize},
-            options.dtype(torch::kFloat32)));
+        "tp_block",
+        MiniMaxH3TPDiTBlock(
+            config_, tp_group_, options, /*dense_output_projection=*/true));
+    fc2_weight_dense_ = register_buffer(
+        "fc2_weight_dense",
+        torch::empty({config_.hidden_size, config_.ffn_hidden_size},
+                     options.dtype(torch::kBFloat16)));
   }
 
   void load_source_weights(
       const std::vector<std::unique_ptr<StateDict>>& shards,
       int64_t layer_index) {
     tp_block_->load_source_weights(shards, layer_index);
-    fc2_weight_fp32_.copy_(tp_block_->mlp()->fc2_weight());
-    minimax_h3_synchronize_weight_load(fc2_weight_fp32_.device());
+    const torch::Tensor fc2_weight = source_tensor(
+        shards, "blocks." + std::to_string(layer_index) + ".mlp.fc2.weight");
+    if (fc2_weight.sizes() != fc2_weight_dense_.sizes() ||
+        fc2_weight.scalar_type() != torch::kBFloat16) {
+      throw std::invalid_argument(
+          "MiniMax-H3 combined block dense FC2 weight mismatch");
+    }
+    fc2_weight_dense_.copy_(fc2_weight);
+    minimax_h3_synchronize_weight_load(fc2_weight_dense_.device());
     row_weights_loaded_ = true;
   }
 
@@ -234,9 +242,9 @@ class MiniMaxH3TPUAADiTBlockImpl final : public torch::nn::Module {
         minimax_h3_uaa_launch_inverse(attention_u.unsqueeze(0), u_group_)
             .finish()
             .squeeze(0);
-    const torch::Tensor partial =
-        attention->project_local_output_fp32(local_heads);
-    torch::Tensor output = minimax_h3_tp_fp32_all_reduce(partial, tp_group_);
+    const torch::Tensor full_heads =
+        parallel_state::gather(local_heads, tp_group_, /*dim=*/1);
+    torch::Tensor output = attention->project_dense_output(full_heads);
 
     if (diagnostics != nullptr) {
       diagnostics->query_u = std::move(query_u);
@@ -258,9 +266,36 @@ class MiniMaxH3TPUAADiTBlockImpl final : public torch::nn::Module {
     const std::vector<torch::Tensor> up_gate =
         torch::nn::functional::linear(input, mlp->fc1_weight()).chunk(2, -1);
     const torch::Tensor activation = up_gate[0] * torch::silu(up_gate[1]);
-    const torch::Tensor partial = torch::nn::functional::linear(
-        activation.to(torch::kFloat32), fc2_weight_fp32_);
-    return minimax_h3_tp_fp32_all_reduce(partial, tp_group_);
+    const torch::Tensor full_activation =
+        parallel_state::gather(activation, tp_group_, /*dim=*/-1);
+    return torch::nn::functional::linear(full_activation, fc2_weight_dense_);
+  }
+
+  static torch::Tensor source_tensor(
+      const std::vector<std::unique_ptr<StateDict>>& shards,
+      const std::string& name) {
+    torch::Tensor found;
+    for (const std::unique_ptr<StateDict>& shard : shards) {
+      if (shard == nullptr) {
+        throw std::invalid_argument(
+            "MiniMax-H3 combined block source contains a null shard");
+      }
+      const torch::Tensor candidate = shard->get_tensor(name);
+      if (!candidate.defined()) {
+        continue;
+      }
+      if (found.defined()) {
+        throw std::invalid_argument(
+            "MiniMax-H3 combined block source tensor is duplicated: `" + name +
+            "`");
+      }
+      found = candidate;
+    }
+    if (!found.defined()) {
+      throw std::invalid_argument(
+          "MiniMax-H3 combined block source tensor is missing: `" + name + "`");
+    }
+    return found;
   }
 
   void validate_inputs(const torch::Tensor& input,
@@ -329,7 +364,7 @@ class MiniMaxH3TPUAADiTBlockImpl final : public torch::nn::Module {
   ProcessGroup* tp_group_;
   ProcessGroup* u_group_;
   MiniMaxH3TPDiTBlock tp_block_{nullptr};
-  torch::Tensor fc2_weight_fp32_;
+  torch::Tensor fc2_weight_dense_;
   bool row_weights_loaded_ = false;
 };
 TORCH_MODULE(MiniMaxH3TPUAADiTBlock);

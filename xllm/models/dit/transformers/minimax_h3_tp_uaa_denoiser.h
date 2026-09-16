@@ -18,6 +18,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <cstdint>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -25,8 +26,8 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "models/dit/transformers/minimax_h3_denoiser.h"
 #include "models/dit/transformers/minimax_h3_tp_uaa_resident.h"
-#include "models/dit/transformers/transformer_minimax_h3.h"
 
 namespace xllm {
 
@@ -44,6 +45,28 @@ struct MiniMaxH3TPUAAOneForwardOutput {
   torch::Tensor full_transformer_output;
   MiniMaxH3FinalOutput final_output;
 };
+
+struct MiniMaxH3TPUAATrajectoryOutput {
+  torch::Tensor video_rows;
+  torch::Tensor audio_rows;
+  int64_t transformer_forwards = 0;
+  int64_t block_forwards = 0;
+};
+
+struct MiniMaxH3TPUAABoundary {
+  int64_t forward_index = 0;
+  torch::Tensor video_rows_before;
+  torch::Tensor audio_rows_before;
+  torch::Tensor raw_video_velocity;
+  torch::Tensor raw_audio_velocity;
+  torch::Tensor video_x0;
+  torch::Tensor audio_x0;
+  torch::Tensor video_rows_after;
+  torch::Tensor audio_rows_after;
+};
+
+using MiniMaxH3TPUAATrajectoryObserver =
+    std::function<void(const MiniMaxH3TPUAABoundary&)>;
 
 class MiniMaxH3TPUAAFixedStageImpl final : public torch::nn::Module {
  public:
@@ -173,6 +196,7 @@ class MiniMaxH3TPUAAFixedStageImpl final : public torch::nn::Module {
   }
 
   ProcessGroup* u_group() const { return u_group_; }
+  torch::Device device() const { return condition_proj_->weight().device(); }
 
  private:
   using SourceIndex = std::unordered_map<std::string, const torch::Tensor*>;
@@ -283,6 +307,116 @@ class MiniMaxH3TPUAAResidentDenoiserImpl final : public torch::nn::Module {
                          output.prepared.device_inverse_indices,
                          layout);
     return output;
+  }
+
+  MiniMaxH3FinalOutput forward_output_only(
+      const H3PackedLayout& layout,
+      const torch::Tensor& video_rows,
+      const torch::Tensor& audio_rows,
+      const torch::Tensor& timesteps,
+      const torch::Tensor& inverse_indices) {
+    const MiniMaxH3TPUAAPreparedForward prepared = fixed_->prepare(
+        layout, video_rows, audio_rows, timesteps, inverse_indices);
+    const torch::Tensor local_transformer_output =
+        transformer_->forward(prepared.local_hidden,
+                              prepared.time_embedding,
+                              prepared.local_combined_indices,
+                              prepared.local_rope_frequencies,
+                              layout.cu_seqlens);
+    return fixed_->finalize(local_transformer_output,
+                            prepared.time_embedding,
+                            prepared.device_inverse_indices,
+                            layout);
+  }
+
+  MiniMaxH3TPUAATrajectoryOutput run_base_trajectory(
+      const H3PackedLayout& layout,
+      const torch::Tensor& initial_video_rows,
+      const torch::Tensor& initial_audio_rows,
+      const MiniMaxH3TPUAATrajectoryObserver& observer = nullptr) {
+    torch::NoGradGuard no_grad;
+    if (!initial_video_rows.defined() || initial_video_rows.dim() != 2 ||
+        initial_video_rows.size(0) != layout.img_pos.numel() ||
+        initial_video_rows.size(1) != 96 ||
+        initial_video_rows.scalar_type() != torch::kFloat32 ||
+        !initial_audio_rows.defined() || initial_audio_rows.dim() != 2 ||
+        initial_audio_rows.size(0) != layout.audio_pos.numel() ||
+        initial_audio_rows.size(1) != 32 ||
+        initial_audio_rows.scalar_type() != torch::kFloat32) {
+      throw std::invalid_argument(
+          "MiniMax-H3 trajectory rows must be FP32 in packed position order");
+    }
+    const MiniMaxH3DualSigmaSchedule schedule =
+        MiniMaxH3Scheduler::build_base();
+    if (schedule.video.forward_count() != schedule.audio.forward_count() ||
+        schedule.video.forward_count() != 49) {
+      throw std::logic_error(
+          "MiniMax-H3 Base dual schedule must have 49 forwards");
+    }
+    const torch::Device device = fixed_->device();
+    const torch::Tensor image_update = layout.update_mask.to(device);
+    const torch::Tensor audio_update = layout.audio_update_mask.to(device);
+    torch::Tensor video_rows = initial_video_rows.to(device).clone();
+    torch::Tensor audio_rows = initial_audio_rows.to(device).clone();
+    const torch::Tensor video_anchor =
+        video_rows.index({~image_update}).clone();
+    const torch::Tensor audio_anchor =
+        audio_rows.index({~audio_update}).clone();
+    for (int64_t step = 0; step < schedule.video.forward_count(); ++step) {
+      const torch::Tensor video_rows_before = video_rows;
+      const torch::Tensor audio_rows_before = audio_rows;
+      const MiniMaxH3RowTimestepPlan plan = minimax_h3_build_row_timestep_plan(
+          layout,
+          schedule.video.timesteps[step].item<float>(),
+          schedule.audio.timesteps[step].item<float>());
+      const MiniMaxH3FinalOutput denoiser =
+          forward_output_only(layout,
+                              video_rows,
+                              audio_rows,
+                              plan.unique_timesteps,
+                              plan.inverse_indices);
+      const torch::Tensor video_target = video_rows.index({image_update});
+      const torch::Tensor audio_target = audio_rows.index({audio_update});
+      const torch::Tensor video_x0 = MiniMaxH3Scheduler::velocity_to_x0(
+          video_target,
+          denoiser.raw_selected_video_logits.index({image_update}),
+          schedule.video.timesteps[step]);
+      const torch::Tensor audio_x0 = MiniMaxH3Scheduler::velocity_to_x0(
+          audio_target,
+          denoiser.raw_selected_audio_logits.index({audio_update}),
+          schedule.audio.timesteps[step]);
+      const torch::Tensor next_video = MiniMaxH3Scheduler::step_eta0(
+          video_target,
+          video_x0,
+          schedule.video.sigmas[step].item<float>(),
+          schedule.video.sigmas[step + 1].item<float>());
+      const torch::Tensor next_audio = MiniMaxH3Scheduler::step_eta0(
+          audio_target,
+          audio_x0,
+          schedule.audio.sigmas[step].item<float>(),
+          schedule.audio.sigmas[step + 1].item<float>());
+      video_rows = video_rows.clone();
+      audio_rows = audio_rows.clone();
+      video_rows.index_put_({image_update}, next_video);
+      audio_rows.index_put_({audio_update}, next_audio);
+      video_rows.index_put_({~image_update}, video_anchor);
+      audio_rows.index_put_({~audio_update}, audio_anchor);
+      if (observer) {
+        observer({.forward_index = step + 1,
+                  .video_rows_before = video_rows_before,
+                  .audio_rows_before = audio_rows_before,
+                  .raw_video_velocity = denoiser.raw_selected_video_logits,
+                  .raw_audio_velocity = denoiser.raw_selected_audio_logits,
+                  .video_x0 = video_x0,
+                  .audio_x0 = audio_x0,
+                  .video_rows_after = video_rows,
+                  .audio_rows_after = audio_rows});
+      }
+    }
+    return {.video_rows = std::move(video_rows),
+            .audio_rows = std::move(audio_rows),
+            .transformer_forwards = 49,
+            .block_forwards = 49 * kMiniMaxH3ResidentBlockCount};
   }
 
   MiniMaxH3TPUAAResidentTransformer transformer() const { return transformer_; }

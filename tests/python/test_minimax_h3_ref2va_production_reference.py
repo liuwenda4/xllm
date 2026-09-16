@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -37,6 +38,7 @@ from tools.minimax_h3_ref2va_production_reference import (
     OFFICIAL_CONDITION_MANIFEST_SHA256,
     OFFICIAL_CONDITION_SHA256,
     OFFICIAL_HIDDEN_SHA256,
+    ORACLE_EXECUTION_SCHEMA,
     PINNED_DIFFUSERS_REVISION,
     PREPARED_CONDITION_KEYS,
     PREPARED_SCHEMA,
@@ -53,6 +55,7 @@ from tools.minimax_h3_ref2va_production_reference import (
     TARGET_AUDIO_ROWS,
     TARGET_VIDEO_ROWS,
     TEXT_ROWS,
+    TRANSFORMER_HIDDEN,
     USED_ROWS,
     VIDEO_COMPACT_ROWS,
     VISUAL_LATENT_SHAPE,
@@ -62,11 +65,15 @@ from tools.minimax_h3_ref2va_production_reference import (
     _build_production_layout,
     _condition_tensor_key,
     _draw_request_noise,
+    _execution_names,
     _geometry_manifest,
     _layout_archive,
+    _oracle_tensor_specs,
     _prepare_reference_pixels,
     _prove_pinned_randn_equivalence,
     _reference_resize_geometry,
+    _resolve_oracle_forwards,
+    _resolve_oracle_model_boundaries,
     _sha256,
     _tensor_summary,
     _torch_randn_tensor,
@@ -74,6 +81,8 @@ from tools.minimax_h3_ref2va_production_reference import (
     _validate_prepared_manifest,
     _validate_production_layout,
     _validate_tensor_contract,
+    _velocity_to_x0,
+    _verify_prepared_against_runtime,
     _with_digest,
     _write_artifact_pair,
 )
@@ -294,6 +303,83 @@ def test_backend_selection_is_explicit_and_has_no_fallback() -> None:
         _condition_tensor_key("xllm_native", manifest)
 
 
+def test_oracle_forward_selection_is_explicit_sorted_and_official_only() -> None:
+    selected = _resolve_oracle_forwards(
+        SimpleNamespace(
+            oracle_forward=[8, 1, 8, 2],
+            oracle_all_forwards=False,
+            condition_backend="official_hf",
+        ),
+        forwards=49,
+    )
+    assert selected == (1, 2, 8)
+    assert _execution_names("official_hf", "full", selected) == (
+        "minimax_h3_ref2va_production_official_hf_full_oracle.safetensors",
+        "minimax_h3_ref2va_production_official_hf_full_oracle.json",
+        "minimax_h3_ref2va_production_official_hf_full_oracle",
+    )
+    assert ORACLE_EXECUTION_SCHEMA.endswith("official_oracle/v1")
+
+    all_forwards = _resolve_oracle_forwards(
+        SimpleNamespace(
+            oracle_forward=[],
+            oracle_all_forwards=True,
+            condition_backend="official_hf",
+        ),
+        forwards=3,
+    )
+    assert all_forwards == (1, 2, 3)
+    assert _resolve_oracle_model_boundaries(
+        SimpleNamespace(oracle_model_boundary_forward=[2, 1, 2]),
+        all_forwards,
+    ) == (1, 2)
+    with pytest.raises(ValueError, match="must also be selected"):
+        _resolve_oracle_model_boundaries(
+            SimpleNamespace(oracle_model_boundary_forward=[4]),
+            all_forwards,
+        )
+
+    with pytest.raises(ValueError, match="official_hf"):
+        _resolve_oracle_forwards(
+            SimpleNamespace(
+                oracle_forward=[1],
+                oracle_all_forwards=False,
+                condition_backend="xllm_native",
+            ),
+            forwards=1,
+        )
+    with pytest.raises(ValueError, match=r"\[1,1\]"):
+        _resolve_oracle_forwards(
+            SimpleNamespace(
+                oracle_forward=[2],
+                oracle_all_forwards=False,
+                condition_backend="official_hf",
+            ),
+            forwards=1,
+        )
+
+
+def test_oracle_tensor_contract_and_x0_formula_are_exact() -> None:
+    specs = _oracle_tensor_specs((1, 49), (1,))
+    assert len(specs) == 18
+    assert specs["oracle.forward_001.raw_video_velocity"] == TensorSpec((VIDEO_COMPACT_ROWS, 96), torch.float32)
+    assert specs["oracle.forward_049.target_video_x0"] == TensorSpec((TARGET_VIDEO_ROWS, 96), torch.float32)
+    assert specs["oracle.forward_049.audio_rows_after"] == TensorSpec((AUDIO_COMPACT_ROWS, 32), torch.float32)
+    assert specs["oracle.forward_001.transformer_hidden"] == TensorSpec((USED_ROWS, TRANSFORMER_HIDDEN), torch.bfloat16)
+    assert specs["oracle.forward_001.final_activation"] == TensorSpec((USED_ROWS, TRANSFORMER_HIDDEN), torch.float32)
+    assert "oracle.forward_049.transformer_hidden" not in specs
+    assert len(_oracle_tensor_specs(tuple(range(1, 50)))) == 49 * 8
+
+    state = torch.tensor([[1.0, -2.0], [3.0, 4.0]], dtype=torch.float32)
+    velocity = torch.tensor([[0.5, 2.0], [-1.0, 0.25]], dtype=torch.float32)
+    timestep = torch.tensor(0.25, dtype=torch.float32)
+    expected = state + (1.0 - timestep) * velocity
+    assert torch.equal(_velocity_to_x0(state, velocity, timestep), expected)
+
+    with pytest.raises(ValueError, match="same-shape FP32"):
+        _velocity_to_x0(state, velocity.to(torch.bfloat16), timestep)
+
+
 def test_prepared_manifest_validation_fails_closed() -> None:
     manifest = _prepared_manifest_fixture()
     _validate_prepared_manifest(manifest)
@@ -314,6 +400,40 @@ def test_prepared_manifest_validation_fails_closed() -> None:
     wrong_dtype["tensors"]["input.visual_anchor_noise"]["dtype"] = "float16"
     with pytest.raises(ValueError, match="dtype mismatch"):
         _validate_prepared_manifest(wrong_dtype)
+
+
+def test_oracle_extension_only_relaxes_generator_identity() -> None:
+    manifest = _prepared_manifest_fixture()
+    runtime_source = copy.deepcopy(manifest["source"])
+    runtime_source["generator"] = {
+        "path": "/oracle/extended_generator.py",
+        "size": 123,
+        "sha256": "1" * 64,
+    }
+    runtime_source.pop("digest")
+    _with_digest(runtime_source)
+
+    _verify_prepared_against_runtime(
+        manifest,
+        runtime_source,
+        manifest["checkpoint"],
+        allow_generator_extension=True,
+    )
+    with pytest.raises(ValueError, match="source does not match"):
+        _verify_prepared_against_runtime(manifest, runtime_source, manifest["checkpoint"])
+
+    wrong_file = copy.deepcopy(runtime_source)
+    first_name = next(iter(wrong_file["files"]))
+    wrong_file["files"][first_name]["sha256"] = "2" * 64
+    wrong_file.pop("digest")
+    _with_digest(wrong_file)
+    with pytest.raises(ValueError, match="pinned Diffusers files"):
+        _verify_prepared_against_runtime(
+            manifest,
+            wrong_file,
+            manifest["checkpoint"],
+            allow_generator_extension=True,
+        )
 
 
 def test_tensor_contract_and_artifact_pair_validation(tmp_path: Path) -> None:

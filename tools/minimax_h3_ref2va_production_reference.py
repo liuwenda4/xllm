@@ -84,6 +84,7 @@ PREPARED_ARCHIVE_NAME = "minimax_h3_ref2va_production_prepared.safetensors"
 PREPARED_MANIFEST_NAME = "minimax_h3_ref2va_production_prepared.json"
 PREPARED_SCHEMA = "xllm.minimax_h3.ref2va_production_prepared/v1"
 EXECUTION_SCHEMA = "xllm.minimax_h3.ref2va_production_execution/v1"
+ORACLE_EXECUTION_SCHEMA = "xllm.minimax_h3.ref2va_production_official_oracle/v1"
 
 OFFICIAL_CONDITION_SHA256 = "524652e82e9b20db4ede5460347b4ce309dce33f7db983a8cc7ae2e7cfe4f496"
 OFFICIAL_CONDITION_MANIFEST_SHA256 = "9a6a0e2b1291658b26e55188e2136d257e45dbea77ef8cdb8f634be66df52c6b"
@@ -125,6 +126,7 @@ REQUEST_SEED = 42
 SIGMA_POINTS = 50
 TRANSFORMER_FORWARDS = 49
 TRANSFORMER_LAYERS = 50
+TRANSFORMER_HIDDEN = 5376
 SNAPSHOT_FORWARDS = (1, 2, 4, 8, 49)
 REQUEST_DRAW_ORDER = ("visual_anchor_noise", "target_video_initial", "target_audio_rows")
 
@@ -274,7 +276,28 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     execute.add_argument("--devices", nargs=2, default=("npu:0", "npu:1"), metavar=("FIRST", "SECOND"))
     execute.add_argument("--vae-device", default="npu:0")
     execute.add_argument("--write-media", action="store_true")
+    execute.add_argument("--oracle-forward", type=int, action="append", default=[])
+    execute.add_argument("--oracle-all-forwards", action="store_true")
+    execute.add_argument("--oracle-model-boundary-forward", type=int, action="append", default=[])
     return parser.parse_args(argv)
+
+
+def _resolve_oracle_forwards(args: argparse.Namespace, forwards: int) -> tuple[int, ...]:
+    requested = set(args.oracle_forward)
+    if args.oracle_all_forwards:
+        requested.update(range(1, forwards + 1))
+    if requested and args.condition_backend != "official_hf":
+        raise ValueError("Oracle capture requires --condition-backend official_hf")
+    if any(value < 1 or value > forwards for value in requested):
+        raise ValueError(f"Oracle forwards must be in [1,{forwards}]")
+    return tuple(sorted(requested))
+
+
+def _resolve_oracle_model_boundaries(args: argparse.Namespace, oracle_forwards: Sequence[int]) -> tuple[int, ...]:
+    requested = set(args.oracle_model_boundary_forward)
+    if not requested.issubset(set(oracle_forwards)):
+        raise ValueError("Oracle model-boundary forwards must also be selected Oracle forwards")
+    return tuple(sorted(requested))
 
 
 def _sha256(path: Path) -> str:
@@ -1297,8 +1320,16 @@ def _verify_prepared_against_runtime(
     manifest: Mapping[str, Any],
     source: Mapping[str, Any],
     checkpoint: Mapping[str, Any],
+    *,
+    allow_generator_extension: bool = False,
 ) -> None:
-    if manifest["source"] != source:
+    prepared_source = manifest["source"]
+    if allow_generator_extension:
+        prepared_pinned = {key: value for key, value in prepared_source.items() if key not in {"digest", "generator"}}
+        current_pinned = {key: value for key, value in source.items() if key not in {"digest", "generator"}}
+        if prepared_pinned != current_pinned:
+            raise ValueError("current pinned Diffusers files do not match the prepared artifact")
+    elif prepared_source != source:
         raise ValueError("current pinned Diffusers source does not match the prepared artifact")
     if manifest["checkpoint"] != checkpoint:
         raise ValueError("current converted checkpoint does not match the prepared artifact")
@@ -1402,7 +1433,8 @@ def _eager_transformer_forward(
     audio_rows: torch.Tensor,
     unique_timesteps: torch.Tensor,
     timestep_indices: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    capture_model_boundaries: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     first = next(model.context_embedder.parameters()).device
     last = next(model.norm_out.parameters()).device
     video_indices_first = layout.video_indices.to(first)
@@ -1439,7 +1471,12 @@ def _eager_transformer_forward(
     audio_velocity = (
         model.audio_proj_out(activation).index_select(1, layout.audio_indices.to(last)).squeeze(0).to(first)
     )
-    return video_velocity, audio_velocity
+    return (
+        video_velocity,
+        audio_velocity,
+        hidden.squeeze(0) if capture_model_boundaries else None,
+        activation.squeeze(0) if capture_model_boundaries else None,
+    )
 
 
 def _replace_generated_rows(rows: torch.Tensor, generated: torch.Tensor, condition_rows: int) -> torch.Tensor:
@@ -1455,7 +1492,45 @@ def _replace_generated_rows(rows: torch.Tensor, generated: torch.Tensor, conditi
     return output
 
 
-def _validate_execution_archive(archive: Mapping[str, torch.Tensor], forwards: int) -> None:
+def _oracle_tensor_specs(
+    oracle_forwards: Sequence[int], model_boundary_forwards: Sequence[int] = ()
+) -> dict[str, TensorSpec]:
+    expected: dict[str, TensorSpec] = {}
+    model_boundary_set = set(model_boundary_forwards)
+    for forward_number in oracle_forwards:
+        prefix = f"oracle.forward_{forward_number:03d}"
+        expected[f"{prefix}.input_video_rows"] = TensorSpec((VIDEO_COMPACT_ROWS, VIDEO_PATCH_WIDTH), torch.float32)
+        expected[f"{prefix}.input_audio_rows"] = TensorSpec(TARGET_AUDIO_ROWS_SHAPE, torch.float32)
+        expected[f"{prefix}.raw_video_velocity"] = TensorSpec((VIDEO_COMPACT_ROWS, VIDEO_PATCH_WIDTH), torch.float32)
+        expected[f"{prefix}.raw_audio_velocity"] = TensorSpec(TARGET_AUDIO_ROWS_SHAPE, torch.float32)
+        if forward_number in model_boundary_set:
+            expected[f"{prefix}.transformer_hidden"] = TensorSpec((USED_ROWS, TRANSFORMER_HIDDEN), torch.bfloat16)
+            expected[f"{prefix}.final_activation"] = TensorSpec((USED_ROWS, TRANSFORMER_HIDDEN), torch.float32)
+        expected[f"{prefix}.target_video_x0"] = TensorSpec((TARGET_VIDEO_ROWS, VIDEO_PATCH_WIDTH), torch.float32)
+        expected[f"{prefix}.target_audio_x0"] = TensorSpec(TARGET_AUDIO_ROWS_SHAPE, torch.float32)
+        expected[f"{prefix}.video_rows_after"] = TensorSpec((VIDEO_COMPACT_ROWS, VIDEO_PATCH_WIDTH), torch.float32)
+        expected[f"{prefix}.audio_rows_after"] = TensorSpec(TARGET_AUDIO_ROWS_SHAPE, torch.float32)
+    return expected
+
+
+def _velocity_to_x0(state: torch.Tensor, velocity: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+    if state.shape != velocity.shape or state.dtype != torch.float32 or velocity.dtype != torch.float32:
+        raise ValueError("Oracle x0 requires same-shape FP32 state and velocity")
+    sigma_from_timestep = 1.0 - timestep.to(device=state.device, dtype=state.dtype)
+    while sigma_from_timestep.ndim < state.ndim:
+        sigma_from_timestep = sigma_from_timestep.unsqueeze(-1)
+    output = state + sigma_from_timestep * velocity
+    if not bool(torch.isfinite(output).all()):
+        raise ValueError("Oracle x0 contains NaN or Inf")
+    return output
+
+
+def _validate_execution_archive(
+    archive: Mapping[str, torch.Tensor],
+    forwards: int,
+    oracle_forwards: Sequence[int] = (),
+    model_boundary_forwards: Sequence[int] = (),
+) -> None:
     expected: dict[str, TensorSpec] = {}
     for forward_number in SNAPSHOT_FORWARDS:
         if forward_number <= forwards:
@@ -1477,6 +1552,7 @@ def _validate_execution_archive(archive: Mapping[str, torch.Tensor], forwards: i
                 "decoded.audio_sample_rate": TensorSpec((), torch.int64),
             }
         )
+    expected.update(_oracle_tensor_specs(oracle_forwards, model_boundary_forwards))
     _validate_tensor_contract(archive, expected)
     if forwards == TRANSFORMER_FORWARDS and int(archive["decoded.audio_sample_rate"].item()) != AUDIO_SAMPLE_RATE:
         raise ValueError("decoded audio sample rate tensor mismatch")
@@ -1504,6 +1580,8 @@ def _run_transformer(
     audio_scheduler: Any,
     devices: tuple[torch.device, torch.device],
     forwards: int,
+    oracle_forwards: Sequence[int] = (),
+    model_boundary_forwards: Sequence[int] = (),
 ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, list[float]]:
     first = devices[0]
     video_rows = tensors["initial.video_rows"].to(first)
@@ -1512,12 +1590,14 @@ def _run_transformer(
     video_anchor = video_rows[:IMAGE_ROWS].clone()
     archive: dict[str, torch.Tensor] = {}
     forward_seconds = []
+    oracle_forward_set = set(oracle_forwards)
+    model_boundary_set = set(model_boundary_forwards)
 
     for index in range(forwards):
         forward_number = index + 1
         prefix = f"schedule.forward_{forward_number:03d}"
         started = time.perf_counter()
-        video_velocity, audio_velocity = _eager_transformer_forward(
+        video_velocity, audio_velocity, transformer_hidden, final_activation = _eager_transformer_forward(
             model,
             layout,
             condition_hidden,
@@ -1525,15 +1605,41 @@ def _run_transformer(
             audio_rows,
             tensors[f"{prefix}.unique_timesteps"].to(first),
             tensors[f"{prefix}.timestep_indices"].to(first),
+            capture_model_boundaries=forward_number in model_boundary_set,
         )
+        target_video_velocity = video_velocity[IMAGE_ROWS:].float()
+        target_audio_velocity = audio_velocity.float()
+        if forward_number in oracle_forward_set:
+            oracle_prefix = f"oracle.forward_{forward_number:03d}"
+            archive[f"{oracle_prefix}.input_video_rows"] = video_rows.detach().cpu().contiguous()
+            archive[f"{oracle_prefix}.input_audio_rows"] = audio_rows.detach().cpu().contiguous()
+            archive[f"{oracle_prefix}.raw_video_velocity"] = video_velocity.detach().cpu().contiguous()
+            archive[f"{oracle_prefix}.raw_audio_velocity"] = audio_velocity.detach().cpu().contiguous()
+            if forward_number in model_boundary_set:
+                if transformer_hidden is None or final_activation is None:
+                    raise RuntimeError("selected Oracle model boundaries were not returned")
+                archive[f"{oracle_prefix}.transformer_hidden"] = transformer_hidden.detach().cpu().contiguous()
+                archive[f"{oracle_prefix}.final_activation"] = final_activation.detach().cpu().contiguous()
+            archive[f"{oracle_prefix}.target_video_x0"] = (
+                _velocity_to_x0(video_rows[IMAGE_ROWS:], target_video_velocity, video_scheduler.timesteps[index])
+                .detach()
+                .cpu()
+                .contiguous()
+            )
+            archive[f"{oracle_prefix}.target_audio_x0"] = (
+                _velocity_to_x0(audio_rows, target_audio_velocity, audio_scheduler.timesteps[index])
+                .detach()
+                .cpu()
+                .contiguous()
+            )
         next_video = video_scheduler.step(
-            video_velocity[IMAGE_ROWS:].float(),
+            target_video_velocity,
             video_scheduler.timesteps[index],
             video_rows[IMAGE_ROWS:],
             return_dict=False,
         )[0]
         next_audio = audio_scheduler.step(
-            audio_velocity.float(),
+            target_audio_velocity,
             audio_scheduler.timesteps[index],
             audio_rows,
             return_dict=False,
@@ -1548,6 +1654,10 @@ def _run_transformer(
         if forward_number in SNAPSHOT_FORWARDS:
             archive[f"trajectory.forward_{forward_number:03d}.video_rows"] = video_rows.detach().cpu().contiguous()
             archive[f"trajectory.forward_{forward_number:03d}.audio_rows"] = audio_rows.detach().cpu().contiguous()
+        if forward_number in oracle_forward_set:
+            oracle_prefix = f"oracle.forward_{forward_number:03d}"
+            archive[f"{oracle_prefix}.video_rows_after"] = video_rows.detach().cpu().contiguous()
+            archive[f"{oracle_prefix}.audio_rows_after"] = audio_rows.detach().cpu().contiguous()
         logger.info(f"Completed production transformer forward {forward_number}/{forwards}")
     return archive, video_rows.detach().cpu().contiguous(), audio_rows.detach().cpu().contiguous(), forward_seconds
 
@@ -1689,14 +1799,19 @@ def _write_media(
         temp_path.unlink(missing_ok=True)
 
 
-def _execution_names(backend: str, mode: str) -> tuple[str, str, str]:
+def _execution_names(backend: str, mode: str, oracle_forwards: Sequence[int] = ()) -> tuple[str, str, str]:
     stem = f"minimax_h3_ref2va_production_{backend}_{mode}"
+    if oracle_forwards:
+        stem += "_oracle"
     return f"{stem}.safetensors", f"{stem}.json", stem
 
 
 def _execute(args: argparse.Namespace) -> Path:
     if args.write_media and args.execution_mode != "full":
         raise ValueError("--write-media is only valid for a full 49-forward execution")
+    forwards = 1 if args.execution_mode == "smoke" else TRANSFORMER_FORWARDS
+    oracle_forwards = _resolve_oracle_forwards(args, forwards)
+    model_boundary_forwards = _resolve_oracle_model_boundaries(args, oracle_forwards)
     devices = tuple(_validate_npu_device(value) for value in args.devices)
     if devices[0] == devices[1]:
         raise ValueError("production transformer execution requires two distinct explicitly indexed NPUs")
@@ -1727,7 +1842,15 @@ def _execute(args: argparse.Namespace) -> Path:
     checkpoint_started = time.perf_counter()
     checkpoint = _checkpoint_manifest(checkpoint_root)
     checkpoint_seconds = time.perf_counter() - checkpoint_started
-    _verify_prepared_against_runtime(prepared_manifest, source, checkpoint)
+    _verify_prepared_against_runtime(
+        prepared_manifest,
+        source,
+        checkpoint,
+        # Prepared tensors are independent of later execute/debug extensions to
+        # this generator. Pinned Diffusers files, revision, and checkpoint stay
+        # exact; only the generator metadata may evolve.
+        allow_generator_extension=True,
+    )
     _activate_diffusers_source(diffusers_source)
 
     import diffusers
@@ -1781,7 +1904,6 @@ def _execute(args: argparse.Namespace) -> Path:
     for device in devices:
         torch.npu.synchronize(device)
     load_seconds = time.perf_counter() - load_started
-    forwards = 1 if args.execution_mode == "smoke" else TRANSFORMER_FORWARDS
     run_started = time.perf_counter()
     with torch.inference_mode():
         archive, final_video_rows, final_audio_rows, per_forward_seconds = _run_transformer(
@@ -1793,6 +1915,8 @@ def _execute(args: argparse.Namespace) -> Path:
             audio_scheduler,
             devices,
             forwards,
+            oracle_forwards,
+            model_boundary_forwards,
         )
     transformer_seconds = time.perf_counter() - run_started
     transformer_memory = _memory_stats(devices)
@@ -1831,19 +1955,25 @@ def _execute(args: argparse.Namespace) -> Path:
         archive["decoded.audio_float32"] = decoded_audio
         archive["decoded.audio_sample_rate"] = torch.tensor(AUDIO_SAMPLE_RATE, dtype=torch.int64)
         if args.write_media:
-            _, _, basename = _execution_names(args.condition_backend, args.execution_mode)
+            _, _, basename = _execution_names(args.condition_backend, args.execution_mode, oracle_forwards)
             media = {
                 "requested": True,
                 "written": True,
                 **_write_media(args.output_dir.resolve(), basename, decoded_video, decoded_audio),
             }
 
-    _validate_execution_archive(archive, forwards)
+    _validate_execution_archive(archive, forwards, oracle_forwards, model_boundary_forwards)
 
-    archive_name, manifest_name, _ = _execution_names(args.condition_backend, args.execution_mode)
-    status = "C7_ONE_FORWARD_ATTENTION_HBM_SMOKE_COMPLETE" if forwards == 1 else "C7_49_FORWARD_REFERENCE_COMPLETE"
+    archive_name, manifest_name, _ = _execution_names(args.condition_backend, args.execution_mode, oracle_forwards)
+    status = (
+        "H3_NUMERICAL_ORACLE_CAPTURE_COMPLETE"
+        if oracle_forwards
+        else "C7_ONE_FORWARD_ATTENTION_HBM_SMOKE_COMPLETE"
+        if forwards == 1
+        else "C7_49_FORWARD_REFERENCE_COMPLETE"
+    )
     manifest = {
-        "schema": EXECUTION_SCHEMA,
+        "schema": ORACLE_EXECUTION_SCHEMA if oracle_forwards else EXECUTION_SCHEMA,
         "status": status,
         "gate_evaluation": {
             "gate": "G8",
@@ -1873,7 +2003,9 @@ def _execute(args: argparse.Namespace) -> Path:
             "transformer_forwards": forwards,
             "transformer_block_forwards": forwards * TRANSFORMER_LAYERS,
             "snapshot_forwards": [value for value in SNAPSHOT_FORWARDS if value <= forwards],
-            "full_residual_cpu_exports": 0,
+            **({"oracle_forwards": list(oracle_forwards)} if oracle_forwards else {}),
+            **({"oracle_model_boundary_forwards": list(model_boundary_forwards)} if model_boundary_forwards else {}),
+            "full_residual_cpu_exports": len(model_boundary_forwards),
             "memory": {
                 "transformer": transformer_memory,
                 "video_vae": None if video_decode is None else video_decode["memory"],
@@ -1897,10 +2029,31 @@ def _execute(args: argparse.Namespace) -> Path:
             "placement": "50 transformer blocks split contiguously 25/25 over two explicit NPUs",
             "anchors": "11,072 image rows checked byte-exact after every scheduler update",
             "snapshots": "compact video/audio rows after forwards 1, 2, 4, 8, and 49 when reached",
-            "residual_capture": "the 60,132x5,376 hidden state remains device-resident and is never hashed or copied to CPU",
+            "residual_capture": (
+                f"full hidden and final activation copied for Oracle forwards {list(model_boundary_forwards)}"
+                if model_boundary_forwards
+                else "the 60,132x5,376 hidden state remains device-resident and is never hashed or copied to CPU"
+            ),
             "video_decode": "pinned FP32 Video VAE weights under NPU FP16 autocast",
             "audio_decode": "pinned Audio VAE in FP32 without autocast",
         },
+        **(
+            {
+                "oracle": {
+                    "selected_forwards": list(oracle_forwards),
+                    "model_boundary_forwards": list(model_boundary_forwards),
+                    "capture_point": "raw final projection output before x0 conversion and scheduler step",
+                    "model_boundaries": "final transformer hidden and final norm/AdaLN activation",
+                    "input_rows": "full compact FP32 video/audio rows before the selected forward",
+                    "raw_velocity_dtype": "float32",
+                    "x0_dtype": "float32",
+                    "x0_formula": "state + (1 - timestep) * velocity",
+                    "post_scheduler_rows": "full compact FP32 rows with visual anchors restored",
+                }
+            }
+            if oracle_forwards
+            else {}
+        ),
         "media": media,
         "tensors": {name: _tensor_summary(tensor) for name, tensor in sorted(archive.items())},
     }
