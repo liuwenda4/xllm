@@ -63,6 +63,19 @@ DiTCollectiveCommunicator::DiTCollectiveCommunicator(
       .dit_text_encoder_tp_size(dit_text_encoder_tp_size);
   dit_mapping_ = std::make_unique<DiTMapping>(
       world_size, global_rank, dit_mapping_options);
+  static const std::vector<std::string> kDomainOrder = {
+      "tp", "sp", "cfg", "dp", "vae", "text_encoder_tp"};
+  std::vector<CommunicationDomainSpec> specs;
+  specs.reserve(kDomainOrder.size());
+  for (const std::string& name : kDomainOrder) {
+    specs.push_back(
+        {.name = name,
+         .rank_groups =
+             dit_mapping_->get_parallel_info(name).rank_per_group()});
+  }
+  communication_domains_ = std::make_shared<CommunicationDomainSet>(
+      global_rank, world_size, std::move(specs));
+  parallel_args_->dit_communication_domains_ = communication_domains_;
 }
 
 void DiTCollectiveCommunicator::create_process_groups(
@@ -82,58 +95,45 @@ void DiTCollectiveCommunicator::create_process_groups(
                                         device);
 
   parallel_args_->process_group_ = process_group_.get();
-  parallel_args_->dit_tp_group_ =
-      create_process_group_by_type("tp", dit_tp_group_, device);
-  parallel_args_->dit_sp_group_ =
-      create_process_group_by_type("sp", dit_sp_group_, device);
-  parallel_args_->dit_cfg_group_ =
-      create_process_group_by_type("cfg", dit_cfg_group_, device);
-  parallel_args_->dit_dp_group_ =
-      create_process_group_by_type("dp", dit_dp_group_, device);
-  parallel_args_->dit_vae_group_ =
-      create_process_group_by_type("vae", dit_vae_group_, device);
-  parallel_args_->dit_text_encoder_tp_group_ = create_process_group_by_type(
-      "text_encoder_tp", dit_text_encoder_tp_group_, device);
+  parallel_args_->dit_tp_group_ = create_process_group_by_type("tp", device);
+  parallel_args_->dit_sp_group_ = create_process_group_by_type("sp", device);
+  parallel_args_->dit_cfg_group_ = create_process_group_by_type("cfg", device);
+  parallel_args_->dit_dp_group_ = create_process_group_by_type("dp", device);
+  parallel_args_->dit_vae_group_ = create_process_group_by_type("vae", device);
+  parallel_args_->dit_text_encoder_tp_group_ =
+      create_process_group_by_type("text_encoder_tp", device);
 }
 
 ProcessGroup* DiTCollectiveCommunicator::create_process_group_by_type(
     const std::string& group_type,
-    std::unique_ptr<ProcessGroup>& member_group,
     const torch::Device& device) {
-  int32_t group_size = parallel_args_->get_group_size_by_type(group_type);
-
-  if (dit_mapping_) {
-    auto parallel_info = dit_mapping_->get_parallel_info(group_type);
-    auto group_id = parallel_info.current_group_id();
-    auto num_group = parallel_info.num_group();
-    auto local_rank = parallel_info.rank();
-    auto& rank_per_group = parallel_info.rank_per_group()[group_id];
-    int port_offset = group_id + 1;
+  CommunicationDomain& domain = communication_domains_->require(group_type);
+  const int port_offset = domain.group_id() + 1;
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
-    member_group = std::move(create_process_group(global_rank_,
-                                                  local_rank,
-                                                  rank_per_group,
-                                                  world_size_,
-                                                  group_size,
-                                                  port_ + port_offset,
-                                                  host_,
-                                                  group_type + "_group",
-                                                  device));
+  std::unique_ptr<ProcessGroup> member_group =
+      create_process_group(global_rank_,
+                           domain.local_rank(),
+                           domain.ranks(),
+                           world_size_,
+                           domain.size(),
+                           port_ + port_offset,
+                           host_,
+                           group_type + "_group",
+                           device);
 #else
-    LOG(FATAL)
-        << "create_process_group function is used by DiT models, since "
-           "the DiT communication group "
-        << "info have already been calculated by rank_generator, we only "
-           "need to pass the "
-        << "info to create the process groups. For any device that want "
-           "to reuse the "
-        << "function and dit process groups, please implement the "
-           "corresponding "
-        << "ProcessGroupImpl construct function. ";
+  LOG(FATAL) << "create_process_group function is used by DiT models, since "
+                "the DiT communication group "
+             << "info have already been calculated by rank_generator, we only "
+                "need to pass the "
+             << "info to create the process groups. For any device that want "
+                "to reuse the "
+             << "function and dit process groups, please implement the "
+                "corresponding "
+             << "ProcessGroupImpl construct function. ";
 #endif
-    port_ += num_group;
-  }
-  return member_group.get();
+  domain.bind(std::move(member_group));
+  port_ += domain.num_groups();
+  return domain.process_group();
 }
 
 const ParallelArgs* DiTCollectiveCommunicator::parallel_args() {

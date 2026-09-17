@@ -5,6 +5,7 @@ cc_library(
     parallel_state
   HDRS
     mapping_npu.h
+    communication_domain.h
     npu_cp_plan.h
     npu_dp_ep_padding.h
     dit_mapping.h
@@ -25,6 +26,7 @@ cc_library(
     $<$<BOOL:${USE_NPU}>:mega_moe_comm_resource.h>
   SRCS
     mapping_npu.cpp
+    communication_domain.cpp
     npu_cp_plan.cpp
     npu_dp_ep_padding.cpp
     dit_mapping.cpp

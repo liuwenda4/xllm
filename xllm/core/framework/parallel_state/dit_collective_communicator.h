@@ -39,23 +39,16 @@ class DiTCollectiveCommunicator : public CollectiveCommunicatorBase {
   // init communicator and return parallel args.
   const ParallelArgs* parallel_args() override;
 
-  ProcessGroup* create_process_group_by_type(
-      const std::string& group_type,
-      std::unique_ptr<ProcessGroup>& member_group,
-      const torch::Device& device);
+  ProcessGroup* create_process_group_by_type(const std::string& group_type,
+                                             const torch::Device& device);
 
  private:
   int32_t port_ = 0;
   std::string host_ = "";
   std::unique_ptr<DiTMapping> dit_mapping_{nullptr};
-  std::unique_ptr<ParallelArgs> parallel_args_;
   std::unique_ptr<ProcessGroup> process_group_;
-  std::unique_ptr<ProcessGroup> dit_tp_group_;
-  std::unique_ptr<ProcessGroup> dit_sp_group_;
-  std::unique_ptr<ProcessGroup> dit_dp_group_;
-  std::unique_ptr<ProcessGroup> dit_cfg_group_;
-  std::unique_ptr<ProcessGroup> dit_vae_group_;
-  std::unique_ptr<ProcessGroup> dit_text_encoder_tp_group_;
+  std::shared_ptr<CommunicationDomainSet> communication_domains_;
+  std::unique_ptr<ParallelArgs> parallel_args_;
 };
 
 }  // namespace xllm

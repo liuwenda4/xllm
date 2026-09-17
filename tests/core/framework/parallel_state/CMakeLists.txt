@@ -2,6 +2,16 @@ include(cc_test)
 
 cc_test(
   NAME
+    communication_domain_test
+  SRCS
+    communication_domain_test.cpp
+  DEPS
+    :parallel_state
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     context_parallel_topology_test
   SRCS
     context_parallel_topology_test.cpp

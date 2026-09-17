@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include "core/common/macros.h"
+#include "core/framework/parallel_state/communication_domain.h"
 #include "core/framework/parallel_state/process_group.h"
 
 #if defined(USE_NPU)
@@ -23,6 +24,7 @@ limitations under the License.
 #include "xllm_atb_layers/models/base/param/mapping.h"
 #endif
 
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <string>
 
@@ -252,6 +254,7 @@ struct ParallelArgs {
   ProcessGroup* dit_dp_group_ = nullptr;
   ProcessGroup* dit_vae_group_ = nullptr;
   ProcessGroup* dit_text_encoder_tp_group_ = nullptr;
+  std::shared_ptr<CommunicationDomainSet> dit_communication_domains_;
 };
 
 }  // namespace xllm
