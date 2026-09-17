@@ -179,6 +179,48 @@ class MiniMaxH3TPUAADiTBlockImpl final : public torch::nn::Module {
                     combined_indices,
                     rope_frequencies,
                     global_cu_seqlens);
+    return forward_output_only_impl(input,
+                                    time_embedding,
+                                    combined_indices,
+                                    rope_frequencies,
+                                    global_cu_seqlens);
+  }
+
+  void validate_forward_inputs(const torch::Tensor& input,
+                               const torch::Tensor& time_embedding,
+                               const torch::Tensor& combined_indices,
+                               const torch::Tensor& rope_frequencies,
+                               const torch::Tensor& global_cu_seqlens) const {
+    validate_inputs(input,
+                    time_embedding,
+                    combined_indices,
+                    rope_frequencies,
+                    global_cu_seqlens);
+  }
+
+  torch::Tensor forward_output_only_assuming_validated(
+      const torch::Tensor& input,
+      const torch::Tensor& time_embedding,
+      const torch::Tensor& combined_indices,
+      const torch::Tensor& rope_frequencies,
+      const torch::Tensor& global_cu_seqlens) {
+    tp_block_->verify_loaded_weights();
+    return forward_output_only_impl(input,
+                                    time_embedding,
+                                    combined_indices,
+                                    rope_frequencies,
+                                    global_cu_seqlens);
+  }
+
+  MiniMaxH3TPDiTBlock tp_block() const { return tp_block_; }
+
+ private:
+  torch::Tensor forward_output_only_impl(
+      const torch::Tensor& input,
+      const torch::Tensor& time_embedding,
+      const torch::Tensor& combined_indices,
+      const torch::Tensor& rope_frequencies,
+      const torch::Tensor& global_cu_seqlens) {
     const torch::Tensor parameters =
         tp_block_->adaln_projection()->forward(time_embedding);
     const torch::Tensor shift_msa =
@@ -211,10 +253,6 @@ class MiniMaxH3TPUAADiTBlockImpl final : public torch::nn::Module {
     return after_attention +
            gate_mlp * forward_mlp(mlp_input, global_cu_seqlens);
   }
-
-  MiniMaxH3TPDiTBlock tp_block() const { return tp_block_; }
-
- private:
   torch::Tensor forward_attention(
       const torch::Tensor& input,
       const torch::Tensor& rope_frequencies,

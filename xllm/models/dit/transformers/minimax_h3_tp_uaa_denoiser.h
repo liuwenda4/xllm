@@ -39,6 +39,45 @@ struct MiniMaxH3TPUAAPreparedForward {
   torch::Tensor device_inverse_indices;
 };
 
+struct MiniMaxH3TPUAATrajectoryCache {
+  torch::Tensor layout_condition_hidden;
+  torch::Tensor layout_text_pos;
+  torch::Tensor layout_img_pos;
+  torch::Tensor layout_audio_pos;
+  torch::Tensor layout_token_tags;
+  torch::Tensor layout_position_ids;
+  torch::Tensor local_refined_condition;
+  torch::Tensor device_text_destinations;
+  torch::Tensor device_img_sources;
+  torch::Tensor device_img_destinations;
+  torch::Tensor device_audio_sources;
+  torch::Tensor device_audio_destinations;
+  torch::Tensor local_token_tags;
+  torch::Tensor local_rope_frequencies;
+};
+
+struct MiniMaxH3TPUAALocalPositionMap {
+  torch::Tensor sources;
+  torch::Tensor destinations;
+};
+
+inline MiniMaxH3TPUAALocalPositionMap minimax_h3_tp_uaa_local_positions(
+    const torch::Tensor& global_positions,
+    int64_t start,
+    int64_t local_rows) {
+  if (!global_positions.defined() || global_positions.dim() != 1 ||
+      global_positions.scalar_type() != torch::kInt64 || start < 0 ||
+      local_rows <= 0) {
+    throw std::invalid_argument(
+        "MiniMax-H3 local position mapping received invalid inputs");
+  }
+  const torch::Tensor selected = torch::logical_and(
+      global_positions >= start, global_positions < start + local_rows);
+  const torch::Tensor sources = torch::nonzero(selected).flatten();
+  return {.sources = sources,
+          .destinations = global_positions.index_select(0, sources) - start};
+}
+
 struct MiniMaxH3TPUAAOneForwardOutput {
   MiniMaxH3TPUAAPreparedForward prepared;
   torch::Tensor local_transformer_output;
@@ -136,13 +175,27 @@ class MiniMaxH3TPUAAFixedStageImpl final : public torch::nn::Module {
                                         const torch::Tensor& audio_rows,
                                         const torch::Tensor& timesteps,
                                         const torch::Tensor& inverse_indices) {
+    const MiniMaxH3TPUAATrajectoryCache cache =
+        prepare_trajectory_cache(layout);
+    return prepare(
+        layout, video_rows, audio_rows, timesteps, inverse_indices, cache);
+  }
+
+  MiniMaxH3TPUAATrajectoryCache prepare_trajectory_cache(
+      const H3PackedLayout& layout) {
     verify_loaded();
-    if (layout.aligned_length % kMiniMaxH3UaaSize != 0 ||
-        video_rows.size(0) != layout.img_pos.numel() ||
-        audio_rows.size(0) != layout.audio_pos.numel() ||
-        inverse_indices.numel() != layout.aligned_length) {
+    if (layout.aligned_length <= 0 ||
+        layout.aligned_length % kMiniMaxH3UaaSize != 0 ||
+        !layout.condition_hidden.defined() ||
+        layout.condition_hidden.dim() != 3 ||
+        layout.condition_hidden.size(0) != 1 || !layout.text_pos.defined() ||
+        !layout.img_pos.defined() || !layout.audio_pos.defined() ||
+        !layout.token_tags.defined() || !layout.position_ids.defined() ||
+        layout.position_ids.dim() < 1 ||
+        layout.token_tags.numel() != layout.aligned_length ||
+        layout.position_ids.size(0) != layout.aligned_length) {
       throw std::invalid_argument(
-          "MiniMax-H3 fixed stage input geometry mismatch");
+          "MiniMax-H3 trajectory cache layout geometry mismatch");
     }
     const torch::Device device = condition_proj_->weight().device();
     const torch::Tensor condition =
@@ -154,33 +207,114 @@ class MiniMaxH3TPUAAFixedStageImpl final : public torch::nn::Module {
         torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
     const torch::Tensor refined_condition =
         token_refiner_->forward_output_only(projected_condition, refiner_cu);
+    const torch::Tensor rope_frequencies =
+        rope_->forward(layout.position_ids.to(device));
+    const int64_t local_rows = layout.aligned_length / kMiniMaxH3UaaSize;
+    const int64_t start = u_group_->rank() * local_rows;
+    const MiniMaxH3TPUAALocalPositionMap text =
+        minimax_h3_tp_uaa_local_positions(layout.text_pos, start, local_rows);
+    const MiniMaxH3TPUAALocalPositionMap image =
+        minimax_h3_tp_uaa_local_positions(layout.img_pos, start, local_rows);
+    const MiniMaxH3TPUAALocalPositionMap audio =
+        minimax_h3_tp_uaa_local_positions(layout.audio_pos, start, local_rows);
+    return {.layout_condition_hidden = layout.condition_hidden,
+            .layout_text_pos = layout.text_pos,
+            .layout_img_pos = layout.img_pos,
+            .layout_audio_pos = layout.audio_pos,
+            .layout_token_tags = layout.token_tags,
+            .layout_position_ids = layout.position_ids,
+            .local_refined_condition =
+                refined_condition.index_select(0, text.sources.to(device)),
+            .device_text_destinations = text.destinations.to(device),
+            .device_img_sources = image.sources.to(device),
+            .device_img_destinations = image.destinations.to(device),
+            .device_audio_sources = audio.sources.to(device),
+            .device_audio_destinations = audio.destinations.to(device),
+            .local_token_tags =
+                layout.token_tags.narrow(0, start, local_rows).to(device),
+            .local_rope_frequencies =
+                rope_frequencies.narrow(0, start, local_rows).contiguous()};
+  }
+
+  MiniMaxH3TPUAAPreparedForward prepare(
+      const H3PackedLayout& layout,
+      const torch::Tensor& video_rows,
+      const torch::Tensor& audio_rows,
+      const torch::Tensor& timesteps,
+      const torch::Tensor& inverse_indices,
+      const MiniMaxH3TPUAATrajectoryCache& cache) {
+    verify_loaded();
+    if (layout.aligned_length <= 0 ||
+        layout.aligned_length % kMiniMaxH3UaaSize != 0 ||
+        video_rows.size(0) != layout.img_pos.numel() ||
+        audio_rows.size(0) != layout.audio_pos.numel() ||
+        inverse_indices.numel() != layout.aligned_length) {
+      throw std::invalid_argument(
+          "MiniMax-H3 fixed stage input geometry mismatch");
+    }
+    const int64_t local_rows = layout.aligned_length / kMiniMaxH3UaaSize;
+    if (!cache.layout_condition_hidden.is_same(layout.condition_hidden) ||
+        !cache.layout_text_pos.is_same(layout.text_pos) ||
+        !cache.layout_img_pos.is_same(layout.img_pos) ||
+        !cache.layout_audio_pos.is_same(layout.audio_pos) ||
+        !cache.layout_token_tags.is_same(layout.token_tags) ||
+        !cache.layout_position_ids.is_same(layout.position_ids) ||
+        !cache.local_refined_condition.defined() ||
+        !cache.device_text_destinations.defined() ||
+        cache.local_refined_condition.size(0) !=
+            cache.device_text_destinations.numel() ||
+        !cache.device_img_sources.defined() ||
+        !cache.device_img_destinations.defined() ||
+        cache.device_img_sources.numel() !=
+            cache.device_img_destinations.numel() ||
+        !cache.device_audio_sources.defined() ||
+        !cache.device_audio_destinations.defined() ||
+        cache.device_audio_sources.numel() !=
+            cache.device_audio_destinations.numel() ||
+        !cache.local_token_tags.defined() ||
+        cache.local_token_tags.numel() != local_rows ||
+        !cache.local_rope_frequencies.defined() ||
+        cache.local_rope_frequencies.size(0) != local_rows) {
+      throw std::invalid_argument(
+          "MiniMax-H3 fixed stage input or trajectory cache mismatch");
+    }
+    const torch::Device device = condition_proj_->weight().device();
     const torch::Tensor video_embedding =
         video_patch_proj_->forward(video_rows.to(device));
     const torch::Tensor audio_embedding =
         audio_patch_proj_->forward(audio_rows.to(device));
-    torch::Tensor hidden =
-        torch::zeros({layout.aligned_length, config_.hidden_size},
-                     options_.dtype(torch::kBFloat16));
-    hidden.index_copy_(0, layout.text_pos.to(device), refined_condition);
-    hidden.index_copy_(
-        0, layout.img_pos.to(device), video_embedding.to(torch::kBFloat16));
-    hidden.index_copy_(
-        0, layout.audio_pos.to(device), audio_embedding.to(torch::kBFloat16));
+    torch::Tensor hidden = torch::zeros({local_rows, config_.hidden_size},
+                                        options_.dtype(torch::kBFloat16));
+    if (cache.device_text_destinations.numel() > 0) {
+      hidden.index_copy_(
+          0, cache.device_text_destinations, cache.local_refined_condition);
+    }
+    if (cache.device_img_sources.numel() > 0) {
+      hidden.index_copy_(
+          0,
+          cache.device_img_destinations,
+          video_embedding.index_select(0, cache.device_img_sources)
+              .to(torch::kBFloat16));
+    }
+    if (cache.device_audio_sources.numel() > 0) {
+      hidden.index_copy_(
+          0,
+          cache.device_audio_destinations,
+          audio_embedding.index_select(0, cache.device_audio_sources)
+              .to(torch::kBFloat16));
+    }
     const torch::Tensor time_embedding =
         time_embedder_->forward(timesteps.to(device));
-    const torch::Tensor rope_frequencies =
-        rope_->forward(layout.position_ids.to(device));
     const torch::Tensor device_inverse = inverse_indices.to(device);
-    const torch::Tensor combined_indices = minimax_h3_combined_adaln_indices(
-        device_inverse, layout.token_tags.to(device));
-    const int64_t local_rows = layout.aligned_length / kMiniMaxH3UaaSize;
     const int64_t start = u_group_->rank() * local_rows;
-    return {.local_hidden = hidden.narrow(0, start, local_rows).contiguous(),
+    const torch::Tensor local_combined_indices =
+        minimax_h3_combined_adaln_indices(
+            device_inverse.narrow(0, start, local_rows),
+            cache.local_token_tags);
+    return {.local_hidden = hidden,
             .time_embedding = time_embedding,
-            .local_combined_indices =
-                combined_indices.narrow(0, start, local_rows).contiguous(),
-            .local_rope_frequencies =
-                rope_frequencies.narrow(0, start, local_rows).contiguous(),
+            .local_combined_indices = local_combined_indices,
+            .local_rope_frequencies = cache.local_rope_frequencies,
             .device_inverse_indices = device_inverse};
   }
 
@@ -329,6 +463,27 @@ class MiniMaxH3TPUAAResidentDenoiserImpl final : public torch::nn::Module {
                             layout);
   }
 
+  MiniMaxH3FinalOutput forward_output_only(
+      const H3PackedLayout& layout,
+      const torch::Tensor& video_rows,
+      const torch::Tensor& audio_rows,
+      const torch::Tensor& timesteps,
+      const torch::Tensor& inverse_indices,
+      const MiniMaxH3TPUAATrajectoryCache& cache) {
+    const MiniMaxH3TPUAAPreparedForward prepared = fixed_->prepare(
+        layout, video_rows, audio_rows, timesteps, inverse_indices, cache);
+    const torch::Tensor local_transformer_output =
+        transformer_->forward(prepared.local_hidden,
+                              prepared.time_embedding,
+                              prepared.local_combined_indices,
+                              prepared.local_rope_frequencies,
+                              layout.cu_seqlens);
+    return fixed_->finalize(local_transformer_output,
+                            prepared.time_embedding,
+                            prepared.device_inverse_indices,
+                            layout);
+  }
+
   MiniMaxH3TPUAATrajectoryOutput run_base_trajectory(
       const H3PackedLayout& layout,
       const torch::Tensor& initial_video_rows,
@@ -362,6 +517,8 @@ class MiniMaxH3TPUAAResidentDenoiserImpl final : public torch::nn::Module {
         video_rows.index({~image_update}).clone();
     const torch::Tensor audio_anchor =
         audio_rows.index({~audio_update}).clone();
+    const MiniMaxH3TPUAATrajectoryCache cache =
+        fixed_->prepare_trajectory_cache(layout);
     for (int64_t step = 0; step < schedule.video.forward_count(); ++step) {
       const torch::Tensor video_rows_before = video_rows;
       const torch::Tensor audio_rows_before = audio_rows;
@@ -374,7 +531,8 @@ class MiniMaxH3TPUAAResidentDenoiserImpl final : public torch::nn::Module {
                               video_rows,
                               audio_rows,
                               plan.unique_timesteps,
-                              plan.inverse_indices);
+                              plan.inverse_indices,
+                              cache);
       const torch::Tensor video_target = video_rows.index({image_update});
       const torch::Tensor audio_target = audio_rows.index({audio_update});
       const torch::Tensor video_x0 = MiniMaxH3Scheduler::velocity_to_x0(

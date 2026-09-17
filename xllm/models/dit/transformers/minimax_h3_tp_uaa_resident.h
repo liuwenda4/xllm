@@ -76,6 +76,13 @@ class MiniMaxH3TPUAAResidentTransformerImpl final : public torch::nn::Module {
       throw std::logic_error(
           "MiniMax-H3 resident transformer does not have all 50 blocks");
     }
+    if (!observer) {
+      block_layers_.front()->validate_forward_inputs(input,
+                                                     time_embedding,
+                                                     combined_indices,
+                                                     rope_frequencies,
+                                                     global_cu_seqlens);
+    }
     torch::Tensor hidden = input;
     for (int64_t layer = 0; layer < kMiniMaxH3ResidentBlockCount; ++layer) {
       if (observer) {
@@ -89,12 +96,13 @@ class MiniMaxH3TPUAAResidentTransformerImpl final : public torch::nn::Module {
         hidden = trace.output;
         observer(layer, trace);
       } else {
-        hidden = block_layers_[static_cast<size_t>(layer)]->forward_output_only(
-            hidden,
-            time_embedding,
-            combined_indices,
-            rope_frequencies,
-            global_cu_seqlens);
+        hidden =
+            block_layers_[static_cast<size_t>(layer)]
+                ->forward_output_only_assuming_validated(hidden,
+                                                         time_embedding,
+                                                         combined_indices,
+                                                         rope_frequencies,
+                                                         global_cu_seqlens);
       }
     }
     return hidden;

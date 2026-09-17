@@ -3743,5 +3743,30 @@ TEST(MiniMaxH3PublicRuntimeTest, ValidatesConditionAndReferenceDigests) {
                std::invalid_argument);
 }
 
+TEST(MiniMaxH3TPUAALocalPositionTest, MapsCompactSourcesToLocalRows) {
+  const torch::Tensor positions =
+      torch::tensor({1, 4, 7, 8, 15, 16, 22}, torch::kInt64);
+
+  const MiniMaxH3TPUAALocalPositionMap mapped =
+      minimax_h3_tp_uaa_local_positions(
+          positions, /*start=*/8, /*local_rows=*/8);
+
+  EXPECT_TRUE(
+      torch::equal(mapped.sources, torch::tensor({3, 4}, torch::kInt64)));
+  EXPECT_TRUE(
+      torch::equal(mapped.destinations, torch::tensor({0, 7}, torch::kInt64)));
+}
+
+TEST(MiniMaxH3TPUAALocalPositionTest, SupportsEmptyLocalIntersections) {
+  const MiniMaxH3TPUAALocalPositionMap mapped =
+      minimax_h3_tp_uaa_local_positions(
+          torch::tensor({0, 1, 31}, torch::kInt64),
+          /*start=*/8,
+          /*local_rows=*/8);
+
+  EXPECT_EQ(mapped.sources.numel(), 0);
+  EXPECT_EQ(mapped.destinations.numel(), 0);
+}
+
 }  // namespace
 }  // namespace xllm
