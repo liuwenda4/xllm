@@ -28,6 +28,7 @@ namespace xllm {
 struct SimilarityResidualCacheDecision {
   bool hit = false;
   float relative_l1 = std::numeric_limits<float>::infinity();
+  float prediction_scale = 0.0F;
 };
 
 class SimilarityResidualCacheState final {
@@ -41,20 +42,28 @@ class SimilarityResidualCacheState final {
       ProcessGroup* consensus_group = nullptr,
       const torch::Tensor& row_indices = torch::Tensor());
 
-  void record_dense(const torch::Tensor& front_output,
+  void record_dense(int64_t step,
+                    const torch::Tensor& front_output,
                     const torch::Tensor& full_output);
-  torch::Tensor apply(const torch::Tensor& front_output) const;
+  torch::Tensor apply(int64_t step, const torch::Tensor& front_output) const;
 
   bool has_stack_residual() const { return stack_residual_.defined(); }
   int64_t dense_forwards() const { return dense_forwards_; }
   int64_t cache_hits() const { return cache_hits_; }
   int64_t similarity_checks() const { return similarity_checks_; }
   int64_t consecutive_hits() const { return consecutive_hits_; }
+  int64_t front_blocks() const { return options_.front_blocks; }
+  int64_t back_blocks() const { return options_.back_blocks; }
 
  private:
   CacheDiTOptions options_;
+  torch::Tensor previous_previous_front_residual_;
   torch::Tensor previous_front_residual_;
+  torch::Tensor previous_stack_residual_;
   torch::Tensor stack_residual_;
+  int64_t previous_stack_step_ = -1;
+  int64_t stack_step_ = -1;
+  float prediction_scale_ = 0.0F;
   int64_t dense_forwards_ = 0;
   int64_t cache_hits_ = 0;
   int64_t similarity_checks_ = 0;

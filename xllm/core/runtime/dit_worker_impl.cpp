@@ -85,13 +85,21 @@ DiTCacheConfig parse_dit_cache_from_flags() {
     cache_config.selected_policy = PolicyType::None;
   } else if (::xllm::DiTConfig::get_instance().dit_cache_policy() ==
              "CacheDiT") {
-    LOG(WARNING) << "CacheDiT is experimental and requires model-specific "
-                    "quality validation";
+    LOG(INFO) << "CacheDiT uses a model-specific quality policy";
     cache_config.selected_policy = PolicyType::CacheDiT;
-    cache_config.cache_dit.warmup_steps = 4;
+    const int64_t configured_warmup =
+        ::xllm::DiTConfig::get_instance().dit_cache_warmup_steps();
+    cache_config.cache_dit.warmup_steps =
+        configured_warmup > 0 ? configured_warmup : 30;
     cache_config.cache_dit.residual_diff_threshold = 0.04F;
-    cache_config.cache_dit.max_cached_steps = 1;
+    cache_config.cache_dit.max_cached_steps =
+        ::xllm::DiTConfig::get_instance().dit_cache_max_cached_steps();
     cache_config.cache_dit.max_consecutive_hits = 1;
+    cache_config.cache_dit.front_blocks =
+        ::xllm::DiTConfig::get_instance().dit_cache_front_blocks();
+    cache_config.cache_dit.back_blocks =
+        ::xllm::DiTConfig::get_instance().dit_cache_back_blocks();
+    cache_config.cache_dit.linear_residual_prediction = true;
   }
   return cache_config;
 }

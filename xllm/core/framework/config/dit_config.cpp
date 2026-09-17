@@ -23,7 +23,7 @@ DEFINE_int32(max_requests_per_batch, 1, "Max number of request per batch.");
 DEFINE_string(dit_cache_policy,
               "TaylorSeer",
               "The policy of dit cache(e.g. None, FBCache, TaylorSeer, "
-              "FBCacheTaylorSeer, ResidualCache).");
+              "FBCacheTaylorSeer, ResidualCache, CacheDiT).");
 
 DEFINE_int64(dit_cache_warmup_steps, 0, "The number of warmup steps.");
 
@@ -52,6 +52,18 @@ DEFINE_int64(dit_cache_start_blocks,
 DEFINE_int64(dit_cache_end_blocks,
              5,
              "The number of blocks to skip at the end.");
+
+DEFINE_int64(dit_cache_max_cached_steps,
+             4,
+             "Maximum total CacheDiT hits; negative means unlimited.");
+
+DEFINE_int64(dit_cache_front_blocks,
+             1,
+             "Number of leading blocks recomputed on a CacheDiT hit.");
+
+DEFINE_int64(dit_cache_back_blocks,
+             0,
+             "Number of trailing blocks recomputed on a CacheDiT hit.");
 
 DEFINE_bool(dit_sp_communication_overlap,
             true,
@@ -131,6 +143,9 @@ void DiTConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_cache_end_steps);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_cache_start_blocks);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_cache_end_blocks);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_cache_max_cached_steps);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_cache_front_blocks);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_cache_back_blocks);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_sp_communication_overlap);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_debug_print);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_laser_attention_enabled);
@@ -157,6 +172,9 @@ void DiTConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_cache_end_steps);
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_cache_start_blocks);
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_cache_end_blocks);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(dit_cache_max_cached_steps);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(dit_cache_front_blocks);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(dit_cache_back_blocks);
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_sp_communication_overlap);
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_debug_print);
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_laser_attention_enabled);
@@ -194,6 +212,12 @@ void DiTConfig::append_config_json(nlohmann::ordered_json& config_json) const {
       config_json, default_config, dit_cache_start_blocks);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, dit_cache_end_blocks);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, dit_cache_max_cached_steps);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, dit_cache_front_blocks);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, dit_cache_back_blocks);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, dit_sp_communication_overlap);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

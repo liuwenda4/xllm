@@ -648,9 +648,15 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     const int64_t maximum_similarity_checks =
         cache_enabled ? 49 - context_.get_dit_config().cache_dit.warmup_steps
                       : 0;
+    const MiniMaxH3CacheBlockPlan cache_block_plan =
+        minimax_h3_cache_block_plan(
+            cache_enabled ? context_.get_dit_config().cache_dit.front_blocks
+                          : 1,
+            cache_enabled ? context_.get_dit_config().cache_dit.back_blocks
+                          : 0);
     const int64_t expected_blocks =
         49 * kMiniMaxH3ResidentBlockCount -
-        trajectory.cache_hits * (kMiniMaxH3ResidentBlockCount - 1);
+        trajectory.cache_hits * cache_block_plan.skipped_blocks;
     if (trajectory.transformer_forwards != 49 ||
         trajectory.dense_forwards + trajectory.cache_hits != 49 ||
         trajectory.block_forwards != expected_blocks ||
@@ -678,6 +684,8 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
               << " cache_hits=" << trajectory.cache_hits
               << " similarity_checks=" << trajectory.similarity_checks
               << " block_forwards=" << trajectory.block_forwards
+              << " hit_executed_blocks="
+              << (cache_enabled ? cache_block_plan.hit_executed_blocks : 0)
               << " hit_forwards=" << cache_hit_list.str();
     log_stage_timing("denoise");
 

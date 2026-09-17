@@ -10,14 +10,16 @@ def test_parse_cache_records_requires_world_consensus_and_hits(tmp_path: Path) -
         (tmp_path / f"node_{rank}.log").write_text(
             "MINIMAX_H3_CACHE_RESULT "
             f"rank={rank} enabled=1 dense_forwards=48 cache_hits=1 "
-            "similarity_checks=1 block_forwards=2401 hit_forwards=5\n",
+            "similarity_checks=1 block_forwards=2417 "
+            "hit_executed_blocks=17 hit_forwards=5\n",
             encoding="utf-8",
         )
 
     result = quality_gate._parse_cache_records(tmp_path)
 
     assert result["consensus"]["cache_hits"] == 1
-    assert result["consensus"]["block_forwards"] == 2401
+    assert result["consensus"]["block_forwards"] == 2417
+    assert result["consensus"]["hit_executed_blocks"] == 17
     assert len(result["records"]) == 16
 
 

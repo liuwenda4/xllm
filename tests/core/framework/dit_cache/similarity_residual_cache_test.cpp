@@ -33,28 +33,28 @@ TEST(SimilarityResidualCacheTest, AppliesWarmupThresholdAndHitCap) {
   torch::Tensor front = torch::ones({4, 2}, torch::kBFloat16);
   auto decision = cache.decide(0, front - input, /*used_rows=*/3);
   EXPECT_FALSE(decision.hit);
-  cache.record_dense(front, front + 10);
+  cache.record_dense(0, front, front + 10);
 
   torch::Tensor front_one = front + 0.01;
   decision = cache.decide(1, front_one - input, /*used_rows=*/3);
   EXPECT_FALSE(decision.hit);
-  cache.record_dense(front_one, front_one + 20);
+  cache.record_dense(1, front_one, front_one + 20);
 
   torch::Tensor front_two = front + 0.011;
   decision = cache.decide(2, front_two - input, /*used_rows=*/3);
   EXPECT_TRUE(decision.hit);
   EXPECT_LT(decision.relative_l1, options.residual_diff_threshold);
-  EXPECT_TRUE(torch::equal(cache.apply(front_two), front_two + 20));
+  EXPECT_TRUE(torch::equal(cache.apply(2, front_two), front_two + 20));
 
   torch::Tensor front_three = front + 0.012;
   decision = cache.decide(3, front_three - input, /*used_rows=*/3);
   EXPECT_FALSE(decision.hit);
-  cache.record_dense(front_three, front_three + 30);
+  cache.record_dense(3, front_three, front_three + 30);
 
   torch::Tensor front_four = front * 2;
   decision = cache.decide(4, front_four - input, /*used_rows=*/3);
   EXPECT_FALSE(decision.hit);
-  cache.record_dense(front_four, front_four + 40);
+  cache.record_dense(4, front_four, front_four + 40);
 
   EXPECT_EQ(cache.cache_hits(), 1);
   EXPECT_EQ(cache.dense_forwards(), 4);
@@ -71,7 +71,7 @@ TEST(SimilarityResidualCacheTest, KeepsDenseProbeAcrossCacheHits) {
 
   torch::Tensor dense_probe = torch::ones({2, 2}, torch::kFloat32);
   EXPECT_FALSE(cache.decide(0, dense_probe, /*used_rows=*/2).hit);
-  cache.record_dense(dense_probe, dense_probe + 10);
+  cache.record_dense(0, dense_probe, dense_probe + 10);
 
   torch::Tensor cached_probe = dense_probe + 0.03;
   EXPECT_TRUE(cache.decide(1, cached_probe, /*used_rows=*/2).hit);
@@ -83,6 +83,29 @@ TEST(SimilarityResidualCacheTest, KeepsDenseProbeAcrossCacheHits) {
   EXPECT_GT(decision.relative_l1, options.residual_diff_threshold);
 }
 
+TEST(SimilarityResidualCacheTest, PredictsResidualFromDenseHistory) {
+  CacheDiTOptions options;
+  options.warmup_steps = 0;
+  options.residual_diff_threshold = 0.3F;
+  options.linear_residual_prediction = true;
+  SimilarityResidualCacheState cache(options);
+
+  const torch::Tensor first = torch::ones({2, 2}, torch::kFloat32);
+  EXPECT_FALSE(cache.decide(0, first, /*used_rows=*/2).hit);
+  cache.record_dense(0, first, first + 10);
+
+  const torch::Tensor second = first * 2;
+  EXPECT_FALSE(cache.decide(1, second, /*used_rows=*/2).hit);
+  cache.record_dense(1, second, second + 14);
+
+  const torch::Tensor third = second + 0.5;
+  const SimilarityResidualCacheDecision decision =
+      cache.decide(2, third, /*used_rows=*/2);
+  EXPECT_TRUE(decision.hit);
+  EXPECT_FLOAT_EQ(decision.prediction_scale, 0.5F);
+  EXPECT_TRUE(torch::allclose(cache.apply(2, third), third + 16));
+}
+
 TEST(SimilarityResidualCacheTest, StopsCheckingAfterMaximumCachedSteps) {
   CacheDiTOptions options;
   options.warmup_steps = 0;
@@ -91,10 +114,10 @@ TEST(SimilarityResidualCacheTest, StopsCheckingAfterMaximumCachedSteps) {
 
   torch::Tensor probe = torch::ones({2, 2}, torch::kFloat32);
   EXPECT_FALSE(cache.decide(0, probe, /*used_rows=*/2).hit);
-  cache.record_dense(probe, probe + 10);
+  cache.record_dense(0, probe, probe + 10);
   EXPECT_TRUE(cache.decide(1, probe, /*used_rows=*/2).hit);
   EXPECT_FALSE(cache.decide(2, probe, /*used_rows=*/2).hit);
-  cache.record_dense(probe, probe + 20);
+  cache.record_dense(2, probe, probe + 20);
 
   EXPECT_EQ(cache.cache_hits(), 1);
   EXPECT_EQ(cache.similarity_checks(), 1);
@@ -107,7 +130,7 @@ TEST(SimilarityResidualCacheTest, ExcludesPaddingRowsFromSimilarity) {
 
   torch::Tensor first = torch::ones({4, 1}, torch::kBFloat16);
   EXPECT_FALSE(cache.decide(0, first, /*used_rows=*/3).hit);
-  cache.record_dense(first, first + 5);
+  cache.record_dense(0, first, first + 5);
   torch::Tensor second = first.clone();
   second[3] = 1000;
   const SimilarityResidualCacheDecision decision =
@@ -124,7 +147,7 @@ TEST(SimilarityResidualCacheTest, RestrictsSimilarityToSelectedRows) {
 
   torch::Tensor first = torch::ones({4, 1}, torch::kFloat32);
   EXPECT_FALSE(cache.decide(0, first, /*used_rows=*/4).hit);
-  cache.record_dense(first, first + 5);
+  cache.record_dense(0, first, first + 5);
 
   torch::Tensor second = first.clone();
   second.index_put_({1}, 100);
@@ -160,6 +183,24 @@ TEST(SimilarityResidualCacheTest, RejectsInvalidOptionsAndTensorChanges) {
       },
       std::invalid_argument);
 
+  invalid = CacheDiTOptions{};
+  invalid.back_blocks = -1;
+  EXPECT_THROW(
+      {
+        SimilarityResidualCacheState invalid_cache{invalid};
+        (void)invalid_cache;
+      },
+      std::invalid_argument);
+
+  invalid = CacheDiTOptions{};
+  invalid.front_blocks = 0;
+  EXPECT_THROW(
+      {
+        SimilarityResidualCacheState invalid_cache{invalid};
+        (void)invalid_cache;
+      },
+      std::invalid_argument);
+
   SimilarityResidualCacheState cache{CacheDiTOptions{}};
   torch::Tensor first = torch::ones({2, 2}, torch::kBFloat16);
   EXPECT_FALSE(cache.decide(0, first, /*used_rows=*/2).hit);
@@ -167,8 +208,8 @@ TEST(SimilarityResidualCacheTest, RejectsInvalidOptionsAndTensorChanges) {
                             torch::ones({3, 2}, torch::kBFloat16),
                             /*used_rows=*/2),
                std::invalid_argument);
-  EXPECT_THROW(cache.apply(first), std::logic_error);
-  cache.record_dense(first, first + 1);
+  EXPECT_THROW(cache.apply(1, first), std::logic_error);
+  cache.record_dense(0, first, first + 1);
   EXPECT_THROW(cache.decide(1,
                             first,
                             /*used_rows=*/2,

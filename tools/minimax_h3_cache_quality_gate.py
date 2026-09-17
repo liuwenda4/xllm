@@ -36,6 +36,7 @@ CACHE_PATTERN = re.compile(
     r"MINIMAX_H3_CACHE_RESULT rank=(?P<rank>\d+) enabled=(?P<enabled>[01]) "
     r"dense_forwards=(?P<dense>\d+) cache_hits=(?P<hits>\d+) "
     r"similarity_checks=(?P<checks>\d+) block_forwards=(?P<blocks>\d+) "
+    r"(?:hit_executed_blocks=(?P<hit_blocks>\d+) )?"
     r"hit_forwards=(?P<hit_forwards>[0-9,]*)"
 )
 
@@ -70,14 +71,20 @@ def _parse_cache_records(log_dir: Path, expected_world_size: int = 16) -> dict[s
             raise ValueError(f"expected exactly one CacheDiT record in {log_path}, got {len(matches)}")
         match = matches[0]
         hit_forwards = [int(value) for value in match.group("hit_forwards").split(",") if value]
+        dense_forwards = int(match.group("dense"))
+        cache_hits = int(match.group("hits"))
+        block_forwards = int(match.group("blocks"))
+        hit_blocks = match.group("hit_blocks")
+        derived_hit_blocks = (block_forwards - dense_forwards * 50) // cache_hits if cache_hits > 0 else 0
         records.append(
             {
                 "rank": int(match.group("rank")),
                 "enabled": match.group("enabled") == "1",
-                "dense_forwards": int(match.group("dense")),
-                "cache_hits": int(match.group("hits")),
+                "dense_forwards": dense_forwards,
+                "cache_hits": cache_hits,
                 "similarity_checks": int(match.group("checks")),
-                "block_forwards": int(match.group("blocks")),
+                "block_forwards": block_forwards,
+                "hit_executed_blocks": int(hit_blocks) if hit_blocks is not None else derived_hit_blocks,
                 "hit_forwards": hit_forwards,
             }
         )
@@ -88,13 +95,17 @@ def _parse_cache_records(log_dir: Path, expected_world_size: int = 16) -> dict[s
         if {key: value for key, value in record.items() if key != "rank"} != reference:
             raise ValueError("CacheDiT ranks disagree on cache counters or hit forwards")
     hits = reference["cache_hits"]
+    dense = reference["dense_forwards"]
+    hit_blocks = reference["hit_executed_blocks"]
     if (
         not reference["enabled"]
         or hits <= 0
-        or reference["dense_forwards"] + hits != 49
+        or dense + hits != 49
         or reference["similarity_checks"] < hits
         or reference["similarity_checks"] > 45
-        or reference["block_forwards"] != 2450 - 49 * hits
+        or hit_blocks < 1
+        or hit_blocks >= 50
+        or reference["block_forwards"] != dense * 50 + hits * hit_blocks
         or len(reference["hit_forwards"]) != hits
     ):
         raise ValueError("CacheDiT execution counters violate the H3 quality contract")

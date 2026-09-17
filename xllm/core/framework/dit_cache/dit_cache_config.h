@@ -73,6 +73,9 @@ struct CacheDiTOptions : public DiTBaseCacheOptions {
   float residual_diff_threshold = 0.04f;
   int64_t max_cached_steps = -1;
   int64_t max_consecutive_hits = 1;
+  int64_t front_blocks = 1;
+  int64_t back_blocks = 0;
+  bool linear_residual_prediction = false;
 };
 
 struct DiTCacheConfig {

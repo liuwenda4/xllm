@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "similarity_residual_cache.h"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -26,7 +27,8 @@ SimilarityResidualCacheState::SimilarityResidualCacheState(
   if (options_.warmup_steps < 0 ||
       !std::isfinite(options_.residual_diff_threshold) ||
       options_.residual_diff_threshold <= 0.0F ||
-      options_.max_cached_steps < -1 || options_.max_consecutive_hits <= 0) {
+      options_.max_cached_steps < -1 || options_.max_consecutive_hits <= 0 ||
+      options_.front_blocks <= 0 || options_.back_blocks < 0) {
     throw std::invalid_argument(
         "similarity residual cache options are invalid");
   }
@@ -60,6 +62,19 @@ SimilarityResidualCacheDecision SimilarityResidualCacheState::decide(
     }
     torch::Tensor current = front_residual.narrow(0, 0, used_rows);
     torch::Tensor previous = previous_front_residual_.narrow(0, 0, used_rows);
+    torch::Tensor previous_previous;
+    if (previous_previous_front_residual_.defined()) {
+      if (previous_previous_front_residual_.sizes() != front_residual.sizes() ||
+          previous_previous_front_residual_.device() !=
+              front_residual.device() ||
+          previous_previous_front_residual_.scalar_type() !=
+              front_residual.scalar_type()) {
+        throw std::invalid_argument(
+            "similarity residual cache tensor metadata changed");
+      }
+      previous_previous =
+          previous_previous_front_residual_.narrow(0, 0, used_rows);
+    }
     if (row_indices.defined()) {
       if (row_indices.dim() != 1 ||
           row_indices.scalar_type() != torch::kInt64 ||
@@ -72,6 +87,22 @@ SimilarityResidualCacheDecision SimilarityResidualCacheState::decide(
       }
       current = current.index_select(0, row_indices);
       previous = previous.index_select(0, row_indices);
+      if (previous_previous.defined()) {
+        previous_previous = previous_previous.index_select(0, row_indices);
+      }
+    }
+    torch::Tensor prediction_numerator = torch::zeros(
+        {},
+        torch::TensorOptions().dtype(torch::kFloat32).device(current.device()));
+    torch::Tensor prediction_denominator =
+        torch::zeros_like(prediction_numerator);
+    if (previous_previous.defined()) {
+      const torch::Tensor current_delta =
+          (current - previous).to(torch::kFloat32);
+      const torch::Tensor historical_delta =
+          (previous - previous_previous).to(torch::kFloat32);
+      prediction_numerator = (current_delta * historical_delta).sum();
+      prediction_denominator = historical_delta.square().sum();
     }
     torch::Tensor statistics =
         torch::stack({(current - previous).abs().to(torch::kFloat32).sum(),
@@ -80,7 +111,9 @@ SimilarityResidualCacheDecision SimilarityResidualCacheState::decide(
                                   static_cast<float>(current.numel()),
                                   torch::TensorOptions()
                                       .dtype(torch::kFloat32)
-                                      .device(current.device()))});
+                                      .device(current.device())),
+                      prediction_numerator,
+                      prediction_denominator});
     if (consensus_group != nullptr && consensus_group->world_size() > 1) {
       consensus_group->allreduce(statistics);
     }
@@ -90,6 +123,10 @@ SimilarityResidualCacheDecision SimilarityResidualCacheState::decide(
     }
     decision.relative_l1 =
         (statistics[0] / (statistics[1] + 1e-6F)).item<float>();
+    if (statistics[4].item<float>() > 1e-6F) {
+      decision.prediction_scale =
+          std::clamp((statistics[3] / statistics[4]).item<float>(), 0.0F, 2.0F);
+    }
     ++similarity_checks_;
     decision.hit = std::isfinite(decision.relative_l1) &&
                    decision.relative_l1 < options_.residual_diff_threshold &&
@@ -99,37 +136,53 @@ SimilarityResidualCacheDecision SimilarityResidualCacheState::decide(
   if (decision.hit) {
     ++cache_hits_;
     ++consecutive_hits_;
+    prediction_scale_ = decision.prediction_scale;
   } else {
+    previous_previous_front_residual_ = previous_front_residual_;
     previous_front_residual_ = front_residual.detach().clone();
     consecutive_hits_ = 0;
+    prediction_scale_ = 0.0F;
   }
   return decision;
 }
 
 void SimilarityResidualCacheState::record_dense(
+    int64_t step,
     const torch::Tensor& front_output,
     const torch::Tensor& full_output) {
-  if (!front_output.defined() || !full_output.defined() ||
+  if (step < 0 || (stack_step_ >= 0 && step <= stack_step_) ||
+      !front_output.defined() || !full_output.defined() ||
       front_output.sizes() != full_output.sizes() ||
       front_output.device() != full_output.device() ||
       front_output.scalar_type() != full_output.scalar_type()) {
     throw std::invalid_argument(
         "similarity residual cache dense outputs do not match");
   }
+  previous_stack_residual_ = stack_residual_;
+  previous_stack_step_ = stack_step_;
   stack_residual_ = (full_output - front_output).detach();
+  stack_step_ = step;
   ++dense_forwards_;
 }
 
 torch::Tensor SimilarityResidualCacheState::apply(
+    int64_t step,
     const torch::Tensor& front_output) const {
   if (!front_output.defined() || !stack_residual_.defined() ||
-      front_output.sizes() != stack_residual_.sizes() ||
+      step <= stack_step_ || front_output.sizes() != stack_residual_.sizes() ||
       front_output.device() != stack_residual_.device() ||
       front_output.scalar_type() != stack_residual_.scalar_type()) {
     throw std::logic_error(
         "similarity residual cache has no compatible stack residual");
   }
-  return front_output + stack_residual_;
+  torch::Tensor residual = stack_residual_;
+  if (options_.linear_residual_prediction &&
+      previous_stack_residual_.defined() && previous_stack_step_ >= 0 &&
+      stack_step_ > previous_stack_step_) {
+    residual = stack_residual_ +
+               prediction_scale_ * (stack_residual_ - previous_stack_residual_);
+  }
+  return front_output + residual;
 }
 
 }  // namespace xllm

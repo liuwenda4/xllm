@@ -372,6 +372,12 @@ DECLARE_int64(dit_cache_start_blocks);
 
 DECLARE_int64(dit_cache_end_blocks);
 
+DECLARE_int64(dit_cache_max_cached_steps);
+
+DECLARE_int64(dit_cache_front_blocks);
+
+DECLARE_int64(dit_cache_back_blocks);
+
 DECLARE_bool(dit_sp_communication_overlap);
 
 DECLARE_int64(dit_generation_image_area_max);

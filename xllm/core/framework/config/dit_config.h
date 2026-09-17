@@ -51,6 +51,9 @@ class DiTConfig final {
          "dit_cache_end_steps",
          "dit_cache_start_blocks",
          "dit_cache_end_blocks",
+         "dit_cache_max_cached_steps",
+         "dit_cache_front_blocks",
+         "dit_cache_back_blocks",
          "dit_sp_communication_overlap",
          "dit_debug_print",
          "dit_laser_attention_enabled",
@@ -86,6 +89,12 @@ class DiTConfig final {
   PROPERTY(int64_t, dit_cache_start_blocks) = 5;
 
   PROPERTY(int64_t, dit_cache_end_blocks) = 5;
+
+  PROPERTY(int64_t, dit_cache_max_cached_steps) = 4;
+
+  PROPERTY(int64_t, dit_cache_front_blocks) = 1;
+
+  PROPERTY(int64_t, dit_cache_back_blocks) = 0;
 
   PROPERTY(bool, dit_sp_communication_overlap) = true;
 

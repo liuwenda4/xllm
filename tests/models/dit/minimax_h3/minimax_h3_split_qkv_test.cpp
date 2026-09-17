@@ -24,9 +24,28 @@ limitations under the License.
 #include "core/framework/dit_model_loader.h"
 #include "core/platform/device.h"
 #include "models/dit/transformers/minimax_h3_blocks.h"
+#include "models/dit/transformers/minimax_h3_tp_uaa_resident.h"
 
 namespace xllm {
 namespace {
+
+TEST(MiniMaxH3CacheBlockPlanTest, SplitsMiddleAndTailBlocks) {
+  const MiniMaxH3CacheBlockPlan no_tail = minimax_h3_cache_block_plan(1, 0);
+  EXPECT_EQ(no_tail.middle_start, 1);
+  EXPECT_EQ(no_tail.tail_start, 50);
+  EXPECT_EQ(no_tail.hit_executed_blocks, 1);
+  EXPECT_EQ(no_tail.skipped_blocks, 49);
+
+  const MiniMaxH3CacheBlockPlan tail = minimax_h3_cache_block_plan(16, 16);
+  EXPECT_EQ(tail.middle_start, 16);
+  EXPECT_EQ(tail.tail_start, 34);
+  EXPECT_EQ(tail.hit_executed_blocks, 32);
+  EXPECT_EQ(tail.skipped_blocks, 18);
+
+  EXPECT_THROW(minimax_h3_cache_block_plan(0, 0), std::invalid_argument);
+  EXPECT_THROW(minimax_h3_cache_block_plan(1, -1), std::invalid_argument);
+  EXPECT_THROW(minimax_h3_cache_block_plan(25, 25), std::invalid_argument);
+}
 
 TEST(MiniMaxH3SplitQKVTest, MatchesFusedProjectionAtProductionShape) {
   const char* enabled = std::getenv("MINIMAX_H3_SPLIT_QKV_AB");

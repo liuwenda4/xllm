@@ -34,6 +34,28 @@ namespace xllm {
 
 inline constexpr int64_t kMiniMaxH3ResidentBlockCount = 50;
 
+struct MiniMaxH3CacheBlockPlan {
+  int64_t middle_start = 0;
+  int64_t tail_start = 0;
+  int64_t hit_executed_blocks = 0;
+  int64_t skipped_blocks = 0;
+};
+
+inline MiniMaxH3CacheBlockPlan minimax_h3_cache_block_plan(
+    int64_t front_blocks,
+    int64_t back_blocks) {
+  if (front_blocks <= 0 || back_blocks < 0 ||
+      front_blocks + back_blocks >= kMiniMaxH3ResidentBlockCount) {
+    throw std::invalid_argument(
+        "MiniMax-H3 CacheDiT front/back block split is invalid");
+  }
+  return {.middle_start = front_blocks,
+          .tail_start = kMiniMaxH3ResidentBlockCount - back_blocks,
+          .hit_executed_blocks = front_blocks + back_blocks,
+          .skipped_blocks =
+              kMiniMaxH3ResidentBlockCount - front_blocks - back_blocks};
+}
+
 using MiniMaxH3TPUAAResidentObserver =
     std::function<void(int64_t, const MiniMaxH3ResidualBranchTrace&)>;
 
@@ -157,24 +179,40 @@ class MiniMaxH3TPUAAResidentTransformerImpl final : public torch::nn::Module {
                                                    combined_indices,
                                                    rope_frequencies,
                                                    global_cu_seqlens);
-    torch::Tensor front =
-        block_layers_.front()->forward_output_only_assuming_validated(
-            input,
-            time_embedding,
-            combined_indices,
-            rope_frequencies,
-            global_cu_seqlens);
+    const MiniMaxH3CacheBlockPlan block_plan = minimax_h3_cache_block_plan(
+        cache->front_blocks(), cache->back_blocks());
+    torch::Tensor front = input;
+    for (int64_t layer = 0; layer < block_plan.middle_start; ++layer) {
+      front = block_layers_[static_cast<size_t>(layer)]
+                  ->forward_output_only_assuming_validated(front,
+                                                           time_embedding,
+                                                           combined_indices,
+                                                           rope_frequencies,
+                                                           global_cu_seqlens);
+    }
     const SimilarityResidualCacheDecision decision = cache->decide(
         step, front - input, used_rows, consensus_group, cache_row_indices);
+    torch::Tensor hidden;
     if (decision.hit) {
-      return {.hidden = cache->apply(front),
-              .cache_hit = true,
-              .executed_blocks = 1,
-              .relative_l1 = decision.relative_l1};
+      hidden = cache->apply(step, front);
+    } else {
+      hidden = front;
+      for (int64_t layer = block_plan.middle_start;
+           layer < block_plan.tail_start;
+           ++layer) {
+        hidden =
+            block_layers_[static_cast<size_t>(layer)]
+                ->forward_output_only_assuming_validated(hidden,
+                                                         time_embedding,
+                                                         combined_indices,
+                                                         rope_frequencies,
+                                                         global_cu_seqlens);
+      }
+      cache->record_dense(step, front, hidden);
     }
-
-    torch::Tensor hidden = front;
-    for (int64_t layer = 1; layer < kMiniMaxH3ResidentBlockCount; ++layer) {
+    for (int64_t layer = block_plan.tail_start;
+         layer < kMiniMaxH3ResidentBlockCount;
+         ++layer) {
       hidden = block_layers_[static_cast<size_t>(layer)]
                    ->forward_output_only_assuming_validated(hidden,
                                                             time_embedding,
@@ -182,10 +220,10 @@ class MiniMaxH3TPUAAResidentTransformerImpl final : public torch::nn::Module {
                                                             rope_frequencies,
                                                             global_cu_seqlens);
     }
-    cache->record_dense(front, hidden);
     return {.hidden = std::move(hidden),
-            .cache_hit = false,
-            .executed_blocks = kMiniMaxH3ResidentBlockCount,
+            .cache_hit = decision.hit,
+            .executed_blocks = decision.hit ? block_plan.hit_executed_blocks
+                                            : kMiniMaxH3ResidentBlockCount,
             .relative_l1 = decision.relative_l1};
   }
 
