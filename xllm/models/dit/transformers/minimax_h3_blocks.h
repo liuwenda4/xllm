@@ -916,6 +916,49 @@ class MiniMaxH3TPAttentionImpl final : public torch::nn::Module {
             .value = std::move(value)};
   }
 
+  torch::Tensor project_local_query(
+      const torch::Tensor& input,
+      const std::optional<torch::Tensor>& rope_frequencies) {
+    validate_projection_input(input);
+    const int64_t rows = input.size(0);
+    const int64_t local_inner = local_heads_ * head_dim_;
+    torch::Tensor query = q_norm_->forward(
+        torch::nn::functional::linear(
+            input, qkv_proj_->weight().narrow(0, 0, local_inner))
+            .view({rows, local_heads_, head_dim_}));
+    if (rope_frequencies.has_value()) {
+      query = minimax_h3_apply_rope(query, *rope_frequencies);
+    }
+    return query;
+  }
+
+  torch::Tensor project_local_key(
+      const torch::Tensor& input,
+      const std::optional<torch::Tensor>& rope_frequencies) {
+    validate_projection_input(input);
+    const int64_t rows = input.size(0);
+    const int64_t local_inner = local_heads_ * head_dim_;
+    torch::Tensor key = k_norm_->forward(
+        torch::nn::functional::linear(
+            input, qkv_proj_->weight().narrow(0, local_inner, local_inner))
+            .view({rows, local_heads_, head_dim_}));
+    if (rope_frequencies.has_value()) {
+      key = minimax_h3_apply_rope(key, *rope_frequencies);
+    }
+    return key;
+  }
+
+  torch::Tensor project_local_value(const torch::Tensor& input) {
+    validate_projection_input(input);
+    const int64_t rows = input.size(0);
+    const int64_t local_inner = local_heads_ * head_dim_;
+    return torch::nn::functional::linear(
+               input,
+               qkv_proj_->weight().narrow(0, 2 * local_inner, local_inner))
+        .view({rows, local_heads_, head_dim_})
+        .contiguous();
+  }
+
   torch::Tensor project_local_output(const torch::Tensor& local_heads) {
     if (!local_heads.defined() || local_heads.dim() != 3 ||
         local_heads.size(1) != local_heads_ ||
@@ -978,6 +1021,15 @@ class MiniMaxH3TPAttentionImpl final : public torch::nn::Module {
   torch::Tensor out_weight() const { return out_proj_->weight(); }
 
  private:
+  void validate_projection_input(const torch::Tensor& input) const {
+    verify_loaded_weights();
+    if (!input.defined() || input.dim() != 2 ||
+        input.scalar_type() != torch::kBFloat16) {
+      throw std::invalid_argument(
+          "MiniMax-H3 TP Attention input must be BF16 [T,H]");
+    }
+  }
+
   static void validate_tp_group(ProcessGroup* tp_group) {
     if (tp_group == nullptr || tp_group->world_size() != 2 ||
         tp_group->rank() < 0 || tp_group->rank() >= 2) {

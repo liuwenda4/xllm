@@ -20,8 +20,13 @@ limitations under the License.
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
 
@@ -74,7 +79,9 @@ int64_t seek_packet(void* opaque, int64_t offset, int whence) {
   return position;
 }
 
-void expect_h264_aac_streams(const std::string& mp4) {
+void expect_h264_aac_streams(const std::string& mp4,
+                             int32_t expected_width,
+                             int32_t expected_height) {
   MemoryReadContext read_context{reinterpret_cast<const uint8_t*>(mp4.data()),
                                  static_cast<int64_t>(mp4.size()),
                                  0};
@@ -105,6 +112,8 @@ void expect_h264_aac_streams(const std::string& mp4) {
     if (params->codec_type == AVMEDIA_TYPE_VIDEO) {
       video_index = static_cast<int>(index);
       EXPECT_EQ(params->codec_id, AV_CODEC_ID_H264);
+      EXPECT_EQ(params->width, expected_width);
+      EXPECT_EQ(params->height, expected_height);
     } else if (params->codec_type == AVMEDIA_TYPE_AUDIO) {
       audio_index = static_cast<int>(index);
       EXPECT_EQ(params->codec_id, AV_CODEC_ID_AAC);
@@ -135,7 +144,8 @@ void expect_h264_aac_streams(const std::string& mp4) {
   std::vector<int32_t> packet_counts(format_context->nb_streams, 0);
   AVPacket* packet = av_packet_alloc();
   ASSERT_NE(packet, nullptr);
-  while (av_read_frame(format_context, packet) >= 0) {
+  int read_result = 0;
+  while ((read_result = av_read_frame(format_context, packet)) >= 0) {
     if (packet->dts != AV_NOPTS_VALUE) {
       const int stream_index = packet->stream_index;
       if (last_dts[stream_index] != AV_NOPTS_VALUE) {
@@ -146,6 +156,7 @@ void expect_h264_aac_streams(const std::string& mp4) {
     ++packet_counts[packet->stream_index];
     av_packet_unref(packet);
   }
+  EXPECT_EQ(read_result, AVERROR_EOF);
   EXPECT_EQ(packet_counts[video_index], 124);
   EXPECT_GT(packet_counts[audio_index], 0);
 
@@ -182,7 +193,7 @@ TEST(MMCodecTest, EncodesH264AacMp4InMemory) {
   ASSERT_TRUE(encoder.encode(video, audio, kFps, kSampleRate, mp4));
   EXPECT_GT(mp4.size(), 1024u);
   EXPECT_NE(mp4.find("ftyp"), std::string::npos);
-  expect_h264_aac_streams(mp4);
+  expect_h264_aac_streams(mp4, kWidth, kHeight);
 
   FFmpegVideoDecoder video_decoder;
   torch::Tensor decoded_video;
@@ -203,6 +214,98 @@ TEST(MMCodecTest, EncodesH264AacMp4InMemory) {
   EXPECT_GE(decoded_audio.numel(), kSamples);
   EXPECT_LT(decoded_audio.numel(), kSamples + 1024);
   EXPECT_EQ(audio_metadata.sample_rate, kSampleRate);
+}
+
+TEST(MMCodecTest, ValidatesExternalProductionMp4WhenRequested) {
+  const char* path = std::getenv("MINIMAX_H3_EXTERNAL_MP4");
+  if (path == nullptr || std::string(path).empty()) {
+    GTEST_SKIP() << "Set MINIMAX_H3_EXTERNAL_MP4 to validate service output";
+  }
+  std::ifstream input(path, std::ios::binary);
+  ASSERT_TRUE(input.good()) << "Failed to open " << path;
+  const std::string mp4((std::istreambuf_iterator<char>(input)),
+                        std::istreambuf_iterator<char>());
+  ASSERT_GT(mp4.size(), 1024u);
+  expect_h264_aac_streams(mp4,
+                          /*expected_width=*/1344,
+                          /*expected_height=*/768);
+
+  FFmpegVideoDecoder video_decoder;
+  torch::Tensor video;
+  VideoMetadata video_metadata;
+  ASSERT_TRUE(video_decoder.decode(mp4, video, video_metadata));
+  EXPECT_EQ(video.sizes().vec(), (std::vector<int64_t>{124, 3, 768, 1344}));
+  EXPECT_NEAR(video_metadata.fps, 24.0, 0.01);
+
+  FFmpegAudioDecoder audio_decoder;
+  torch::Tensor audio;
+  AudioMetadata audio_metadata;
+  ASSERT_TRUE(
+      audio_decoder.decode(mp4, audio, audio_metadata, /*target_sr=*/32000));
+  EXPECT_GE(audio.numel(), 165600);
+  EXPECT_LT(audio.numel(), 165600 + 1024);
+  EXPECT_EQ(audio_metadata.sample_rate, 32000);
+}
+
+TEST(MMCodecTest, ExtractsExternalProductionMp4ForQualityGateWhenRequested) {
+  const char* input_path = std::getenv("MINIMAX_H3_QUALITY_MP4");
+  const char* video_path = std::getenv("MINIMAX_H3_QUALITY_VIDEO_RAW");
+  const char* audio_path = std::getenv("MINIMAX_H3_QUALITY_AUDIO_RAW");
+  const char* metadata_path = std::getenv("MINIMAX_H3_QUALITY_METADATA");
+  if (input_path == nullptr || video_path == nullptr || audio_path == nullptr ||
+      metadata_path == nullptr) {
+    GTEST_SKIP() << "Set all MINIMAX_H3_QUALITY_* paths";
+  }
+  std::ifstream input(input_path, std::ios::binary);
+  ASSERT_TRUE(input.good());
+  const std::string mp4((std::istreambuf_iterator<char>(input)),
+                        std::istreambuf_iterator<char>());
+
+  FFmpegVideoDecoder video_decoder;
+  torch::Tensor video;
+  VideoMetadata video_metadata;
+  ASSERT_TRUE(video_decoder.decode(mp4, video, video_metadata));
+  ASSERT_EQ(video.sizes().vec(), (std::vector<int64_t>{124, 3, 768, 1344}));
+  ASSERT_EQ(video.scalar_type(), torch::kUInt8);
+  video = video.contiguous();
+
+  FFmpegAudioDecoder audio_decoder;
+  torch::Tensor audio;
+  AudioMetadata audio_metadata;
+  ASSERT_TRUE(audio_decoder.decode(mp4,
+                                   audio,
+                                   audio_metadata,
+                                   /*target_sr=*/32000,
+                                   /*target_channels=*/2));
+  ASSERT_EQ(audio.dim(), 2);
+  ASSERT_EQ(audio.size(0), 2);
+  ASSERT_EQ(audio.scalar_type(), torch::kFloat32);
+  audio = audio.contiguous();
+
+  std::ofstream video_output(video_path, std::ios::binary);
+  ASSERT_TRUE(video_output.good());
+  video_output.write(static_cast<const char*>(video.const_data_ptr()),
+                     video.numel() * video.element_size());
+  ASSERT_TRUE(video_output.good());
+
+  std::ofstream audio_output(audio_path, std::ios::binary);
+  ASSERT_TRUE(audio_output.good());
+  audio_output.write(static_cast<const char*>(audio.const_data_ptr()),
+                     audio.numel() * audio.element_size());
+  ASSERT_TRUE(audio_output.good());
+
+  const nlohmann::json metadata = {
+      {"video_shape", video.sizes().vec()},
+      {"video_dtype", "uint8"},
+      {"video_fps", video_metadata.fps},
+      {"audio_shape", audio.sizes().vec()},
+      {"audio_dtype", "float32"},
+      {"audio_sample_rate", audio_metadata.sample_rate},
+      {"audio_channels", audio_metadata.num_channels}};
+  std::ofstream metadata_output(metadata_path);
+  ASSERT_TRUE(metadata_output.good());
+  metadata_output << metadata.dump(2) << '\n';
+  ASSERT_TRUE(metadata_output.good());
 }
 
 TEST(MMCodecTest, RejectsInvalidPairedMediaShapes) {

@@ -22,7 +22,8 @@ enum class PolicyType {
   FBCache,
   TaylorSeer,
   FBCacheTaylorSeer,
-  ResidualCache
+  ResidualCache,
+  CacheDiT
 };
 
 struct DiTBaseCacheOptions {
@@ -68,6 +69,12 @@ struct ResidualCacheOptions {
   int64_t skip_interval_steps = 3;
 };
 
+struct CacheDiTOptions : public DiTBaseCacheOptions {
+  float residual_diff_threshold = 0.04f;
+  int64_t max_cached_steps = -1;
+  int64_t max_consecutive_hits = 1;
+};
+
 struct DiTCacheConfig {
   DiTCacheConfig() = default;
 
@@ -85,6 +92,9 @@ struct DiTCacheConfig {
 
   // the configuration for ResidualCache policy.
   ResidualCacheOptions residual_cache;
+
+  // Request-local residual similarity cache used by supported DiT models.
+  CacheDiTOptions cache_dit;
 };
 
 }  // namespace xllm

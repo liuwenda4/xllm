@@ -15,10 +15,12 @@ limitations under the License.
 
 #pragma once
 
+#include <glog/logging.h>
 #include <openssl/sha.h>
 #include <torch/torch.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <exception>
@@ -457,6 +459,9 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
 
   DiTForwardOutput forward(const DiTForwardInput& input) {
     std::lock_guard<std::mutex> lock(forward_mutex_);
+    using Clock = std::chrono::steady_clock;
+    const auto request_started = Clock::now();
+    auto stage_started = request_started;
     if (!loaded_) {
       throw std::logic_error(
           "MiniMax-H3 public runtime requires loaded component weights");
@@ -464,6 +469,31 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     const ParallelArgs& parallel = context_.get_parallel_args();
     validate_parallel_topology(parallel);
     const torch::Device device = options_.device();
+    const uint64_t request_sequence = ++request_sequence_;
+    const auto log_stage_timing = [&](const char* stage) {
+      const auto now = Clock::now();
+      LOG(INFO) << "MINIMAX_H3_STAGE_TIMING rank=" << parallel.rank()
+                << " request=" << request_sequence << " stage=" << stage
+                << " elapsed_ms="
+                << std::chrono::duration<double, std::milli>(now -
+                                                             stage_started)
+                       .count()
+                << " cumulative_ms="
+                << std::chrono::duration<double, std::milli>(now -
+                                                             request_started)
+                       .count();
+      stage_started = now;
+    };
+    const auto log_request_total = [&] {
+      const auto now = Clock::now();
+      const double elapsed_ms =
+          std::chrono::duration<double, std::milli>(now - request_started)
+              .count();
+      LOG(INFO) << "MINIMAX_H3_STAGE_TIMING rank=" << parallel.rank()
+                << " request=" << request_sequence
+                << " stage=request_total elapsed_ms=" << elapsed_ms
+                << " cumulative_ms=" << elapsed_ms;
+    };
 
     torch::Tensor reference_pixels;
     std::exception_ptr input_error;
@@ -487,6 +517,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
       input_error = std::current_exception();
     }
     agree_stage(parallel, input_error, "input preparation");
+    log_stage_timing("input_preparation");
 
     torch::Tensor posterior_epsilon;
     torch::Tensor visual_latent;
@@ -516,6 +547,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     reference_vae = nullptr;
     clear_device_cache();
     agree_stage(parallel, reference_error, "reference VAE encode");
+    log_stage_timing("reference_vae_load_encode");
 
     const H3TargetLatents target = {.audio_t = 207,
                                     .audio_channels = 2,
@@ -566,6 +598,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     reference_pixels = torch::Tensor();
     posterior_epsilon = torch::Tensor();
     clear_device_cache();
+    log_stage_timing("latent_packing");
 
     MiniMaxH3TPUAATrajectoryOutput trajectory;
     MiniMaxH3TPUAAResidentDenoiser denoiser{nullptr};
@@ -575,7 +608,12 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
           MiniMaxH3TPUAAResidentDenoiser(MiniMaxH3C4Config{},
                                          parallel.dit_tp_group_,
                                          parallel.dit_sp_group_,
-                                         options_.dtype(torch::kBFloat16));
+                                         options_.dtype(torch::kBFloat16),
+                                         parallel.process_group_,
+                                         context_.get_dit_config(),
+                                         parallel.dit_sp_q_group_,
+                                         parallel.dit_sp_k_group_,
+                                         parallel.dit_sp_v_group_);
       denoiser->load_source_weights(
           component_loader("transformer")->get_state_dicts());
       synchronize_device();
@@ -593,6 +631,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
       clear_device_cache();
       throw;
     }
+    log_stage_timing("denoiser_load");
     try {
       trajectory = denoiser->run_base_trajectory(
           layout, initial_video_rows, initial_audio_rows);
@@ -604,11 +643,43 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     }
     denoiser = nullptr;
     clear_device_cache();
+    const bool cache_enabled =
+        context_.get_dit_config().selected_policy == PolicyType::CacheDiT;
+    const int64_t maximum_similarity_checks =
+        cache_enabled ? 49 - context_.get_dit_config().cache_dit.warmup_steps
+                      : 0;
+    const int64_t expected_blocks =
+        49 * kMiniMaxH3ResidentBlockCount -
+        trajectory.cache_hits * (kMiniMaxH3ResidentBlockCount - 1);
     if (trajectory.transformer_forwards != 49 ||
-        trajectory.block_forwards != 2450) {
+        trajectory.dense_forwards + trajectory.cache_hits != 49 ||
+        trajectory.block_forwards != expected_blocks ||
+        trajectory.similarity_checks < trajectory.cache_hits ||
+        trajectory.similarity_checks > maximum_similarity_checks ||
+        trajectory.cache_hit_forwards.size() !=
+            static_cast<size_t>(trajectory.cache_hits) ||
+        (!cache_enabled &&
+         (trajectory.block_forwards != 2450 || trajectory.cache_hits != 0 ||
+          trajectory.dense_forwards != 49))) {
       throw std::logic_error(
           "MiniMax-H3 public runtime violated trajectory counters");
     }
+    std::ostringstream cache_hit_list;
+    for (size_t index = 0; index < trajectory.cache_hit_forwards.size();
+         ++index) {
+      if (index != 0) {
+        cache_hit_list << ',';
+      }
+      cache_hit_list << trajectory.cache_hit_forwards[index];
+    }
+    LOG(INFO) << "MINIMAX_H3_CACHE_RESULT rank=" << parallel.rank()
+              << " enabled=" << cache_enabled
+              << " dense_forwards=" << trajectory.dense_forwards
+              << " cache_hits=" << trajectory.cache_hits
+              << " similarity_checks=" << trajectory.similarity_checks
+              << " block_forwards=" << trajectory.block_forwards
+              << " hit_forwards=" << cache_hit_list.str();
+    log_stage_timing("denoise");
 
     const torch::Tensor image_update = layout.update_mask.to(device);
     const torch::Tensor audio_update = layout.audio_update_mask.to(device);
@@ -626,8 +697,10 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     initial_video_rows = torch::Tensor();
     initial_audio_rows = torch::Tensor();
     clear_device_cache();
+    log_stage_timing("final_unpack");
 
     if (parallel.rank() != 0) {
+      log_request_total();
       return {};
     }
 
@@ -636,6 +709,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     try {
       video_vae = MiniMaxH3VideoVAE(options_);
       video_vae->load_model(*component_loader("video_vae"));
+      log_stage_timing("video_vae_load");
       torch::Tensor decoded_video =
           video_vae->decode_normalized(final_video_latent);
       synchronize_device();
@@ -657,12 +731,14 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     }
     video_vae = nullptr;
     clear_device_cache();
+    log_stage_timing("video_vae_decode_transfer");
 
     torch::Tensor audio_cpu;
     MiniMaxH3AudioVAE audio_vae{nullptr};
     try {
       audio_vae = MiniMaxH3AudioVAE(options_);
       audio_vae->load_model(*component_loader("audio_vae"));
+      log_stage_timing("audio_vae_load");
       torch::Tensor decoded_audio =
           audio_vae->decode_normalized(final_audio_latent);
       synchronize_device();
@@ -681,6 +757,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     }
     audio_vae = nullptr;
     clear_device_cache();
+    log_stage_timing("audio_vae_decode_transfer");
 
     DiTEncodedMedia media;
     FFmpegVideoAudioEncoder encoder;
@@ -699,6 +776,8 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     media.audio_channels = 2;
     DiTForwardOutput output;
     output.encoded_media.emplace_back(std::move(media));
+    log_stage_timing("media_encode");
+    log_request_total();
     return output;
   }
 
@@ -1133,90 +1212,42 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
 
   static void validate_parallel_topology(const ParallelArgs& parallel) {
     if (parallel.process_group_ == nullptr ||
-        parallel.process_group_->world_size() != kMiniMaxH3TPUAAWorldSize) {
+        parallel.process_group_->world_size() != kMiniMaxH3TPUAAWorldSize ||
+        parallel.world_size() != kMiniMaxH3TPUAAWorldSize ||
+        parallel.dp_size() != 1 || parallel.tp_size() != kMiniMaxH3TPSize ||
+        parallel.sp_size() != kMiniMaxH3UaaSize || parallel.cfg_size() != 1 ||
+        parallel.vae_size() != 1 || parallel.text_encoder_tp_size() != 1) {
       throw std::invalid_argument(
-          "MiniMax-H3 public runtime requires a world16 process group");
+          "MiniMax-H3 public runtime requires world16 TP2 x U8 groups");
     }
-    const auto descriptor_options =
-        torch::TensorOptions()
-            .dtype(torch::kInt32)
-            .device(parallel.process_group_->device());
-    const torch::Tensor descriptor = torch::tensor(
-        {parallel.rank(),
-         parallel.world_size(),
-         parallel.dp_size(),
-         parallel.tp_size(),
-         parallel.sp_size(),
-         parallel.cfg_size(),
-         parallel.dit_tp_group_ == nullptr
-             ? -1
-             : parallel.dit_tp_group_->world_size(),
-         parallel.dit_tp_group_ == nullptr ? -1
-                                           : parallel.dit_tp_group_->rank(),
-         parallel.dit_sp_group_ == nullptr
-             ? -1
-             : parallel.dit_sp_group_->world_size(),
-         parallel.dit_sp_group_ == nullptr ? -1
-                                           : parallel.dit_sp_group_->rank()},
-        descriptor_options);
-    std::vector<torch::Tensor> descriptors(kMiniMaxH3TPUAAWorldSize);
-    for (torch::Tensor& value : descriptors) {
-      value = torch::empty({10}, descriptor_options);
-    }
-    parallel.process_group_->allgather(descriptor, descriptors);
-    bool descriptors_valid = true;
-    for (int32_t rank = 0; rank < kMiniMaxH3TPUAAWorldSize; ++rank) {
-      const MiniMaxH3TPUAAParallelCoordinates expected =
-          minimax_h3_tp_uaa_coordinates(rank);
-      const torch::Tensor value = descriptors[rank].to(torch::kCPU);
-      const int32_t* fields = value.const_data_ptr<int32_t>();
-      descriptors_valid =
-          descriptors_valid && fields[0] == rank &&
-          fields[1] == kMiniMaxH3TPUAAWorldSize && fields[2] == 1 &&
-          fields[3] == kMiniMaxH3TPSize && fields[4] == kMiniMaxH3UaaSize &&
-          fields[5] == 1 && fields[6] == kMiniMaxH3TPSize &&
-          fields[7] == expected.tp_rank && fields[8] == kMiniMaxH3UaaSize &&
-          fields[9] == expected.u_rank;
-    }
-    if (!descriptors_valid) {
+    if (parallel.dit_communication_domains_ == nullptr) {
       throw std::invalid_argument(
-          "MiniMax-H3 DiT process-group descriptors are invalid");
+          "MiniMax-H3 public runtime requires communication-domain metadata");
     }
 
-    const MiniMaxH3TPUAAParallelCoordinates coordinates =
-        minimax_h3_tp_uaa_coordinates(parallel.rank());
-    const auto gather_members = [&](ProcessGroup* group) {
-      const auto rank_options =
-          torch::TensorOptions().dtype(torch::kInt32).device(group->device());
-      const torch::Tensor local_rank =
-          torch::tensor({parallel.rank()}, rank_options);
-      std::vector<torch::Tensor> gathered(group->world_size());
-      for (torch::Tensor& rank : gathered) {
-        rank = torch::empty({1}, rank_options);
+    const auto require_domain = [&](const std::string& name,
+                                    int32_t expected_size,
+                                    ProcessGroup* expected_group) {
+      const CommunicationDomain& domain =
+          parallel.dit_communication_domains_->require(name);
+      if (domain.size() != expected_size || domain.process_group() == nullptr ||
+          domain.process_group() != expected_group ||
+          domain.local_rank() != expected_group->rank() ||
+          domain.ranks().at(static_cast<size_t>(domain.local_rank())) !=
+              parallel.rank()) {
+        throw std::invalid_argument("MiniMax-H3 communication domain `" + name +
+                                    "` is invalid");
       }
-      group->allgather(local_rank, gathered);
-      std::vector<int32_t> members;
-      members.reserve(gathered.size());
-      for (const torch::Tensor& rank : gathered) {
-        members.push_back(rank.item<int32_t>());
-      }
-      return members;
     };
-    const std::vector<int32_t> tp_members =
-        gather_members(parallel.dit_tp_group_);
-    const std::vector<int32_t> u_members =
-        gather_members(parallel.dit_sp_group_);
-    torch::Tensor invalid_membership =
-        torch::tensor({tp_members != coordinates.tp_group_ranks ||
-                               u_members != coordinates.u_group_ranks
-                           ? 1
-                           : 0},
-                      descriptor_options);
-    parallel.process_group_->allreduce(invalid_membership);
-    if (invalid_membership.item<int32_t>() != 0) {
-      throw std::invalid_argument(
-          "MiniMax-H3 TP2 x U8 process-group membership is invalid");
-    }
+    require_domain("tp", kMiniMaxH3TPSize, parallel.dit_tp_group_);
+    require_domain("sp", kMiniMaxH3UaaSize, parallel.dit_sp_group_);
+    require_domain("sp_q", kMiniMaxH3UaaSize, parallel.dit_sp_q_group_);
+    require_domain("sp_k", kMiniMaxH3UaaSize, parallel.dit_sp_k_group_);
+    require_domain("sp_v", kMiniMaxH3UaaSize, parallel.dit_sp_v_group_);
+    require_domain("cfg", 1, parallel.dit_cfg_group_);
+    require_domain("dp", 1, parallel.dit_dp_group_);
+    require_domain("vae", 1, parallel.dit_vae_group_);
+    require_domain("text_encoder_tp", 1, parallel.dit_text_encoder_tp_group_);
   }
 
   void agree_stage(const ParallelArgs& parallel,
@@ -1314,6 +1345,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
   MiniMaxH3VideoVAE c6a_video_vae_{nullptr};
   MiniMaxH3AudioVAE c6b_audio_vae_{nullptr};
   std::mutex forward_mutex_;
+  uint64_t request_sequence_ = 0;
   bool loaded_ = false;
 };
 TORCH_MODULE(MiniMaxH3Pipeline);

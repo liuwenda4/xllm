@@ -50,9 +50,10 @@ TEST(CommunicationDomainTest, SelectsStackedTpAndSpMembership) {
       /*global_rank=*/7,
       /*world_size=*/16,
       {{.name = "tp", .rank_groups = tp2_groups()},
-       {.name = "sp", .rank_groups = sp8_groups()}});
+       {.name = "sp", .rank_groups = sp8_groups()},
+       {.name = "sp_q", .rank_groups = sp8_groups()}});
 
-  EXPECT_EQ(domains.order(), (std::vector<std::string>{"tp", "sp"}));
+  EXPECT_EQ(domains.order(), (std::vector<std::string>{"tp", "sp", "sp_q"}));
   const CommunicationDomain& tp = domains.require("tp");
   EXPECT_EQ(tp.group_id(), 3);
   EXPECT_EQ(tp.local_rank(), 1);
@@ -61,6 +62,7 @@ TEST(CommunicationDomainTest, SelectsStackedTpAndSpMembership) {
   EXPECT_EQ(sp.group_id(), 1);
   EXPECT_EQ(sp.local_rank(), 3);
   EXPECT_EQ(sp.ranks(), (std::vector<int32_t>{1, 3, 5, 7, 9, 11, 13, 15}));
+  EXPECT_EQ(domains.require("sp_q").ranks(), sp.ranks());
   EXPECT_EQ(domains.find("missing"), nullptr);
   EXPECT_THROW(domains.require("missing"), std::out_of_range);
 }

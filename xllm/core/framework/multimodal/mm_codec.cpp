@@ -396,9 +396,13 @@ class MemoryVideoReader : public MemoryMediaReader {
 
 class MemoryAudioReader : public MemoryMediaReader {
  public:
-  MemoryAudioReader(const uint8_t* data, size_t size, int64_t target_sr = 16000)
+  MemoryAudioReader(const uint8_t* data,
+                    size_t size,
+                    int64_t target_sr = 16000,
+                    int32_t target_channels = 1)
       : MemoryMediaReader(data, size) {
     target_sr_ = target_sr;
+    target_ch_ = target_channels;
   }
 
   ~MemoryAudioReader() {
@@ -408,6 +412,9 @@ class MemoryAudioReader : public MemoryMediaReader {
   }
 
   bool init(AudioMetadata& metadata) {
+    if (target_sr_ <= 0 || (target_ch_ != 1 && target_ch_ != 2)) {
+      return false;
+    }
     if (!MemoryMediaReader::init(AVMEDIA_TYPE_AUDIO)) {
       return false;
     }
@@ -627,10 +634,12 @@ bool FFmpegVideoDecoder::decode(const std::string& raw_data,
 bool FFmpegAudioDecoder::decode(const std::string& raw_data,
                                 torch::Tensor& t,
                                 AudioMetadata& metadata,
-                                int64_t target_sr) {
+                                int64_t target_sr,
+                                int32_t target_channels) {
   MemoryAudioReader reader(reinterpret_cast<const uint8_t*>(raw_data.data()),
                            raw_data.size(),
-                           target_sr);
+                           target_sr,
+                           target_channels);
 
   if (!reader.init(metadata) || !reader.read(t, metadata)) {
     LOG(INFO) << "audio decode failed";

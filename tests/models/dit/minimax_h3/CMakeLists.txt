@@ -14,6 +14,20 @@ cc_test(
     -DXLLM_MINIMAX_H3_DISABLE_REGISTRATION
 )
 
+cc_test(
+  NAME
+    minimax_h3_split_qkv_test
+  SRCS
+    minimax_h3_split_qkv_test.cpp
+  DEPS
+    :model_loader
+    state_dict
+    torch
+    GTest::gtest_main
+  COPTS
+    -DXLLM_MINIMAX_H3_DISABLE_REGISTRATION
+)
+
 if(USE_NPU)
   cc_test(
     NAME

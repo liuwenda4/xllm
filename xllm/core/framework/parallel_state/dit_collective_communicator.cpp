@@ -63,15 +63,23 @@ DiTCollectiveCommunicator::DiTCollectiveCommunicator(
       .dit_text_encoder_tp_size(dit_text_encoder_tp_size);
   dit_mapping_ = std::make_unique<DiTMapping>(
       world_size, global_rank, dit_mapping_options);
-  static const std::vector<std::string> kDomainOrder = {
-      "tp", "sp", "cfg", "dp", "vae", "text_encoder_tp"};
+  static const std::vector<std::string> kDomainOrder = {"tp",
+                                                        "sp",
+                                                        "sp_q",
+                                                        "sp_k",
+                                                        "sp_v",
+                                                        "cfg",
+                                                        "dp",
+                                                        "vae",
+                                                        "text_encoder_tp"};
   std::vector<CommunicationDomainSpec> specs;
   specs.reserve(kDomainOrder.size());
   for (const std::string& name : kDomainOrder) {
+    const std::string mapping_name = name.starts_with("sp_") ? "sp" : name;
     specs.push_back(
         {.name = name,
          .rank_groups =
-             dit_mapping_->get_parallel_info(name).rank_per_group()});
+             dit_mapping_->get_parallel_info(mapping_name).rank_per_group()});
   }
   communication_domains_ = std::make_shared<CommunicationDomainSet>(
       global_rank, world_size, std::move(specs));
@@ -97,6 +105,12 @@ void DiTCollectiveCommunicator::create_process_groups(
   parallel_args_->process_group_ = process_group_.get();
   parallel_args_->dit_tp_group_ = create_process_group_by_type("tp", device);
   parallel_args_->dit_sp_group_ = create_process_group_by_type("sp", device);
+  parallel_args_->dit_sp_q_group_ =
+      create_process_group_by_type("sp_q", device);
+  parallel_args_->dit_sp_k_group_ =
+      create_process_group_by_type("sp_k", device);
+  parallel_args_->dit_sp_v_group_ =
+      create_process_group_by_type("sp_v", device);
   parallel_args_->dit_cfg_group_ = create_process_group_by_type("cfg", device);
   parallel_args_->dit_dp_group_ = create_process_group_by_type("dp", device);
   parallel_args_->dit_vae_group_ = create_process_group_by_type("vae", device);

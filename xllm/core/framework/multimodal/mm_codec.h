@@ -61,7 +61,8 @@ class FFmpegAudioDecoder {
   bool decode(const std::string& raw_data,
               torch::Tensor& t,
               AudioMetadata& meta,
-              int64_t target_sr = 16000);
+              int64_t target_sr = 16000,
+              int32_t target_channels = 1);
 };
 
 class FFmpegVideoEncoder final {

@@ -250,6 +250,9 @@ struct ParallelArgs {
   // ProcessGroups for DiT models
   ProcessGroup* dit_tp_group_ = nullptr;
   ProcessGroup* dit_sp_group_ = nullptr;
+  ProcessGroup* dit_sp_q_group_ = nullptr;
+  ProcessGroup* dit_sp_k_group_ = nullptr;
+  ProcessGroup* dit_sp_v_group_ = nullptr;
   ProcessGroup* dit_cfg_group_ = nullptr;
   ProcessGroup* dit_dp_group_ = nullptr;
   ProcessGroup* dit_vae_group_ = nullptr;

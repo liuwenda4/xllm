@@ -73,10 +73,16 @@ class MiniMaxH3TPUAADiTBlockImpl final : public torch::nn::Module {
                              ProcessGroup* tp_group,
                              ProcessGroup* u_group,
                              const torch::TensorOptions& options,
-                             MiniMaxH3UAAWorkspace* uaa_workspace = nullptr)
+                             MiniMaxH3UAAWorkspace* uaa_workspace = nullptr,
+                             ProcessGroup* q_u_group = nullptr,
+                             ProcessGroup* k_u_group = nullptr,
+                             ProcessGroup* v_u_group = nullptr)
       : config_(config),
         tp_group_(tp_group),
         u_group_(u_group),
+        q_u_group_(q_u_group == nullptr ? u_group : q_u_group),
+        k_u_group_(k_u_group == nullptr ? u_group : k_u_group),
+        v_u_group_(v_u_group == nullptr ? u_group : v_u_group),
         uaa_workspace_(uaa_workspace) {
     if (tp_group_ == nullptr || tp_group_->world_size() != kMiniMaxH3TPSize ||
         u_group_ == nullptr || u_group_->world_size() != kMiniMaxH3UaaSize ||
@@ -84,6 +90,17 @@ class MiniMaxH3TPUAADiTBlockImpl final : public torch::nn::Module {
       throw std::invalid_argument(
           "MiniMax-H3 combined block requires colocated TP2 and U8 groups");
     }
+    for (ProcessGroup* forward_group : {q_u_group_, k_u_group_, v_u_group_}) {
+      if (forward_group == nullptr ||
+          forward_group->world_size() != kMiniMaxH3UaaSize ||
+          forward_group->rank() != u_group_->rank() ||
+          forward_group->device() != u_group_->device()) {
+        throw std::invalid_argument(
+            "MiniMax-H3 QKV UAA domains do not match the base U8 group");
+      }
+    }
+    concurrent_qkv_ = q_u_group_ != k_u_group_ && q_u_group_ != v_u_group_ &&
+                      k_u_group_ != v_u_group_;
     if (config_.num_attention_heads != 56 ||
         config_.attention_head_dim != kMiniMaxH3UaaHeadDim ||
         config_.num_attention_heads / kMiniMaxH3TPSize !=
@@ -267,35 +284,73 @@ class MiniMaxH3TPUAADiTBlockImpl final : public torch::nn::Module {
       const torch::Tensor& global_cu_seqlens,
       MiniMaxH3TPUAAAttentionDiagnostics* diagnostics) {
     MiniMaxH3TPAttention attention = tp_block_->attention();
-    MiniMaxH3TPAttentionQKV local =
-        attention->project_local_qkv(input, rope_frequencies);
-    const int64_t local_sequence = local.query.size(0);
-    uaa_workspace_->reserve(local_sequence, local.query.options());
-    MiniMaxH3UAAForwardContext query_context =
-        minimax_h3_uaa_launch_forward_into(
-            local.query.unsqueeze(0),
-            u_group_,
-            uaa_workspace_->send(0, local_sequence),
-            uaa_workspace_->receive(0, local_sequence));
-    MiniMaxH3UAAForwardContext key_context = minimax_h3_uaa_launch_forward_into(
-        local.key.unsqueeze(0),
-        u_group_,
-        uaa_workspace_->send(1, local_sequence),
-        uaa_workspace_->receive(1, local_sequence));
-    MiniMaxH3UAAForwardContext value_context =
-        minimax_h3_uaa_launch_forward_into(
-            local.value.unsqueeze(0),
-            u_group_,
-            uaa_workspace_->send(2, local_sequence),
-            uaa_workspace_->receive(2, local_sequence));
-    torch::Tensor query_u = query_context.finish();
-    torch::Tensor key_u = key_context.finish();
-    torch::Tensor value_u = value_context.finish();
+    const int64_t local_sequence = input.size(0);
+    uaa_workspace_->reserve(local_sequence, input.options());
+    torch::Tensor query_u;
+    torch::Tensor key_u;
+    torch::Tensor value_u;
+    if (concurrent_qkv_) {
+      torch::Tensor query =
+          attention->project_local_query(input, rope_frequencies);
+      MiniMaxH3UAAForwardContext query_context =
+          minimax_h3_uaa_launch_forward_into(
+              query.unsqueeze(0),
+              q_u_group_,
+              uaa_workspace_->send(0, local_sequence),
+              uaa_workspace_->receive(0, local_sequence));
+      query = torch::Tensor();
+      torch::Tensor key = attention->project_local_key(input, rope_frequencies);
+      MiniMaxH3UAAForwardContext key_context =
+          minimax_h3_uaa_launch_forward_into(
+              key.unsqueeze(0),
+              k_u_group_,
+              uaa_workspace_->send(1, local_sequence),
+              uaa_workspace_->receive(1, local_sequence));
+      key = torch::Tensor();
+      torch::Tensor value = attention->project_local_value(input);
+      MiniMaxH3UAAForwardContext value_context =
+          minimax_h3_uaa_launch_forward_into(
+              value.unsqueeze(0),
+              v_u_group_,
+              uaa_workspace_->send(2, local_sequence),
+              uaa_workspace_->receive(2, local_sequence));
+      value = torch::Tensor();
+      query_u = query_context.finish();
+      key_u = key_context.finish();
+      value_u = value_context.finish();
+    } else {
+      MiniMaxH3TPAttentionQKV local =
+          attention->project_local_qkv(input, rope_frequencies);
+      query_u = minimax_h3_uaa_launch_forward_into(
+                    local.query.unsqueeze(0),
+                    u_group_,
+                    uaa_workspace_->send(0, local_sequence),
+                    uaa_workspace_->receive(0, local_sequence))
+                    .finish();
+      key_u = minimax_h3_uaa_launch_forward_into(
+                  local.key.unsqueeze(0),
+                  u_group_,
+                  uaa_workspace_->send(1, local_sequence),
+                  uaa_workspace_->receive(1, local_sequence))
+                  .finish();
+      value_u = minimax_h3_uaa_launch_forward_into(
+                    local.value.unsqueeze(0),
+                    u_group_,
+                    uaa_workspace_->send(2, local_sequence),
+                    uaa_workspace_->receive(2, local_sequence))
+                    .finish();
+    }
 
     torch::Tensor attention_u = minimax_h3_segmented_sdpa(query_u.squeeze(0),
                                                           key_u.squeeze(0),
                                                           value_u.squeeze(0),
                                                           global_cu_seqlens);
+    if (diagnostics != nullptr) {
+      diagnostics->query_u = query_u.clone();
+      diagnostics->key_u = key_u.clone();
+      diagnostics->value_u = value_u.clone();
+      diagnostics->attention_u = attention_u.unsqueeze(0);
+    }
     torch::Tensor local_heads =
         minimax_h3_uaa_launch_inverse_into(
             attention_u.unsqueeze(0),
@@ -308,13 +363,6 @@ class MiniMaxH3TPUAADiTBlockImpl final : public torch::nn::Module {
     const torch::Tensor full_heads =
         parallel_state::gather(local_heads, tp_group_, /*dim=*/1);
     torch::Tensor output = attention->project_dense_output(full_heads);
-
-    if (diagnostics != nullptr) {
-      diagnostics->query_u = query_u.clone();
-      diagnostics->key_u = key_u.clone();
-      diagnostics->value_u = value_u.clone();
-      diagnostics->attention_u = attention_u.unsqueeze(0);
-    }
     return output;
   }
 
@@ -426,6 +474,10 @@ class MiniMaxH3TPUAADiTBlockImpl final : public torch::nn::Module {
   MiniMaxH3C4Config config_;
   ProcessGroup* tp_group_;
   ProcessGroup* u_group_;
+  ProcessGroup* q_u_group_;
+  ProcessGroup* k_u_group_;
+  ProcessGroup* v_u_group_;
+  bool concurrent_qkv_ = false;
   std::unique_ptr<MiniMaxH3UAAWorkspace> owned_uaa_workspace_;
   MiniMaxH3UAAWorkspace* uaa_workspace_;
   MiniMaxH3TPDiTBlock tp_block_{nullptr};

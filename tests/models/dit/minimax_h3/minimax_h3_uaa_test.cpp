@@ -460,6 +460,33 @@ TEST(MiniMaxH3UAAHcclTest, ForwardAttentionInverseAndProductionShape) {
                                       "minimax_h3_u8_uaa",
                                       device);
   ASSERT_NE(u_group, nullptr);
+  auto q_u_group = create_process_group(environment->rank,
+                                        environment->world_size,
+                                        environment->world_size,
+                                        environment->port + 1,
+                                        /*trans=*/false,
+                                        "127.0.0.1",
+                                        "minimax_h3_u8_uaa_q",
+                                        device);
+  auto k_u_group = create_process_group(environment->rank,
+                                        environment->world_size,
+                                        environment->world_size,
+                                        environment->port + 2,
+                                        /*trans=*/false,
+                                        "127.0.0.1",
+                                        "minimax_h3_u8_uaa_k",
+                                        device);
+  auto v_u_group = create_process_group(environment->rank,
+                                        environment->world_size,
+                                        environment->world_size,
+                                        environment->port + 3,
+                                        /*trans=*/false,
+                                        "127.0.0.1",
+                                        "minimax_h3_u8_uaa_v",
+                                        device);
+  ASSERT_NE(q_u_group, nullptr);
+  ASSERT_NE(k_u_group, nullptr);
+  ASSERT_NE(v_u_group, nullptr);
   torch::NoGradGuard no_grad;
   bool passed = true;
 
@@ -478,11 +505,11 @@ TEST(MiniMaxH3UAAHcclTest, ForwardAttentionInverseAndProductionShape) {
   ASSERT_EQ(rank_device.synchronize_default_stream(), 0);
 
   MiniMaxH3UAAForwardContext allocating_q =
-      minimax_h3_uaa_launch_forward(local_qkv[0], u_group.get());
+      minimax_h3_uaa_launch_forward(local_qkv[0], q_u_group.get());
   MiniMaxH3UAAForwardContext allocating_k =
-      minimax_h3_uaa_launch_forward(local_qkv[1], u_group.get());
+      minimax_h3_uaa_launch_forward(local_qkv[1], k_u_group.get());
   MiniMaxH3UAAForwardContext allocating_v =
-      minimax_h3_uaa_launch_forward(local_qkv[2], u_group.get());
+      minimax_h3_uaa_launch_forward(local_qkv[2], v_u_group.get());
   const std::vector<torch::Tensor> allocating_u_qkv = {
       allocating_q.finish(), allocating_k.finish(), allocating_v.finish()};
 
@@ -490,17 +517,17 @@ TEST(MiniMaxH3UAAHcclTest, ForwardAttentionInverseAndProductionShape) {
   small_workspace.reserve(kSmallLocalSequence, local_qkv[0].options());
   MiniMaxH3UAAForwardContext q_context = minimax_h3_uaa_launch_forward_into(
       local_qkv[0],
-      u_group.get(),
+      q_u_group.get(),
       small_workspace.send(0, kSmallLocalSequence),
       small_workspace.receive(0, kSmallLocalSequence));
   MiniMaxH3UAAForwardContext k_context = minimax_h3_uaa_launch_forward_into(
       local_qkv[1],
-      u_group.get(),
+      k_u_group.get(),
       small_workspace.send(1, kSmallLocalSequence),
       small_workspace.receive(1, kSmallLocalSequence));
   MiniMaxH3UAAForwardContext v_context = minimax_h3_uaa_launch_forward_into(
       local_qkv[2],
-      u_group.get(),
+      v_u_group.get(),
       small_workspace.send(2, kSmallLocalSequence),
       small_workspace.receive(2, kSmallLocalSequence));
   std::vector<torch::Tensor> u_qkv = {
@@ -601,19 +628,19 @@ TEST(MiniMaxH3UAAHcclTest, ForwardAttentionInverseAndProductionShape) {
     MiniMaxH3UAAForwardContext production_q =
         minimax_h3_uaa_launch_forward_into(
             production_input,
-            u_group.get(),
+            q_u_group.get(),
             production_workspace.send(0, kProductionLocalSequence),
             production_workspace.receive(0, kProductionLocalSequence));
     MiniMaxH3UAAForwardContext production_k =
         minimax_h3_uaa_launch_forward_into(
             production_input,
-            u_group.get(),
+            k_u_group.get(),
             production_workspace.send(1, kProductionLocalSequence),
             production_workspace.receive(1, kProductionLocalSequence));
     MiniMaxH3UAAForwardContext production_v =
         minimax_h3_uaa_launch_forward_into(
             production_input,
-            u_group.get(),
+            v_u_group.get(),
             production_workspace.send(2, kProductionLocalSequence),
             production_workspace.receive(2, kProductionLocalSequence));
     const torch::Tensor production_u = production_q.finish();

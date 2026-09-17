@@ -17,8 +17,11 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -54,6 +57,7 @@ struct MiniMaxH3TPUAATrajectoryCache {
   torch::Tensor device_audio_destinations;
   torch::Tensor local_token_tags;
   torch::Tensor local_rope_frequencies;
+  torch::Tensor local_cache_row_indices;
 };
 
 struct MiniMaxH3TPUAALocalPositionMap {
@@ -90,6 +94,17 @@ struct MiniMaxH3TPUAATrajectoryOutput {
   torch::Tensor audio_rows;
   int64_t transformer_forwards = 0;
   int64_t block_forwards = 0;
+  int64_t dense_forwards = 0;
+  int64_t cache_hits = 0;
+  int64_t similarity_checks = 0;
+  std::vector<int64_t> cache_hit_forwards;
+};
+
+struct MiniMaxH3TPUAACachedForwardOutput {
+  MiniMaxH3FinalOutput final_output;
+  bool cache_hit = false;
+  int64_t executed_blocks = 0;
+  float relative_l1 = std::numeric_limits<float>::infinity();
 };
 
 struct MiniMaxH3TPUAABoundary {
@@ -217,6 +232,11 @@ class MiniMaxH3TPUAAFixedStageImpl final : public torch::nn::Module {
         minimax_h3_tp_uaa_local_positions(layout.img_pos, start, local_rows);
     const MiniMaxH3TPUAALocalPositionMap audio =
         minimax_h3_tp_uaa_local_positions(layout.audio_pos, start, local_rows);
+    const torch::Tensor target_positions =
+        torch::cat({layout.img_pos.index({layout.update_mask}),
+                    layout.audio_pos.index({layout.audio_update_mask})});
+    const MiniMaxH3TPUAALocalPositionMap cache_rows =
+        minimax_h3_tp_uaa_local_positions(target_positions, start, local_rows);
     return {.layout_condition_hidden = layout.condition_hidden,
             .layout_text_pos = layout.text_pos,
             .layout_img_pos = layout.img_pos,
@@ -233,7 +253,8 @@ class MiniMaxH3TPUAAFixedStageImpl final : public torch::nn::Module {
             .local_token_tags =
                 layout.token_tags.narrow(0, start, local_rows).to(device),
             .local_rope_frequencies =
-                rope_frequencies.narrow(0, start, local_rows).contiguous()};
+                rope_frequencies.narrow(0, start, local_rows).contiguous(),
+            .local_cache_row_indices = cache_rows.destinations.to(device)};
   }
 
   MiniMaxH3TPUAAPreparedForward prepare(
@@ -253,6 +274,7 @@ class MiniMaxH3TPUAAFixedStageImpl final : public torch::nn::Module {
           "MiniMax-H3 fixed stage input geometry mismatch");
     }
     const int64_t local_rows = layout.aligned_length / kMiniMaxH3UaaSize;
+    const torch::Device device = condition_proj_->weight().device();
     if (!cache.layout_condition_hidden.is_same(layout.condition_hidden) ||
         !cache.layout_text_pos.is_same(layout.text_pos) ||
         !cache.layout_img_pos.is_same(layout.img_pos) ||
@@ -274,11 +296,14 @@ class MiniMaxH3TPUAAFixedStageImpl final : public torch::nn::Module {
         !cache.local_token_tags.defined() ||
         cache.local_token_tags.numel() != local_rows ||
         !cache.local_rope_frequencies.defined() ||
-        cache.local_rope_frequencies.size(0) != local_rows) {
+        cache.local_rope_frequencies.size(0) != local_rows ||
+        !cache.local_cache_row_indices.defined() ||
+        cache.local_cache_row_indices.dim() != 1 ||
+        cache.local_cache_row_indices.scalar_type() != torch::kInt64 ||
+        cache.local_cache_row_indices.device() != device) {
       throw std::invalid_argument(
           "MiniMax-H3 fixed stage input or trajectory cache mismatch");
     }
-    const torch::Device device = condition_proj_->weight().device();
     const torch::Tensor video_embedding =
         video_patch_proj_->forward(video_rows.to(device));
     const torch::Tensor audio_embedding =
@@ -402,15 +427,29 @@ TORCH_MODULE(MiniMaxH3TPUAAFixedStage);
 
 class MiniMaxH3TPUAAResidentDenoiserImpl final : public torch::nn::Module {
  public:
-  MiniMaxH3TPUAAResidentDenoiserImpl(const MiniMaxH3C4Config& config,
-                                     ProcessGroup* tp_group,
-                                     ProcessGroup* u_group,
-                                     const torch::TensorOptions& options) {
+  MiniMaxH3TPUAAResidentDenoiserImpl(
+      const MiniMaxH3C4Config& config,
+      ProcessGroup* tp_group,
+      ProcessGroup* u_group,
+      const torch::TensorOptions& options,
+      ProcessGroup* cache_consensus_group = nullptr,
+      const DiTCacheConfig& cache_config = {},
+      ProcessGroup* q_u_group = nullptr,
+      ProcessGroup* k_u_group = nullptr,
+      ProcessGroup* v_u_group = nullptr)
+      : cache_consensus_group_(cache_consensus_group),
+        cache_config_(cache_config) {
     fixed_ = register_module(
         "fixed", MiniMaxH3TPUAAFixedStage(config, u_group, options));
-    transformer_ = register_module(
-        "transformer",
-        MiniMaxH3TPUAAResidentTransformer(config, tp_group, u_group, options));
+    transformer_ =
+        register_module("transformer",
+                        MiniMaxH3TPUAAResidentTransformer(config,
+                                                          tp_group,
+                                                          u_group,
+                                                          options,
+                                                          q_u_group,
+                                                          k_u_group,
+                                                          v_u_group));
   }
 
   void load_source_weights(
@@ -461,6 +500,46 @@ class MiniMaxH3TPUAAResidentDenoiserImpl final : public torch::nn::Module {
                             prepared.time_embedding,
                             prepared.device_inverse_indices,
                             layout);
+  }
+
+  MiniMaxH3TPUAACachedForwardOutput forward_output_only_cached(
+      const H3PackedLayout& layout,
+      const torch::Tensor& video_rows,
+      const torch::Tensor& audio_rows,
+      const torch::Tensor& timesteps,
+      const torch::Tensor& inverse_indices,
+      const MiniMaxH3TPUAATrajectoryCache& trajectory_cache,
+      int64_t step,
+      SimilarityResidualCacheState* cache) {
+    const MiniMaxH3TPUAAPreparedForward prepared =
+        fixed_->prepare(layout,
+                        video_rows,
+                        audio_rows,
+                        timesteps,
+                        inverse_indices,
+                        trajectory_cache);
+    const int64_t local_rows = prepared.local_hidden.size(0);
+    const int64_t local_start = fixed_->u_group()->rank() * local_rows;
+    const int64_t local_used_rows =
+        std::clamp<int64_t>(layout.used_length - local_start, 0, local_rows);
+    const MiniMaxH3TPUAAResidentForwardOutput transformer_output =
+        transformer_->forward_cached(prepared.local_hidden,
+                                     prepared.time_embedding,
+                                     prepared.local_combined_indices,
+                                     prepared.local_rope_frequencies,
+                                     layout.cu_seqlens,
+                                     step,
+                                     local_used_rows,
+                                     cache,
+                                     cache_consensus_group_,
+                                     trajectory_cache.local_cache_row_indices);
+    return {.final_output = fixed_->finalize(transformer_output.hidden,
+                                             prepared.time_embedding,
+                                             prepared.device_inverse_indices,
+                                             layout),
+            .cache_hit = transformer_output.cache_hit,
+            .executed_blocks = transformer_output.executed_blocks,
+            .relative_l1 = transformer_output.relative_l1};
   }
 
   MiniMaxH3FinalOutput forward_output_only(
@@ -519,6 +598,18 @@ class MiniMaxH3TPUAAResidentDenoiserImpl final : public torch::nn::Module {
         audio_rows.index({~audio_update}).clone();
     const MiniMaxH3TPUAATrajectoryCache cache =
         fixed_->prepare_trajectory_cache(layout);
+    std::unique_ptr<SimilarityResidualCacheState> residual_cache;
+    if (cache_config_.selected_policy == PolicyType::CacheDiT) {
+      if (cache_consensus_group_ == nullptr ||
+          cache_consensus_group_->world_size() != kMiniMaxH3TPUAAWorldSize) {
+        throw std::invalid_argument(
+            "MiniMax-H3 CacheDiT requires the world16 consensus group");
+      }
+      residual_cache = std::make_unique<SimilarityResidualCacheState>(
+          cache_config_.cache_dit);
+    }
+    int64_t executed_blocks = 0;
+    std::vector<int64_t> cache_hit_forwards;
     for (int64_t step = 0; step < schedule.video.forward_count(); ++step) {
       const torch::Tensor video_rows_before = video_rows;
       const torch::Tensor audio_rows_before = audio_rows;
@@ -526,13 +617,20 @@ class MiniMaxH3TPUAAResidentDenoiserImpl final : public torch::nn::Module {
           layout,
           schedule.video.timesteps[step].item<float>(),
           schedule.audio.timesteps[step].item<float>());
-      const MiniMaxH3FinalOutput denoiser =
-          forward_output_only(layout,
-                              video_rows,
-                              audio_rows,
-                              plan.unique_timesteps,
-                              plan.inverse_indices,
-                              cache);
+      const MiniMaxH3TPUAACachedForwardOutput cached_forward =
+          forward_output_only_cached(layout,
+                                     video_rows,
+                                     audio_rows,
+                                     plan.unique_timesteps,
+                                     plan.inverse_indices,
+                                     cache,
+                                     step,
+                                     residual_cache.get());
+      const MiniMaxH3FinalOutput& denoiser = cached_forward.final_output;
+      executed_blocks += cached_forward.executed_blocks;
+      if (cached_forward.cache_hit) {
+        cache_hit_forwards.push_back(step + 1);
+      }
       const torch::Tensor video_target = video_rows.index({image_update});
       const torch::Tensor audio_target = audio_rows.index({audio_update});
       const torch::Tensor video_x0 = MiniMaxH3Scheduler::velocity_to_x0(
@@ -571,10 +669,20 @@ class MiniMaxH3TPUAAResidentDenoiserImpl final : public torch::nn::Module {
                   .audio_rows_after = audio_rows});
       }
     }
+    const int64_t cache_hits =
+        residual_cache == nullptr ? 0 : residual_cache->cache_hits();
+    const int64_t dense_forwards =
+        residual_cache == nullptr ? 49 : residual_cache->dense_forwards();
+    const int64_t similarity_checks =
+        residual_cache == nullptr ? 0 : residual_cache->similarity_checks();
     return {.video_rows = std::move(video_rows),
             .audio_rows = std::move(audio_rows),
             .transformer_forwards = 49,
-            .block_forwards = 49 * kMiniMaxH3ResidentBlockCount};
+            .block_forwards = executed_blocks,
+            .dense_forwards = dense_forwards,
+            .cache_hits = cache_hits,
+            .similarity_checks = similarity_checks,
+            .cache_hit_forwards = std::move(cache_hit_forwards)};
   }
 
   MiniMaxH3TPUAAResidentTransformer transformer() const { return transformer_; }
@@ -582,6 +690,8 @@ class MiniMaxH3TPUAAResidentDenoiserImpl final : public torch::nn::Module {
  private:
   MiniMaxH3TPUAAFixedStage fixed_{nullptr};
   MiniMaxH3TPUAAResidentTransformer transformer_{nullptr};
+  ProcessGroup* cache_consensus_group_;
+  DiTCacheConfig cache_config_;
 };
 TORCH_MODULE(MiniMaxH3TPUAAResidentDenoiser);
 

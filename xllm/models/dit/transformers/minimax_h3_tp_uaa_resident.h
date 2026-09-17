@@ -21,11 +21,13 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "core/framework/dit_cache/similarity_residual_cache.h"
 #include "models/dit/transformers/minimax_h3_tp_uaa_block.h"
 
 namespace xllm {
@@ -35,19 +37,35 @@ inline constexpr int64_t kMiniMaxH3ResidentBlockCount = 50;
 using MiniMaxH3TPUAAResidentObserver =
     std::function<void(int64_t, const MiniMaxH3ResidualBranchTrace&)>;
 
+struct MiniMaxH3TPUAAResidentForwardOutput {
+  torch::Tensor hidden;
+  bool cache_hit = false;
+  int64_t executed_blocks = 0;
+  float relative_l1 = std::numeric_limits<float>::infinity();
+};
+
 class MiniMaxH3TPUAAResidentTransformerImpl final : public torch::nn::Module {
  public:
   MiniMaxH3TPUAAResidentTransformerImpl(const MiniMaxH3C4Config& config,
                                         ProcessGroup* tp_group,
                                         ProcessGroup* u_group,
-                                        const torch::TensorOptions& options)
+                                        const torch::TensorOptions& options,
+                                        ProcessGroup* q_u_group = nullptr,
+                                        ProcessGroup* k_u_group = nullptr,
+                                        ProcessGroup* v_u_group = nullptr)
       : config_(config) {
     uaa_workspace_ = std::make_unique<MiniMaxH3UAAWorkspace>();
     blocks_ = register_module("blocks", torch::nn::ModuleList());
     block_layers_.reserve(kMiniMaxH3ResidentBlockCount);
     for (int64_t layer = 0; layer < kMiniMaxH3ResidentBlockCount; ++layer) {
-      MiniMaxH3TPUAADiTBlock block(
-          config, tp_group, u_group, options, uaa_workspace_.get());
+      MiniMaxH3TPUAADiTBlock block(config,
+                                   tp_group,
+                                   u_group,
+                                   options,
+                                   uaa_workspace_.get(),
+                                   q_u_group,
+                                   k_u_group,
+                                   v_u_group);
       blocks_->push_back(block);
       block_layers_.emplace_back(std::move(block));
     }
@@ -108,6 +126,67 @@ class MiniMaxH3TPUAAResidentTransformerImpl final : public torch::nn::Module {
       }
     }
     return hidden;
+  }
+
+  MiniMaxH3TPUAAResidentForwardOutput forward_cached(
+      const torch::Tensor& input,
+      const torch::Tensor& time_embedding,
+      const torch::Tensor& combined_indices,
+      const torch::Tensor& rope_frequencies,
+      const torch::Tensor& global_cu_seqlens,
+      int64_t step,
+      int64_t used_rows,
+      SimilarityResidualCacheState* cache,
+      ProcessGroup* consensus_group,
+      const torch::Tensor& cache_row_indices = torch::Tensor()) {
+    if (cache == nullptr) {
+      return {.hidden = forward(input,
+                                time_embedding,
+                                combined_indices,
+                                rope_frequencies,
+                                global_cu_seqlens),
+              .cache_hit = false,
+              .executed_blocks = kMiniMaxH3ResidentBlockCount};
+    }
+    if (loaded_block_count_ != kMiniMaxH3ResidentBlockCount) {
+      throw std::logic_error(
+          "MiniMax-H3 resident transformer does not have all 50 blocks");
+    }
+    block_layers_.front()->validate_forward_inputs(input,
+                                                   time_embedding,
+                                                   combined_indices,
+                                                   rope_frequencies,
+                                                   global_cu_seqlens);
+    torch::Tensor front =
+        block_layers_.front()->forward_output_only_assuming_validated(
+            input,
+            time_embedding,
+            combined_indices,
+            rope_frequencies,
+            global_cu_seqlens);
+    const SimilarityResidualCacheDecision decision = cache->decide(
+        step, front - input, used_rows, consensus_group, cache_row_indices);
+    if (decision.hit) {
+      return {.hidden = cache->apply(front),
+              .cache_hit = true,
+              .executed_blocks = 1,
+              .relative_l1 = decision.relative_l1};
+    }
+
+    torch::Tensor hidden = front;
+    for (int64_t layer = 1; layer < kMiniMaxH3ResidentBlockCount; ++layer) {
+      hidden = block_layers_[static_cast<size_t>(layer)]
+                   ->forward_output_only_assuming_validated(hidden,
+                                                            time_embedding,
+                                                            combined_indices,
+                                                            rope_frequencies,
+                                                            global_cu_seqlens);
+    }
+    cache->record_dense(front, hidden);
+    return {.hidden = std::move(hidden),
+            .cache_hit = false,
+            .executed_blocks = kMiniMaxH3ResidentBlockCount,
+            .relative_l1 = decision.relative_l1};
   }
 
   int64_t loaded_block_count() const { return loaded_block_count_; }
