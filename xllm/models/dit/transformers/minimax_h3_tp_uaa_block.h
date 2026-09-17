@@ -72,8 +72,12 @@ class MiniMaxH3TPUAADiTBlockImpl final : public torch::nn::Module {
   MiniMaxH3TPUAADiTBlockImpl(const MiniMaxH3C4Config& config,
                              ProcessGroup* tp_group,
                              ProcessGroup* u_group,
-                             const torch::TensorOptions& options)
-      : config_(config), tp_group_(tp_group), u_group_(u_group) {
+                             const torch::TensorOptions& options,
+                             MiniMaxH3UAAWorkspace* uaa_workspace = nullptr)
+      : config_(config),
+        tp_group_(tp_group),
+        u_group_(u_group),
+        uaa_workspace_(uaa_workspace) {
     if (tp_group_ == nullptr || tp_group_->world_size() != kMiniMaxH3TPSize ||
         u_group_ == nullptr || u_group_->world_size() != kMiniMaxH3UaaSize ||
         tp_group_->device() != u_group_->device()) {
@@ -95,6 +99,10 @@ class MiniMaxH3TPUAADiTBlockImpl final : public torch::nn::Module {
         "fc2_weight_dense",
         torch::empty({config_.hidden_size, config_.ffn_hidden_size},
                      options.dtype(torch::kBFloat16)));
+    if (uaa_workspace_ == nullptr) {
+      owned_uaa_workspace_ = std::make_unique<MiniMaxH3UAAWorkspace>();
+      uaa_workspace_ = owned_uaa_workspace_.get();
+    }
   }
 
   void load_source_weights(
@@ -261,23 +269,40 @@ class MiniMaxH3TPUAADiTBlockImpl final : public torch::nn::Module {
     MiniMaxH3TPAttention attention = tp_block_->attention();
     MiniMaxH3TPAttentionQKV local =
         attention->project_local_qkv(input, rope_frequencies);
-
-    torch::Tensor query_u =
-        minimax_h3_uaa_launch_forward(local.query.unsqueeze(0), u_group_)
-            .finish();
-    torch::Tensor key_u =
-        minimax_h3_uaa_launch_forward(local.key.unsqueeze(0), u_group_)
-            .finish();
-    torch::Tensor value_u =
-        minimax_h3_uaa_launch_forward(local.value.unsqueeze(0), u_group_)
-            .finish();
+    const int64_t local_sequence = local.query.size(0);
+    uaa_workspace_->reserve(local_sequence, local.query.options());
+    MiniMaxH3UAAForwardContext query_context =
+        minimax_h3_uaa_launch_forward_into(
+            local.query.unsqueeze(0),
+            u_group_,
+            uaa_workspace_->send(0, local_sequence),
+            uaa_workspace_->receive(0, local_sequence));
+    MiniMaxH3UAAForwardContext key_context = minimax_h3_uaa_launch_forward_into(
+        local.key.unsqueeze(0),
+        u_group_,
+        uaa_workspace_->send(1, local_sequence),
+        uaa_workspace_->receive(1, local_sequence));
+    MiniMaxH3UAAForwardContext value_context =
+        minimax_h3_uaa_launch_forward_into(
+            local.value.unsqueeze(0),
+            u_group_,
+            uaa_workspace_->send(2, local_sequence),
+            uaa_workspace_->receive(2, local_sequence));
+    torch::Tensor query_u = query_context.finish();
+    torch::Tensor key_u = key_context.finish();
+    torch::Tensor value_u = value_context.finish();
 
     torch::Tensor attention_u = minimax_h3_segmented_sdpa(query_u.squeeze(0),
                                                           key_u.squeeze(0),
                                                           value_u.squeeze(0),
                                                           global_cu_seqlens);
     torch::Tensor local_heads =
-        minimax_h3_uaa_launch_inverse(attention_u.unsqueeze(0), u_group_)
+        minimax_h3_uaa_launch_inverse_into(
+            attention_u.unsqueeze(0),
+            u_group_,
+            uaa_workspace_->send(0, local_sequence),
+            uaa_workspace_->receive(MiniMaxH3UAAWorkspace::kInverseReceiveSlot,
+                                    local_sequence))
             .finish()
             .squeeze(0);
     const torch::Tensor full_heads =
@@ -285,9 +310,9 @@ class MiniMaxH3TPUAADiTBlockImpl final : public torch::nn::Module {
     torch::Tensor output = attention->project_dense_output(full_heads);
 
     if (diagnostics != nullptr) {
-      diagnostics->query_u = std::move(query_u);
-      diagnostics->key_u = std::move(key_u);
-      diagnostics->value_u = std::move(value_u);
+      diagnostics->query_u = query_u.clone();
+      diagnostics->key_u = key_u.clone();
+      diagnostics->value_u = value_u.clone();
       diagnostics->attention_u = attention_u.unsqueeze(0);
     }
     return output;
@@ -401,6 +426,8 @@ class MiniMaxH3TPUAADiTBlockImpl final : public torch::nn::Module {
   MiniMaxH3C4Config config_;
   ProcessGroup* tp_group_;
   ProcessGroup* u_group_;
+  std::unique_ptr<MiniMaxH3UAAWorkspace> owned_uaa_workspace_;
+  MiniMaxH3UAAWorkspace* uaa_workspace_;
   MiniMaxH3TPDiTBlock tp_block_{nullptr};
   torch::Tensor fc2_weight_dense_;
   bool row_weights_loaded_ = false;

@@ -61,6 +61,32 @@ inline torch::Tensor minimax_h3_uaa_prepare_forward_send(
       .flatten(0, 1);
 }
 
+inline void minimax_h3_uaa_prepare_forward_send_out(const torch::Tensor& input,
+                                                    torch::Tensor& send) {
+  if (!input.defined() || input.dim() != 4 || input.size(0) != 1 ||
+      input.size(1) <= 0 || input.size(2) != kMiniMaxH3UaaLogicalHeads ||
+      input.size(3) != kMiniMaxH3UaaHeadDim || !send.defined() ||
+      send.sizes() != torch::IntArrayRef({kMiniMaxH3UaaSize * input.size(1),
+                                          input.size(0),
+                                          kMiniMaxH3UaaLocalHeads,
+                                          input.size(3)}) ||
+      send.options().dtype() != input.options().dtype() ||
+      send.device() != input.device()) {
+    throw std::invalid_argument(
+        "MiniMax-H3 UAA forward workspace metadata mismatch");
+  }
+  send.zero_();
+  for (int64_t destination = 0; destination < kMiniMaxH3UaaSize - 1;
+       ++destination) {
+    send.narrow(0, destination * input.size(1), input.size(1))
+        .copy_(input
+                   .slice(2,
+                          destination * kMiniMaxH3UaaLocalHeads,
+                          (destination + 1) * kMiniMaxH3UaaLocalHeads)
+                   .permute({1, 0, 2, 3}));
+  }
+}
+
 inline torch::Tensor minimax_h3_uaa_finish_forward_receive(
     const torch::Tensor& receive,
     int64_t batch,
@@ -87,6 +113,23 @@ inline torch::Tensor minimax_h3_uaa_prepare_inverse_send(
         "MiniMax-H3 UAA inverse input must be [B,S_global,4,D]");
   }
   return input.permute({1, 0, 2, 3}).contiguous();
+}
+
+inline void minimax_h3_uaa_prepare_inverse_send_out(const torch::Tensor& input,
+                                                    torch::Tensor& send) {
+  if (!input.defined() || input.dim() != 4 || input.size(0) != 1 ||
+      input.size(1) <= 0 || input.size(1) % kMiniMaxH3UaaSize != 0 ||
+      input.size(2) != kMiniMaxH3UaaLocalHeads ||
+      input.size(3) != kMiniMaxH3UaaHeadDim || !send.defined() ||
+      send.sizes() !=
+          torch::IntArrayRef(
+              {input.size(1), input.size(0), input.size(2), input.size(3)}) ||
+      send.scalar_type() != input.scalar_type() ||
+      send.device() != input.device()) {
+    throw std::invalid_argument(
+        "MiniMax-H3 UAA inverse workspace metadata mismatch");
+  }
+  send.copy_(input.permute({1, 0, 2, 3}));
 }
 
 inline torch::Tensor minimax_h3_uaa_finish_inverse_receive(
@@ -257,6 +300,78 @@ class MiniMaxH3UAAInverseContext final {
   bool finished_ = false;
 };
 
+class MiniMaxH3UAAWorkspace final {
+ public:
+  static constexpr int64_t kForwardSlots = 3;
+  static constexpr int64_t kReceiveSlots = 4;
+  static constexpr int64_t kInverseReceiveSlot = 3;
+
+  void reserve(int64_t local_sequence, const torch::TensorOptions& options) {
+    if (local_sequence <= 0 || options.dtype_opt() != torch::kBFloat16) {
+      throw std::invalid_argument(
+          "MiniMax-H3 UAA workspace requires positive BF16 capacity");
+    }
+    if (send_storage_.defined()) {
+      if (send_storage_.device() != options.device() ||
+          send_storage_.scalar_type() != options.dtype().toScalarType()) {
+        throw std::invalid_argument(
+            "MiniMax-H3 UAA workspace device or dtype changed");
+      }
+      if (capacity_ >= local_sequence) {
+        return;
+      }
+    }
+    capacity_ = local_sequence;
+    const std::vector<int64_t> buffer_shape = {kMiniMaxH3UaaSize * capacity_,
+                                               1,
+                                               kMiniMaxH3UaaLocalHeads,
+                                               kMiniMaxH3UaaHeadDim};
+    std::vector<int64_t> send_shape = {kForwardSlots};
+    send_shape.insert(
+        send_shape.end(), buffer_shape.begin(), buffer_shape.end());
+    std::vector<int64_t> receive_shape = {kReceiveSlots};
+    receive_shape.insert(
+        receive_shape.end(), buffer_shape.begin(), buffer_shape.end());
+    send_storage_ = torch::empty(send_shape, options);
+    receive_storage_ = torch::empty(receive_shape, options);
+  }
+
+  torch::Tensor send(int64_t slot, int64_t local_sequence) const {
+    return active_buffer(send_storage_, kForwardSlots, slot, local_sequence);
+  }
+
+  torch::Tensor receive(int64_t slot, int64_t local_sequence) const {
+    return active_buffer(receive_storage_, kReceiveSlots, slot, local_sequence);
+  }
+
+  int64_t capacity() const { return capacity_; }
+  int64_t allocated_bytes() const {
+    if (!send_storage_.defined()) {
+      return 0;
+    }
+    return (send_storage_.numel() + receive_storage_.numel()) *
+           static_cast<int64_t>(send_storage_.element_size());
+  }
+
+ private:
+  torch::Tensor active_buffer(const torch::Tensor& storage,
+                              int64_t slots,
+                              int64_t slot,
+                              int64_t local_sequence) const {
+    if (!storage.defined() || slot < 0 || slot >= slots ||
+        local_sequence <= 0 || local_sequence > capacity_) {
+      throw std::invalid_argument(
+          "MiniMax-H3 UAA workspace request is out of range");
+    }
+    return storage.select(0, slot).narrow(
+        0, 0, kMiniMaxH3UaaSize * local_sequence);
+  }
+
+  torch::Tensor send_storage_;
+  torch::Tensor receive_storage_;
+  int64_t capacity_ = 0;
+};
+
 inline void minimax_h3_validate_uaa_runtime_input(const torch::Tensor& input,
                                                   ProcessGroup* u_group) {
   if (u_group == nullptr || u_group->world_size() != kMiniMaxH3UaaSize ||
@@ -307,6 +422,37 @@ inline MiniMaxH3UAAForwardContext minimax_h3_uaa_launch_forward(
                                     input.size(3));
 }
 
+inline MiniMaxH3UAAForwardContext minimax_h3_uaa_launch_forward_into(
+    const torch::Tensor& input,
+    ProcessGroup* u_group,
+    torch::Tensor send,
+    torch::Tensor receive) {
+  minimax_h3_validate_uaa_runtime_input(input, u_group);
+  if (input.size(2) != kMiniMaxH3UaaLogicalHeads || input.size(1) <= 0) {
+    throw std::invalid_argument(
+        "MiniMax-H3 UAA forward requires [1,S_local,28,128]");
+  }
+  minimax_h3_uaa_prepare_forward_send_out(input, send);
+  const std::vector<int64_t> splits(kMiniMaxH3UaaSize, input.size(1));
+  c10::intrusive_ptr<c10d::Work> work;
+  u_group->all_to_all_single(receive,
+                             send,
+                             splits,
+                             splits,
+                             /*async_op=*/true,
+                             &work);
+  if (work == nullptr) {
+    throw std::runtime_error(
+        "MiniMax-H3 UAA forward did not receive an HCCL Work handle");
+  }
+  return MiniMaxH3UAAForwardContext(std::move(send),
+                                    std::move(receive),
+                                    std::move(work),
+                                    input.size(0),
+                                    input.size(1),
+                                    input.size(3));
+}
+
 inline MiniMaxH3UAAInverseContext minimax_h3_uaa_launch_inverse(
     const torch::Tensor& input,
     ProcessGroup* u_group) {
@@ -324,6 +470,39 @@ inline MiniMaxH3UAAInverseContext minimax_h3_uaa_launch_inverse(
                                         input.size(3)},
                                        input.options());
   std::vector<int64_t> splits(kMiniMaxH3UaaSize, local_sequence);
+  c10::intrusive_ptr<c10d::Work> work;
+  u_group->all_to_all_single(receive,
+                             send,
+                             splits,
+                             splits,
+                             /*async_op=*/true,
+                             &work);
+  if (work == nullptr) {
+    throw std::runtime_error(
+        "MiniMax-H3 UAA inverse did not receive an HCCL Work handle");
+  }
+  return MiniMaxH3UAAInverseContext(std::move(send),
+                                    std::move(receive),
+                                    std::move(work),
+                                    input.size(0),
+                                    local_sequence,
+                                    input.size(3));
+}
+
+inline MiniMaxH3UAAInverseContext minimax_h3_uaa_launch_inverse_into(
+    const torch::Tensor& input,
+    ProcessGroup* u_group,
+    torch::Tensor send,
+    torch::Tensor receive) {
+  minimax_h3_validate_uaa_runtime_input(input, u_group);
+  if (input.size(2) != kMiniMaxH3UaaLocalHeads || input.size(1) <= 0 ||
+      input.size(1) % kMiniMaxH3UaaSize != 0) {
+    throw std::invalid_argument(
+        "MiniMax-H3 UAA inverse requires [1,S_global,4,128]");
+  }
+  const int64_t local_sequence = input.size(1) / kMiniMaxH3UaaSize;
+  minimax_h3_uaa_prepare_inverse_send_out(input, send);
+  const std::vector<int64_t> splits(kMiniMaxH3UaaSize, local_sequence);
   c10::intrusive_ptr<c10d::Work> work;
   u_group->all_to_all_single(receive,
                              send,

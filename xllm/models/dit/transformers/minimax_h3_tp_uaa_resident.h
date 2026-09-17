@@ -42,10 +42,12 @@ class MiniMaxH3TPUAAResidentTransformerImpl final : public torch::nn::Module {
                                         ProcessGroup* u_group,
                                         const torch::TensorOptions& options)
       : config_(config) {
+    uaa_workspace_ = std::make_unique<MiniMaxH3UAAWorkspace>();
     blocks_ = register_module("blocks", torch::nn::ModuleList());
     block_layers_.reserve(kMiniMaxH3ResidentBlockCount);
     for (int64_t layer = 0; layer < kMiniMaxH3ResidentBlockCount; ++layer) {
-      MiniMaxH3TPUAADiTBlock block(config, tp_group, u_group, options);
+      MiniMaxH3TPUAADiTBlock block(
+          config, tp_group, u_group, options, uaa_workspace_.get());
       blocks_->push_back(block);
       block_layers_.emplace_back(std::move(block));
     }
@@ -204,6 +206,7 @@ class MiniMaxH3TPUAAResidentTransformerImpl final : public torch::nn::Module {
   }
 
   MiniMaxH3C4Config config_;
+  std::unique_ptr<MiniMaxH3UAAWorkspace> uaa_workspace_;
   torch::nn::ModuleList blocks_{nullptr};
   std::vector<MiniMaxH3TPUAADiTBlock> block_layers_;
   int64_t loaded_block_count_ = 0;
