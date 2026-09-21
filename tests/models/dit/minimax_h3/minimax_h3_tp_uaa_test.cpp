@@ -193,6 +193,9 @@ bool tensors_within_one_ulp(const torch::Tensor& actual,
 struct ProcessGroups {
   std::unique_ptr<ProcessGroup> tp;
   std::unique_ptr<ProcessGroup> u;
+  std::unique_ptr<ProcessGroup> q_u;
+  std::unique_ptr<ProcessGroup> k_u;
+  std::unique_ptr<ProcessGroup> v_u;
 };
 
 ProcessGroups create_groups(
@@ -218,6 +221,33 @@ ProcessGroups create_groups(
                                   "127.0.0.1",
                                   "minimax_h3_c8d_u_group",
                                   device);
+  groups.q_u = create_process_group(environment.global_rank,
+                                    coordinates.u_rank,
+                                    coordinates.u_group_ranks,
+                                    environment.world_size,
+                                    kMiniMaxH3UaaSize,
+                                    environment.port + 10 + coordinates.tp_rank,
+                                    "127.0.0.1",
+                                    "minimax_h3_c8d_q_u_group",
+                                    device);
+  groups.k_u = create_process_group(environment.global_rank,
+                                    coordinates.u_rank,
+                                    coordinates.u_group_ranks,
+                                    environment.world_size,
+                                    kMiniMaxH3UaaSize,
+                                    environment.port + 12 + coordinates.tp_rank,
+                                    "127.0.0.1",
+                                    "minimax_h3_c8d_k_u_group",
+                                    device);
+  groups.v_u = create_process_group(environment.global_rank,
+                                    coordinates.u_rank,
+                                    coordinates.u_group_ranks,
+                                    environment.world_size,
+                                    kMiniMaxH3UaaSize,
+                                    environment.port + 14 + coordinates.tp_rank,
+                                    "127.0.0.1",
+                                    "minimax_h3_c8d_v_u_group",
+                                    device);
   return groups;
 }
 
@@ -549,6 +579,9 @@ TEST(MiniMaxH3TPUAAProductionFixtureTest, MaterializesAttestedDenseOracle) {
 MiniMaxH3TPUAADiTBlock load_combined_block(const HcclEnvironment& environment,
                                            ProcessGroup* tp_group,
                                            ProcessGroup* u_group,
+                                           ProcessGroup* q_u_group,
+                                           ProcessGroup* k_u_group,
+                                           ProcessGroup* v_u_group,
                                            const torch::Device& device) {
   auto loader = std::make_unique<DiTModelLoader>(environment.checkpoint);
   if (!loader->has_component("transformer")) {
@@ -562,7 +595,11 @@ MiniMaxH3TPUAADiTBlock load_combined_block(const HcclEnvironment& environment,
       MiniMaxH3C4Config{},
       tp_group,
       u_group,
-      torch::TensorOptions().device(device).dtype(torch::kBFloat16));
+      torch::TensorOptions().device(device).dtype(torch::kBFloat16),
+      /*uaa_workspace=*/nullptr,
+      q_u_group,
+      k_u_group,
+      v_u_group);
   block->load_source_weights(transformer_loader->get_state_dicts(),
                              /*layer_index=*/0);
   return block;
@@ -741,8 +778,20 @@ TEST(MiniMaxH3TPUAAHcclTest, MatchesDenseBlockAndProfilesProduction) {
   ProcessGroups groups = create_groups(*environment, coordinates, device);
   ASSERT_NE(groups.tp, nullptr);
   ASSERT_NE(groups.u, nullptr);
+  ASSERT_NE(groups.q_u, nullptr);
+  ASSERT_NE(groups.k_u, nullptr);
+  ASSERT_NE(groups.v_u, nullptr);
   bool passed =
       verify_groups(coordinates, groups.tp.get(), groups.u.get(), device);
+  passed = passed && groups.q_u->rank() == coordinates.u_rank &&
+           groups.k_u->rank() == coordinates.u_rank &&
+           groups.v_u->rank() == coordinates.u_rank &&
+           groups.q_u->world_size() == kMiniMaxH3UaaSize &&
+           groups.k_u->world_size() == kMiniMaxH3UaaSize &&
+           groups.v_u->world_size() == kMiniMaxH3UaaSize &&
+           groups.q_u.get() != groups.k_u.get() &&
+           groups.q_u.get() != groups.v_u.get() &&
+           groups.k_u.get() != groups.v_u.get();
 
   torch::NoGradGuard no_grad;
   BlockCase block_case =
@@ -761,8 +810,13 @@ TEST(MiniMaxH3TPUAAHcclTest, MatchesDenseBlockAndProfilesProduction) {
   ASSERT_EQ(contract_failures.item<int32_t>(), 0)
       << "TP2 x U8 group or input contract mismatch";
   Device::empty_cache(environment->local_rank);
-  MiniMaxH3TPUAADiTBlock block = load_combined_block(
-      *environment, groups.tp.get(), groups.u.get(), device);
+  MiniMaxH3TPUAADiTBlock block = load_combined_block(*environment,
+                                                     groups.tp.get(),
+                                                     groups.u.get(),
+                                                     groups.q_u.get(),
+                                                     groups.k_u.get(),
+                                                     groups.v_u.get(),
+                                                     device);
   ASSERT_EQ(rank_device.synchronize_default_stream(), 0);
 
   MiniMaxH3TPUAAAttentionDiagnostics diagnostics;
@@ -915,14 +969,20 @@ TEST(MiniMaxH3TPUAAHcclTest, MatchesDenseBlockAndProfilesProduction) {
     actual = MiniMaxH3ResidualBranchTrace{};
     diagnostics = MiniMaxH3TPUAAAttentionDiagnostics{};
     Device::empty_cache(environment->local_rank);
+    block->validate_forward_inputs(block_case.hidden,
+                                   block_case.time_embedding,
+                                   block_case.combined_indices,
+                                   block_case.rope_frequencies,
+                                   block_case.global_cu_seqlens);
     for (int32_t warmup = 0; warmup < 3; ++warmup) {
-      MiniMaxH3ResidualBranchTrace warmup_trace =
-          block->forward(block_case.hidden,
-                         block_case.time_embedding,
-                         block_case.combined_indices,
-                         block_case.rope_frequencies,
-                         block_case.global_cu_seqlens);
-      (void)warmup_trace;
+      const torch::Tensor warmup_output =
+          block->forward_output_only_assuming_validated(
+              block_case.hidden,
+              block_case.time_embedding,
+              block_case.combined_indices,
+              block_case.rope_frequencies,
+              block_case.global_cu_seqlens);
+      (void)warmup_output;
     }
     ASSERT_EQ(rank_device.synchronize_default_stream(), 0);
     c10_npu::NPUCachingAllocator::resetPeakStats(environment->local_rank);
@@ -930,19 +990,20 @@ TEST(MiniMaxH3TPUAAHcclTest, MatchesDenseBlockAndProfilesProduction) {
       synchronize_ranks(groups.tp.get(), groups.u.get(), device);
       ASSERT_EQ(rank_device.synchronize_default_stream(), 0);
       const auto start = std::chrono::steady_clock::now();
-      MiniMaxH3ResidualBranchTrace measured =
-          block->forward(block_case.hidden,
-                         block_case.time_embedding,
-                         block_case.combined_indices,
-                         block_case.rope_frequencies,
-                         block_case.global_cu_seqlens);
+      const torch::Tensor measured =
+          block->forward_output_only_assuming_validated(
+              block_case.hidden,
+              block_case.time_embedding,
+              block_case.combined_indices,
+              block_case.rope_frequencies,
+              block_case.global_cu_seqlens);
       ASSERT_EQ(rank_device.synchronize_default_stream(), 0);
       const double local_ms = std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - start)
                                   .count();
       max_rank_iterations.push_back(
           global_max(local_ms, groups.tp.get(), groups.u.get(), device));
-      passed = passed && torch::isfinite(measured.output).all().item<bool>();
+      passed = passed && torch::isfinite(measured).all().item<bool>();
     }
     p50_ms = percentile(max_rank_iterations, 0.50);
     p95_ms = percentile(max_rank_iterations, 0.95);
@@ -982,6 +1043,7 @@ TEST(MiniMaxH3TPUAAHcclTest, MatchesDenseBlockAndProfilesProduction) {
               << " max_attention_relative_l2=" << max_attention_relative_l2
               << " max_mlp_relative_l2=" << max_mlp_relative_l2
               << " max_output_relative_l2=" << max_output_relative_l2
+              << " split_qkv=1 validated_once=1"
               << " profile_enabled=" << profile_enabled << " p50_ms=" << p50_ms
               << " p95_ms=" << p95_ms
               << " max_peak_allocated_bytes=" << max_peak_allocated_bytes
