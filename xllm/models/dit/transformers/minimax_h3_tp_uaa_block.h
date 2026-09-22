@@ -108,10 +108,13 @@ class MiniMaxH3TPUAADiTBlockImpl final : public torch::nn::Module {
       throw std::invalid_argument(
           "MiniMax-H3 combined block requires locked 56-head geometry");
     }
-    tp_block_ = register_module(
-        "tp_block",
-        MiniMaxH3TPDiTBlock(
-            config_, tp_group_, options, /*dense_output_projection=*/true));
+    tp_block_ =
+        register_module("tp_block",
+                        MiniMaxH3TPDiTBlock(config_,
+                                            tp_group_,
+                                            options,
+                                            /*dense_output_projection=*/true,
+                                            /*allocate_sharded_fc2=*/false));
     fc2_weight_dense_ = register_buffer(
         "fc2_weight_dense",
         torch::empty({config_.hidden_size, config_.ffn_hidden_size},

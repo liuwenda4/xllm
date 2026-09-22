@@ -821,16 +821,18 @@ class MiniMaxH3TPAttentionImpl final : public torch::nn::Module {
                                                     QuantArgs{},
                                                     tp_group_,
                                                     bf16));
-    out_proj_ = register_module(
-        "out_proj",
-        layer::RowParallelLinear(inner,
-                                 config.hidden_size,
-                                 /*bias=*/false,
-                                 /*input_is_parallelized=*/true,
-                                 /*enable_result_reduction=*/false,
-                                 QuantArgs{},
-                                 tp_group_,
-                                 bf16));
+    if (!dense_output_projection_) {
+      out_proj_ = register_module(
+          "out_proj",
+          layer::RowParallelLinear(inner,
+                                   config.hidden_size,
+                                   /*bias=*/false,
+                                   /*input_is_parallelized=*/true,
+                                   /*enable_result_reduction=*/false,
+                                   QuantArgs{},
+                                   tp_group_,
+                                   bf16));
+    }
   }
 
   void load_state_dict(const StateDict& state_dict) {
@@ -849,11 +851,11 @@ class MiniMaxH3TPAttentionImpl final : public torch::nn::Module {
     qkv_proj_->load_state_dict(reordered_qkv,
                                /*shard_tensor_count=*/3,
                                {local_inner, local_inner, local_inner});
-    out_proj_->load_state_dict(state_dict.get_dict_with_prefix("out_proj."));
     const torch::Tensor out_weight = state_dict.get_tensor("out_proj.weight");
     if (!out_weight.defined() ||
-        out_weight.sizes() != torch::IntArrayRef({out_proj_->weight().size(0),
-                                                  num_heads_ * head_dim_}) ||
+        out_weight.sizes() !=
+            torch::IntArrayRef(
+                {out_projection_weight_.size(0), num_heads_ * head_dim_}) ||
         out_weight.scalar_type() != torch::kBFloat16) {
       throw std::invalid_argument(
           "MiniMax-H3 TP Attention dense output weight mismatch");
@@ -861,6 +863,7 @@ class MiniMaxH3TPAttentionImpl final : public torch::nn::Module {
     if (dense_output_projection_) {
       out_projection_weight_.copy_(out_weight);
     } else {
+      out_proj_->load_state_dict(state_dict.get_dict_with_prefix("out_proj."));
       out_projection_weight_.copy_(out_proj_->weight());
     }
     minimax_h3_synchronize_weight_load(qkv_proj_->weight().device());
@@ -960,6 +963,11 @@ class MiniMaxH3TPAttentionImpl final : public torch::nn::Module {
   }
 
   torch::Tensor project_local_output(const torch::Tensor& local_heads) {
+    if (!out_proj_) {
+      throw std::logic_error(
+          "MiniMax-H3 TP Attention sharded output projection is not allocated "
+          "because the dense output projection owns this block");
+    }
     if (!local_heads.defined() || local_heads.dim() != 3 ||
         local_heads.size(1) != local_heads_ ||
         local_heads.size(2) != head_dim_) {
@@ -1007,18 +1015,26 @@ class MiniMaxH3TPAttentionImpl final : public torch::nn::Module {
 
   void verify_loaded_weights() const {
     if (!q_norm_->is_weight_loaded() || !k_norm_->is_weight_loaded() ||
-        !qkv_proj_->is_weight_loaded() || !out_proj_->is_weight_loaded() ||
-        !out_projection_weight_.defined()) {
+        !qkv_proj_->is_weight_loaded() || !out_projection_weight_.defined() ||
+        (out_proj_ && !out_proj_->is_weight_loaded())) {
       throw std::logic_error(
           "MiniMax-H3 TP Attention weights are not completely loaded");
     }
   }
 
   int64_t local_heads() const { return local_heads_; }
+  bool has_sharded_out_proj() const { return static_cast<bool>(out_proj_); }
   const torch::Tensor& q_norm_weight() const { return q_norm_->weight(); }
   const torch::Tensor& k_norm_weight() const { return k_norm_->weight(); }
   torch::Tensor qkv_weight() const { return qkv_proj_->weight(); }
-  torch::Tensor out_weight() const { return out_proj_->weight(); }
+  torch::Tensor out_weight() const {
+    if (!out_proj_) {
+      throw std::logic_error(
+          "MiniMax-H3 TP Attention sharded output projection is not allocated "
+          "because the dense output projection owns this block");
+    }
+    return out_proj_->weight();
+  }
 
  private:
   void validate_projection_input(const torch::Tensor& input) const {
@@ -1055,8 +1071,11 @@ class MiniMaxH3TPMLPImpl final : public torch::nn::Module {
  public:
   MiniMaxH3TPMLPImpl(const MiniMaxH3C4Config& config,
                      ProcessGroup* tp_group,
-                     const torch::TensorOptions& options)
-      : tp_group_(tp_group), ffn_hidden_size_(config.ffn_hidden_size) {
+                     const torch::TensorOptions& options,
+                     bool allocate_sharded_fc2 = true)
+      : tp_group_(tp_group),
+        ffn_hidden_size_(config.ffn_hidden_size),
+        allocate_sharded_fc2_(allocate_sharded_fc2) {
     if (tp_group_ == nullptr || tp_group_->world_size() != 2 ||
         ffn_hidden_size_ % 2 != 0) {
       throw std::invalid_argument(
@@ -1072,16 +1091,18 @@ class MiniMaxH3TPMLPImpl final : public torch::nn::Module {
                                                        QuantArgs{},
                                                        tp_group_,
                                                        bf16));
-    fc2_ = register_module(
-        "fc2",
-        layer::RowParallelLinear(ffn_hidden_size_,
-                                 config.hidden_size,
-                                 /*bias=*/false,
-                                 /*input_is_parallelized=*/true,
-                                 /*enable_result_reduction=*/false,
-                                 QuantArgs{},
-                                 tp_group_,
-                                 bf16));
+    if (allocate_sharded_fc2_) {
+      fc2_ = register_module(
+          "fc2",
+          layer::RowParallelLinear(ffn_hidden_size_,
+                                   config.hidden_size,
+                                   /*bias=*/false,
+                                   /*input_is_parallelized=*/true,
+                                   /*enable_result_reduction=*/false,
+                                   QuantArgs{},
+                                   tp_group_,
+                                   bf16));
+    }
   }
 
   void load_state_dict(const StateDict& state_dict) {
@@ -1093,11 +1114,18 @@ class MiniMaxH3TPMLPImpl final : public torch::nn::Module {
         {{"weight", minimax_h3_reorder_gate_up_to_up_gate(gate_up)}});
     fc1_->load_state_dict(
         reordered_fc1, /*shard_tensor_count=*/2, {local_ffn_, local_ffn_});
-    fc2_->load_state_dict(state_dict.get_dict_with_prefix("fc2."));
+    if (fc2_) {
+      fc2_->load_state_dict(state_dict.get_dict_with_prefix("fc2."));
+    }
     minimax_h3_synchronize_weight_load(fc1_->weight().device());
   }
 
   torch::Tensor forward(const torch::Tensor& input) {
+    if (!fc2_) {
+      throw std::logic_error(
+          "MiniMax-H3 TP MLP sharded FC2 is not allocated because the dense "
+          "FC2 weight owns this block");
+    }
     verify_loaded_weights();
     const std::vector<torch::Tensor> up_gate =
         fc1_->forward(input).chunk(2, -1);
@@ -1106,19 +1134,28 @@ class MiniMaxH3TPMLPImpl final : public torch::nn::Module {
   }
 
   void verify_loaded_weights() const {
-    if (!fc1_->is_weight_loaded() || !fc2_->is_weight_loaded()) {
+    if (!fc1_->is_weight_loaded() || (fc2_ && !fc2_->is_weight_loaded())) {
       throw std::logic_error(
           "MiniMax-H3 TP MLP weights are not completely loaded");
     }
   }
 
+  bool has_sharded_fc2() const { return static_cast<bool>(fc2_); }
   torch::Tensor fc1_weight() const { return fc1_->weight(); }
-  torch::Tensor fc2_weight() const { return fc2_->weight(); }
+  torch::Tensor fc2_weight() const {
+    if (!fc2_) {
+      throw std::logic_error(
+          "MiniMax-H3 TP MLP sharded FC2 is not allocated because the dense "
+          "FC2 weight owns this block");
+    }
+    return fc2_->weight();
+  }
 
  private:
   ProcessGroup* tp_group_;
   int64_t ffn_hidden_size_;
   int64_t local_ffn_ = 0;
+  bool allocate_sharded_fc2_ = true;
   layer::ColumnParallelLinear fc1_{nullptr};
   layer::RowParallelLinear fc2_{nullptr};
 };
@@ -1202,7 +1239,8 @@ class MiniMaxH3TPDiTBlockImpl final : public torch::nn::Module {
   MiniMaxH3TPDiTBlockImpl(const MiniMaxH3C4Config& config,
                           ProcessGroup* tp_group,
                           const torch::TensorOptions& options,
-                          bool dense_output_projection = false)
+                          bool dense_output_projection = false,
+                          bool allocate_sharded_fc2 = true)
       : config_(config), tp_group_(tp_group) {
     if (tp_group_ == nullptr || tp_group_->world_size() != 2) {
       throw std::invalid_argument(
@@ -1217,7 +1255,12 @@ class MiniMaxH3TPDiTBlockImpl final : public torch::nn::Module {
         "attn",
         MiniMaxH3TPAttention(
             config, tp_group_, options, dense_output_projection));
-    mlp_ = register_module("mlp", MiniMaxH3TPMLP(config, tp_group_, options));
+    mlp_ = register_module(
+        "mlp",
+        MiniMaxH3TPMLP(config,
+                       tp_group_,
+                       options,
+                       /*allocate_sharded_fc2=*/allocate_sharded_fc2));
     adaln_proj_ = register_module(
         "adaln_proj", MiniMaxH3TPAdaLNProjection(config, tp_group_, options));
   }

@@ -365,7 +365,7 @@ TEST(MiniMaxH3TPUAAResidentHcclTest, LoadsAndRunsFiftyLayers) {
                         groups.tp.get(),
                         groups.u.get(),
                         device);
-  constexpr int64_t kExpectedResidentBytes = 43839692800LL;
+  constexpr int64_t kExpectedResidentBytes = 38059417600LL;
   constexpr int64_t kRequiredFreeBytes = 8LL * 1024 * 1024 * 1024;
   bool passed = resident->loaded_block_count() == 50 &&
                 resident->all_tensors_on(device) &&

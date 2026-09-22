@@ -914,29 +914,41 @@ TEST(MiniMaxH3TPUAAHcclTest, MatchesDenseBlockAndProfilesProduction) {
                                                    /*max_abs_limit=*/8.0);
 
   if (environment->test_case == "production") {
+    static const std::array<std::string, 3> kDiagnosticMlpNodes = {
+        "diagnostic_mlp_dense_input",
+        "diagnostic_mlp_fp32_fc2_actual_input",
+        "diagnostic_mlp_fp32_fc2_dense_input"};
     MiniMaxH3TPMLP tp_mlp = block->tp_block()->mlp();
-    const torch::Tensor gate =
-        actual.gate_mlp.narrow(0, 0, block_case.local_valid_rows);
-    const torch::Tensor baseline_dense_input_delta =
-        gate * tp_mlp->forward(block_case.expected_mlp_input);
-    const torch::Tensor fp32_actual_input_delta =
-        gate * diagnostic_fp32_fc2(
-                   tp_mlp, used_rows(actual.mlp_input), groups.tp.get());
-    const torch::Tensor fp32_dense_input_delta =
-        gate * diagnostic_fp32_fc2(
-                   tp_mlp, block_case.expected_mlp_input, groups.tp.get());
-    for (const auto& [name, value] :
-         std::vector<std::pair<std::string, torch::Tensor>>{
-             {"diagnostic_mlp_dense_input", baseline_dense_input_delta},
-             {"diagnostic_mlp_fp32_fc2_actual_input", fp32_actual_input_delta},
-             {"diagnostic_mlp_fp32_fc2_dense_input", fp32_dense_input_delta}}) {
-      const ComparisonMetrics metrics =
-          comparison_metrics(value, block_case.expected_mlp_delta);
-      std::cout << "H3-C8D rank=" << environment->global_rank
-                << " case=production node=" << name
-                << " relative_l2=" << metrics.relative_l2
-                << " cosine=" << metrics.cosine
-                << " max_abs=" << metrics.max_abs << std::endl;
+    if (!tp_mlp->has_sharded_fc2()) {
+      for (const std::string& name : kDiagnosticMlpNodes) {
+        std::cout << "H3-C8D rank=" << environment->global_rank
+                  << " case=production node=" << name
+                  << " status=UNAVAILABLE_SHARDED_FC2_NOT_ALLOCATED"
+                  << std::endl;
+      }
+    } else {
+      const torch::Tensor gate =
+          actual.gate_mlp.narrow(0, 0, block_case.local_valid_rows);
+      const torch::Tensor baseline_dense_input_delta =
+          gate * tp_mlp->forward(block_case.expected_mlp_input);
+      const torch::Tensor fp32_actual_input_delta =
+          gate * diagnostic_fp32_fc2(
+                     tp_mlp, used_rows(actual.mlp_input), groups.tp.get());
+      const torch::Tensor fp32_dense_input_delta =
+          gate * diagnostic_fp32_fc2(
+                     tp_mlp, block_case.expected_mlp_input, groups.tp.get());
+      const std::array<torch::Tensor, 3> values = {baseline_dense_input_delta,
+                                                   fp32_actual_input_delta,
+                                                   fp32_dense_input_delta};
+      for (size_t index = 0; index < values.size(); ++index) {
+        const ComparisonMetrics metrics =
+            comparison_metrics(values[index], block_case.expected_mlp_delta);
+        std::cout << "H3-C8D rank=" << environment->global_rank
+                  << " case=production node=" << kDiagnosticMlpNodes[index]
+                  << " relative_l2=" << metrics.relative_l2
+                  << " cosine=" << metrics.cosine
+                  << " max_abs=" << metrics.max_abs << std::endl;
+      }
     }
   }
 
