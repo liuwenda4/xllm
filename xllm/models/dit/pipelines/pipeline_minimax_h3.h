@@ -521,7 +521,6 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
 
     torch::Tensor posterior_epsilon;
     torch::Tensor visual_latent;
-    MiniMaxH3VideoVAE reference_vae{nullptr};
     std::exception_ptr reference_error;
     try {
       torch::Generator posterior_generator =
@@ -531,9 +530,11 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
           {1, 24, 1, 128, 346},
           posterior_generator,
           torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32));
-      reference_vae = MiniMaxH3VideoVAE(options_);
-      reference_vae->load_model(*component_loader("video_vae"));
-      visual_latent = reference_vae->encode_condition(
+      if (!resident_video_vae_) {
+        resident_video_vae_ = MiniMaxH3VideoVAE(options_);
+        resident_video_vae_->load_model(*component_loader("video_vae"));
+      }
+      visual_latent = resident_video_vae_->encode_condition(
           reference_pixels, posterior_epsilon.to(device));
       synchronize_device();
       require_tensor(visual_latent,
@@ -543,9 +544,9 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
                      "reference visual latent");
     } catch (...) {
       reference_error = std::current_exception();
+      resident_video_vae_ = nullptr;
+      clear_device_cache();
     }
-    reference_vae = nullptr;
-    clear_device_cache();
     agree_stage(parallel, reference_error, "reference VAE encode");
     log_stage_timing("reference_vae_load_encode");
 
@@ -597,52 +598,50 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     visual_latent = torch::Tensor();
     reference_pixels = torch::Tensor();
     posterior_epsilon = torch::Tensor();
-    clear_device_cache();
     log_stage_timing("latent_packing");
 
     MiniMaxH3TPUAATrajectoryOutput trajectory;
-    MiniMaxH3TPUAAResidentDenoiser denoiser{nullptr};
     std::exception_ptr denoiser_load_error;
     try {
-      denoiser =
-          MiniMaxH3TPUAAResidentDenoiser(MiniMaxH3C4Config{},
-                                         parallel.dit_tp_group_,
-                                         parallel.dit_sp_group_,
-                                         options_.dtype(torch::kBFloat16),
-                                         parallel.process_group_,
-                                         context_.get_dit_config(),
-                                         parallel.dit_sp_q_group_,
-                                         parallel.dit_sp_k_group_,
-                                         parallel.dit_sp_v_group_);
-      denoiser->load_source_weights(
-          component_loader("transformer")->get_state_dicts());
+      if (!resident_denoiser_) {
+        resident_denoiser_ =
+            MiniMaxH3TPUAAResidentDenoiser(MiniMaxH3C4Config{},
+                                           parallel.dit_tp_group_,
+                                           parallel.dit_sp_group_,
+                                           options_.dtype(torch::kBFloat16),
+                                           parallel.process_group_,
+                                           context_.get_dit_config(),
+                                           parallel.dit_sp_q_group_,
+                                           parallel.dit_sp_k_group_,
+                                           parallel.dit_sp_v_group_);
+        resident_denoiser_->load_source_weights(
+            component_loader("transformer")->get_state_dicts());
+      }
       synchronize_device();
     } catch (...) {
       denoiser_load_error = std::current_exception();
     }
     if (denoiser_load_error != nullptr) {
-      denoiser = nullptr;
+      resident_denoiser_ = nullptr;
       clear_device_cache();
     }
     try {
       agree_stage(parallel, denoiser_load_error, "resident denoiser load");
     } catch (...) {
-      denoiser = nullptr;
+      resident_denoiser_ = nullptr;
       clear_device_cache();
       throw;
     }
     log_stage_timing("denoiser_load");
     try {
-      trajectory = denoiser->run_base_trajectory(
+      trajectory = resident_denoiser_->run_base_trajectory(
           layout, initial_video_rows, initial_audio_rows);
       synchronize_device();
     } catch (...) {
-      denoiser = nullptr;
+      resident_denoiser_ = nullptr;
       clear_device_cache();
       throw;
     }
-    denoiser = nullptr;
-    clear_device_cache();
     const bool cache_enabled =
         context_.get_dit_config().selected_policy == PolicyType::CacheDiT;
     const int64_t maximum_similarity_checks =
@@ -704,7 +703,6 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     trajectory = {};
     initial_video_rows = torch::Tensor();
     initial_audio_rows = torch::Tensor();
-    clear_device_cache();
     log_stage_timing("final_unpack");
 
     if (parallel.rank() != 0) {
@@ -713,13 +711,14 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     }
 
     torch::Tensor video_cpu;
-    MiniMaxH3VideoVAE video_vae{nullptr};
     try {
-      video_vae = MiniMaxH3VideoVAE(options_);
-      video_vae->load_model(*component_loader("video_vae"));
+      if (!resident_video_vae_) {
+        resident_video_vae_ = MiniMaxH3VideoVAE(options_);
+        resident_video_vae_->load_model(*component_loader("video_vae"));
+      }
       log_stage_timing("video_vae_load");
       torch::Tensor decoded_video =
-          video_vae->decode_normalized(final_video_latent);
+          resident_video_vae_->decode_normalized(final_video_latent);
       synchronize_device();
       require_tensor(decoded_video,
                      {1, 3, kOutputFrames, kOutputHeight, kOutputWidth},
@@ -733,22 +732,21 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
       decoded_video = torch::Tensor();
       final_video_latent = torch::Tensor();
     } catch (...) {
-      video_vae = nullptr;
+      resident_video_vae_ = nullptr;
       clear_device_cache();
       throw;
     }
-    video_vae = nullptr;
-    clear_device_cache();
     log_stage_timing("video_vae_decode_transfer");
 
     torch::Tensor audio_cpu;
-    MiniMaxH3AudioVAE audio_vae{nullptr};
     try {
-      audio_vae = MiniMaxH3AudioVAE(options_);
-      audio_vae->load_model(*component_loader("audio_vae"));
+      if (!resident_audio_vae_) {
+        resident_audio_vae_ = MiniMaxH3AudioVAE(options_);
+        resident_audio_vae_->load_model(*component_loader("audio_vae"));
+      }
       log_stage_timing("audio_vae_load");
       torch::Tensor decoded_audio =
-          audio_vae->decode_normalized(final_audio_latent);
+          resident_audio_vae_->decode_normalized(final_audio_latent);
       synchronize_device();
       require_tensor(decoded_audio,
                      {1, 2, kOutputAudioSamples},
@@ -759,12 +757,10 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
       decoded_audio = torch::Tensor();
       final_audio_latent = torch::Tensor();
     } catch (...) {
-      audio_vae = nullptr;
+      resident_audio_vae_ = nullptr;
       clear_device_cache();
       throw;
     }
-    audio_vae = nullptr;
-    clear_device_cache();
     log_stage_timing("audio_vae_decode_transfer");
 
     DiTEncodedMedia media;
@@ -1352,6 +1348,9 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
   MiniMaxH3StreamingDenoiser c5_denoiser_{nullptr};
   MiniMaxH3VideoVAE c6a_video_vae_{nullptr};
   MiniMaxH3AudioVAE c6b_audio_vae_{nullptr};
+  MiniMaxH3TPUAAResidentDenoiser resident_denoiser_{nullptr};
+  MiniMaxH3VideoVAE resident_video_vae_{nullptr};
+  MiniMaxH3AudioVAE resident_audio_vae_{nullptr};
   std::mutex forward_mutex_;
   uint64_t request_sequence_ = 0;
   bool loaded_ = false;
