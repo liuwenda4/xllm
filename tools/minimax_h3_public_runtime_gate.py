@@ -31,8 +31,7 @@ if __package__:
 else:
     from minimax_h3_condition_cache import image_pixels_sha256
 
-EXPECTED_CONDITION_SHAPE = (11350, 5120)
-EXPECTED_TAGS_SHAPE = (11350,)
+CONDITION_HIDDEN_SIZE = 5120
 EXPECTED_WIDTH = 1344
 EXPECTED_HEIGHT = 768
 EXPECTED_FRAMES = 124
@@ -213,8 +212,11 @@ def _load_request_template(cache_dir: Path, image_path: Path, model: str, seed: 
         raise ValueError("condition cache runtime schema mismatch")
     if runtime_manifest.get("source_backend") != "official_hf":
         raise ValueError("public gate requires the attested official_hf condition")
-    if runtime_manifest.get("token_count") != EXPECTED_CONDITION_SHAPE[0]:
-        raise ValueError("condition cache token count is not the production contract")
+    condition_tokens = runtime_manifest.get("token_count")
+    if not isinstance(condition_tokens, int) or isinstance(condition_tokens, bool) or condition_tokens <= 0:
+        raise ValueError("condition cache token count must be a positive integer")
+    expected_condition_shape = (condition_tokens, CONDITION_HIDDEN_SIZE)
+    expected_tags_shape = (condition_tokens,)
     if runtime_manifest.get("condition_cache_key") != manifest.get("cache_key"):
         raise ValueError("runtime condition cache key mismatch")
     if cache_dir.name != manifest.get("cache_key"):
@@ -228,10 +230,10 @@ def _load_request_template(cache_dir: Path, image_path: Path, model: str, seed: 
         raise ValueError("condition cache tensor inventory mismatch")
     prompt_embeds = tensors["prompt_embeds"].contiguous()
     text_token_tags = tensors["text_token_tags"].contiguous()
-    if tuple(prompt_embeds.shape) != EXPECTED_CONDITION_SHAPE or prompt_embeds.dtype != torch.bfloat16:
-        raise ValueError("prompt_embeds does not match [11350,5120] BF16")
-    if tuple(text_token_tags.shape) != EXPECTED_TAGS_SHAPE or text_token_tags.dtype != torch.int64:
-        raise ValueError("text_token_tags does not match [11350] int64")
+    if tuple(prompt_embeds.shape) != expected_condition_shape or prompt_embeds.dtype != torch.bfloat16:
+        raise ValueError(f"prompt_embeds does not match [{condition_tokens},{CONDITION_HIDDEN_SIZE}] BF16")
+    if tuple(text_token_tags.shape) != expected_tags_shape or text_token_tags.dtype != torch.int64:
+        raise ValueError(f"text_token_tags does not match [{condition_tokens}] int64")
     if not bool(torch.logical_or(text_token_tags == 0, text_token_tags == 1).all().item()):
         raise ValueError("text_token_tags contains values outside {0,1}")
 
@@ -252,14 +254,14 @@ def _load_request_template(cache_dir: Path, image_path: Path, model: str, seed: 
             "prompt_embed": {
                 "name": "prompt_embed",
                 "datatype": "BF16",
-                "shape": list(EXPECTED_CONDITION_SHAPE),
+                "shape": list(expected_condition_shape),
                 "contents": {"bytes_contents": base64.b64encode(prompt_bytes).decode("ascii")},
             },
             "image": base64.b64encode(image_path.read_bytes()).decode("ascii"),
             "text_token_tags": {
                 "name": "text_token_tags",
                 "datatype": "INT64",
-                "shape": list(EXPECTED_TAGS_SHAPE),
+                "shape": list(expected_tags_shape),
                 "contents": {"int64_contents": text_token_tags.tolist()},
             },
             "condition_schema": runtime_manifest["schema"],

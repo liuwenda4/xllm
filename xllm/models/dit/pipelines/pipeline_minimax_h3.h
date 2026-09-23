@@ -578,13 +578,27 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
           input.text_token_tags,
           target,
           references,
-          /*sequence_length=*/kAlignedRows);
-      if (layout.used_length != kUsedRows ||
-          layout.aligned_length != kAlignedRows) {
+          /*sequence_length=*/std::nullopt);
+      const int64_t condition_tokens = input.prompt_embeds.size(1);
+      if (layout.used_length - condition_tokens != kFixedNonTextRows) {
         throw std::logic_error(
-            "MiniMax-H3 public runtime packed layout does not match "
-            "production");
+            "MiniMax-H3 public runtime packed layout does not match the "
+            "production video, audio and reference geometry");
       }
+      if (layout.aligned_length < layout.used_length ||
+          layout.aligned_length % kMiniMaxH3UaaSize != 0) {
+        throw std::logic_error(
+            "MiniMax-H3 public runtime packed layout is not divisible by the "
+            "UAA degree");
+      }
+      LOG(INFO) << "MINIMAX_H3_GEOMETRY rank=" << parallel.rank()
+                << " request=" << request_sequence
+                << " condition_tokens=" << condition_tokens
+                << " used_rows=" << layout.used_length
+                << " aligned_rows=" << layout.aligned_length
+                << " local_rows=" << layout.aligned_length / kMiniMaxH3UaaSize
+                << " padding_rows="
+                << layout.aligned_length - layout.used_length;
       initial_video_rows =
           torch::cat({minimax_h3_patchify_video_latent(visual_anchor),
                       minimax_h3_patchify_video_latent(initial_target_video)},
@@ -1039,11 +1053,9 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
   }
 
  private:
-  static constexpr int64_t kConditionTokens = 11350;
   static constexpr int64_t kReferenceHeight = 2048;
   static constexpr int64_t kReferenceWidth = 5536;
-  static constexpr int64_t kUsedRows = 60132;
-  static constexpr int64_t kAlignedRows = 60160;
+  static constexpr int64_t kFixedNonTextRows = 48782;
   static constexpr int32_t kOutputWidth = 1344;
   static constexpr int32_t kOutputHeight = 768;
   static constexpr int32_t kOutputFrames = 124;
@@ -1068,19 +1080,19 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
 
   static void validate_public_input(const DiTForwardInput& input) {
     if (input.batch_size != 1 || input.prompt_embeds.dim() != 3 ||
-        input.prompt_embeds.sizes().vec() !=
-            std::vector<int64_t>{
-                1, kConditionTokens, MiniMaxH3TransformerConfig::kTextDim} ||
+        input.prompt_embeds.size(0) != 1 || input.prompt_embeds.size(1) <= 0 ||
+        input.prompt_embeds.size(2) != MiniMaxH3TransformerConfig::kTextDim ||
         input.prompt_embeds.scalar_type() != torch::kBFloat16 ||
         !input.prompt_embeds.is_contiguous() ||
         !torch::isfinite(input.prompt_embeds).all().item<bool>()) {
       throw std::invalid_argument(
           "MiniMax-H3 public runtime requires one contiguous BF16 "
-          "condition [1,11350,5120]");
+          "condition [1,token_count,5120] with a positive token_count");
     }
+    const int64_t condition_tokens = input.prompt_embeds.size(1);
     if (!input.text_token_tags.defined() || input.text_token_tags.dim() != 2 ||
         input.text_token_tags.sizes().vec() !=
-            std::vector<int64_t>{1, kConditionTokens} ||
+            std::vector<int64_t>{1, condition_tokens} ||
         input.text_token_tags.scalar_type() != torch::kInt64 ||
         !input.text_token_tags.is_contiguous() ||
         !torch::logical_or(input.text_token_tags == 0,
@@ -1089,7 +1101,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
              .item<bool>()) {
       throw std::invalid_argument(
           "MiniMax-H3 public runtime requires int64 binary token tags "
-          "[1,11350]");
+          "[1,token_count] matching the condition token_count");
     }
     if (input.condition_schemas.size() != 1 ||
         input.condition_source_backends.size() != 1 ||
@@ -1121,7 +1133,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
         !string_equals("source_backend", input.condition_source_backends[0]) ||
         !integer_equals("decoder_layer_index", 49) ||
         !integer_equals("hidden_state_slot", 50) ||
-        !integer_equals("token_count", kConditionTokens) ||
+        !integer_equals("token_count", input.prompt_embeds.size(1)) ||
         !has_sha256(manifest, "hidden_digest") ||
         !has_sha256(manifest, "token_tags_digest") ||
         !has_sha256(manifest, "condition_cache_key") ||
